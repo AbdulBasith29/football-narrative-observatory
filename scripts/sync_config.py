@@ -1,6 +1,9 @@
 import os
 import yaml
 import uuid
+import json
+import hashlib
+import subprocess
 from datetime import datetime, timezone, timedelta
 from ingestion_snowflake import get_snowflake_connection
 
@@ -94,8 +97,6 @@ def sync_events(conn, config_path):
                                   VALUES (%s, %s, %s, %s, %s, %s, %s)''', 
                                   (str(uuid.uuid4()), version_key, w_type, start_hours, end_hours, abs_start, abs_end))
 
-import hashlib
-import json
 
 def sync_channels(conn, config_path):
     with open(config_path, 'r') as f:
@@ -108,7 +109,28 @@ def sync_channels(conn, config_path):
     frame_purpose = data.get('frame_purpose', 'UNKNOWN')
     methodology_version = data.get('methodology_version', '1.2')
     
+    # Sync Sampling Policy Version
+    cursor.execute("SELECT sampling_policy_version_key FROM CORE.DIM_SAMPLING_POLICY_VERSION WHERE policy_name=%s", (f"Methodology v{methodology_version}",))
+    sp_row = cursor.fetchone()
+    if sp_row:
+        sampling_policy_version_key = sp_row[0]
+    else:
+        sampling_policy_version_key = str(uuid.uuid4())
+        cursor.execute("INSERT INTO CORE.DIM_SAMPLING_POLICY_VERSION (sampling_policy_version_key, policy_name, valid_from) VALUES (%s, %s, %s)",
+                       (sampling_policy_version_key, f"Methodology v{methodology_version}", now))
+                       
     config_hash = hashlib.sha256(json.dumps(data, sort_keys=True).encode('utf-8')).hexdigest()
+    
+    # Deterministic Git SHA
+    try:
+        git_sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], stderr=subprocess.STDOUT).decode('utf-8').strip()
+    except Exception:
+        git_sha = None
+        
+    if frame_purpose == 'RESEARCH' and not git_sha:
+        raise ValueError("Cannot establish required Git lineage (git_commit_sha) for a RESEARCH frame.")
+        
+    git_sha_to_store = git_sha or 'unknown_dev'
     
     # Sync frame version
     cursor.execute("SELECT frame_version_key FROM CORE.DIM_CHANNEL_FRAME_VERSION WHERE configuration_hash=%s", (config_hash,))
@@ -120,7 +142,7 @@ def sync_channels(conn, config_path):
         cursor.execute('''INSERT INTO CORE.DIM_CHANNEL_FRAME_VERSION 
                           (frame_version_key, frame_name, frame_purpose, methodology_version, configuration_version, configuration_hash, git_commit_sha, constructed_at, configuration_provenance)
                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s))''',
-                       (frame_version_key, frame_name, frame_purpose, methodology_version, 'v1', config_hash, 'dev', now, json.dumps(data)))
+                       (frame_version_key, frame_name, frame_purpose, methodology_version, 'v1', config_hash, git_sha_to_store, now, json.dumps(data)))
     
     for ch in data.get('channels', []):
         ch_id = ch['channel_id']

@@ -159,7 +159,14 @@ def discover_videos(target_db="FOOTBALL_NARRATIVE_DEV", run_purpose="RESEARCH", 
     for w in windows:
         event_to_windows.setdefault(w['event_version_key'], []).append(w)
     
-    methodology_version = 'v1.2'
+    # Fetch actual sampling policy version key instead of conflating string
+    methodology_version = '1.2'
+    cursor.execute("SELECT sampling_policy_version_key FROM CORE.DIM_SAMPLING_POLICY_VERSION WHERE policy_name=%s", (f"Methodology v{methodology_version}",))
+    sp_row = cursor.fetchone()
+    if sp_row:
+        sampling_policy_version_key = sp_row[0]
+    else:
+        raise ValueError(f"Sampling policy 'Methodology v{methodology_version}' not found in DIM_SAMPLING_POLICY_VERSION. Sync config first.")
     
     for ch_key, ch_id in channels:
         print(f"Discovering for channel: {ch_id}")
@@ -213,14 +220,14 @@ def discover_videos(target_db="FOOTBALL_NARRATIVE_DEV", run_purpose="RESEARCH", 
                 # Idempotency check + Insert
                 cursor.execute('''SELECT video_event_key FROM CORE.BRIDGE_VIDEO_EVENT 
                                   WHERE video_key = %s AND event_version_key = %s AND sampling_policy_version_key = %s''', 
-                               (v_key, ev_key, methodology_version))
+                               (v_key, ev_key, sampling_policy_version_key))
                 if cursor.fetchone():
                     continue
                     
                 cursor.execute('''INSERT INTO CORE.BRIDGE_VIDEO_EVENT 
                                   (video_event_key, video_key, event_version_key, sampling_policy_version_key, inclusion_status, primary_exclusion_reason, discovery_method, discovery_provenance)
                                   VALUES (%s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s))''',
-                               (str(uuid.uuid4()), v_key, ev_key, methodology_version, status, reason, discovery_method, provenance))
+                               (str(uuid.uuid4()), v_key, ev_key, sampling_policy_version_key, status, reason, discovery_method, provenance))
                                
     conn.commit()
     conn.close()
