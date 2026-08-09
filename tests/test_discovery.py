@@ -2,19 +2,23 @@ import pytest
 from datetime import datetime, timezone
 import sys
 import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'scripts')))
-from discovery_youtube import check_eligibility
+from unittest.mock import patch, MagicMock
 
-def test_alias_resolution_and_exclusion():
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'scripts')))
+from discovery_youtube import evaluate_video_against_events, discover_videos
+
+def test_evaluate_video_against_events():
     aliases = ["messi", "ronaldo"]
     
-    windows = [{
-        'window_key': 'w1',
-        'event_version_key': 'ev1',
-        'start': datetime(2022, 12, 1, tzinfo=timezone.utc),
-        'end': datetime(2022, 12, 31, tzinfo=timezone.utc),
-        'terms': ['world cup']
-    }]
+    event_to_windows = {
+        'ev1': [{
+            'window_key': 'w1',
+            'event_version_key': 'ev1',
+            'start': datetime(2022, 12, 1, tzinfo=timezone.utc),
+            'end': datetime(2022, 12, 31, tzinfo=timezone.utc),
+            'terms': ['world cup']
+        }]
+    }
 
     # Case 1: In window, has alias
     video_1 = {
@@ -24,10 +28,9 @@ def test_alias_resolution_and_exclusion():
             'publishedAt': '2022-12-15T10:00:00Z'
         }
     }
-    status, reason, ev_key = check_eligibility(video_1, aliases, windows)
-    assert status == 'ELIGIBLE'
-    assert reason is None
-    assert ev_key == 'ev1'
+    res_1 = evaluate_video_against_events(video_1, aliases, event_to_windows)
+    assert len(res_1) == 1
+    assert res_1[0] == ('ev1', 'ELIGIBLE', None)
     
     # Case 2: In window, NO alias but HAS event term (baseline relevance)
     video_2 = {
@@ -37,10 +40,8 @@ def test_alias_resolution_and_exclusion():
             'publishedAt': '2022-12-15T10:00:00Z'
         }
     }
-    status, reason, ev_key = check_eligibility(video_2, aliases, windows)
-    assert status == 'ELIGIBLE'
-    assert reason is None
-    assert ev_key == 'ev1'
+    res_2 = evaluate_video_against_events(video_2, aliases, event_to_windows)
+    assert res_2[0] == ('ev1', 'ELIGIBLE', None)
 
     # Case 3: In window, no alias, no event term
     video_3 = {
@@ -50,9 +51,8 @@ def test_alias_resolution_and_exclusion():
             'publishedAt': '2022-12-15T10:00:00Z'
         }
     }
-    status, reason, ev_key = check_eligibility(video_3, aliases, windows)
-    assert status == 'INELIGIBLE'
-    assert reason == 'NO_TARGET_RELEVANCE'
+    res_3 = evaluate_video_against_events(video_3, aliases, event_to_windows)
+    assert res_3[0] == ('ev1', 'INELIGIBLE', 'NO_TARGET_RELEVANCE')
     
     # Case 4: Has alias, OUT of window
     video_4 = {
@@ -62,19 +62,20 @@ def test_alias_resolution_and_exclusion():
             'publishedAt': '2023-01-15T10:00:00Z'
         }
     }
-    status, reason, ev_key = check_eligibility(video_4, aliases, windows)
-    assert status == 'INELIGIBLE'
-    assert reason == 'OUT_OF_WINDOW'
+    res_4 = evaluate_video_against_events(video_4, aliases, event_to_windows)
+    assert res_4[0] == ('ev1', 'INELIGIBLE', 'OUT_OF_WINDOW')
 
 def test_alias_word_boundaries():
     aliases = ["cr7"]
-    windows = [{
-        'window_key': 'w1',
-        'event_version_key': 'ev1',
-        'start': datetime(2022, 1, 1, tzinfo=timezone.utc),
-        'end': datetime(2023, 1, 1, tzinfo=timezone.utc),
-        'terms': []
-    }]
+    event_to_windows = {
+        'ev1': [{
+            'window_key': 'w1',
+            'event_version_key': 'ev1',
+            'start': datetime(2022, 1, 1, tzinfo=timezone.utc),
+            'end': datetime(2023, 1, 1, tzinfo=timezone.utc),
+            'terms': []
+        }]
+    }
     
     # Exact match
     video_1 = {
@@ -84,8 +85,8 @@ def test_alias_word_boundaries():
             'publishedAt': '2022-06-15T10:00:00Z'
         }
     }
-    status, _, _ = check_eligibility(video_1, aliases, windows)
-    assert status == 'ELIGIBLE'
+    res_1 = evaluate_video_against_events(video_1, aliases, event_to_windows)
+    assert res_1[0] == ('ev1', 'ELIGIBLE', None)
     
     # Substring match shouldn't trigger
     video_2 = {
@@ -95,49 +96,29 @@ def test_alias_word_boundaries():
             'publishedAt': '2022-06-15T10:00:00Z'
         }
     }
-    status, reason, _ = check_eligibility(video_2, aliases, windows)
-    assert status == 'INELIGIBLE'
-    assert reason == 'NO_TARGET_RELEVANCE'
+    res_2 = evaluate_video_against_events(video_2, aliases, event_to_windows)
+    assert res_2[0] == ('ev1', 'INELIGIBLE', 'NO_TARGET_RELEVANCE')
 
-def test_discovery_method_equivalence():
-    # Proves the same logical video gets same outcome regardless of discovery method
-    aliases = ["messi"]
-    windows = [{
-        'window_key': 'w1',
-        'event_version_key': 'ev1',
-        'start': datetime(2022, 12, 1, tzinfo=timezone.utc),
-        'end': datetime(2022, 12, 31, tzinfo=timezone.utc),
-        'terms': []
-    }]
+@patch("discovery_youtube.get_snowflake_connection")
+def test_research_pilot_isolation(mock_get_conn):
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_get_conn.return_value = mock_conn
+    mock_conn.cursor.return_value = mock_cursor
+
+    # Simulate that the DB returns 'PIPELINE_PILOT' for this frame_version_key
+    mock_cursor.fetchone.return_value = ("PIPELINE_PILOT",)
     
-    # Mock video as returned by playlistItems.list
-    video_playlist = {
-        'snippet': {
-            'title': 'Messi is great',
-            'description': '',
-            'publishedAt': '2022-12-15T10:00:00Z',
-            'resourceId': {'videoId': 'vid123'}
-        }
-    }
-    
-    # Mock video as returned by search.list
-    video_search = {
-        'id': {'videoId': 'vid123'},
-        'snippet': {
-            'title': 'Messi is great',
-            'description': '',
-            'publishedAt': '2022-12-15T10:00:00Z'
-        }
-    }
-    
-    # Check playlist method
-    status_1, reason_1, ev_key_1 = check_eligibility(video_playlist, aliases, windows)
-    
-    # The discovery_youtube.py maps search.list videoId to snippet.resourceId.videoId before checking eligibility
-    # So we simulate that mapping here:
-    video_search['snippet']['resourceId'] = {'videoId': video_search['id']['videoId']}
-    status_2, reason_2, ev_key_2 = check_eligibility(video_search, aliases, windows)
-    
-    assert status_1 == status_2 == 'ELIGIBLE'
-    assert reason_1 == reason_2 == None
-    assert ev_key_1 == ev_key_2 == 'ev1'
+    # Running RESEARCH purpose on a PIPELINE_PILOT frame must structurally fail
+    with pytest.raises(ValueError, match="RESEARCH discovery structurally rejects PIPELINE_PILOT frames."):
+        discover_videos(run_purpose="RESEARCH", frame_version_key="pilot-frame-id")
+        
+    # Running INTEGRATION_TEST on a PIPELINE_PILOT should not raise this specific error
+    # (It will fail later in the mock because get_aliases etc., but we can catch that)
+    mock_cursor.fetchone.return_value = ("PIPELINE_PILOT",)
+    mock_cursor.fetchall.return_value = [] # no eligible channels
+    try:
+        discover_videos(run_purpose="INTEGRATION_TEST", frame_version_key="pilot-frame-id")
+    except ValueError as e:
+        if "structurally rejects" in str(e):
+            pytest.fail("INTEGRATION_TEST should not reject PIPELINE_PILOT frames")

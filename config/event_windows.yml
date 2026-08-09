@@ -1,5 +1,5 @@
 # config/event_windows.yml
-# Methodology Version: 1.1
+# Methodology Version: 1.2
 
 events:
   - event_name: "Pipeline Validation Event: 2022 FIFA World Cup Final"
@@ -10,8 +10,8 @@ events:
     event_terms: ["world cup", "final", "argentina vs france"]
     windows:
       - window_type: "PRE_EVENT"
-        relative_offset_start_hours: -336  # T-14 days
-        relative_offset_end_hours: -1      # T-1 hour
+        relative_offset_start_hours: -336
+        relative_offset_end_hours: -1
       - window_type: "EVENT"
         relative_offset_start_hours: -1
         relative_offset_end_hours: 6
@@ -21,6 +21,9 @@ events:
       - window_type: "LATE_POST_EVENT"
         relative_offset_start_hours: 24
         relative_offset_end_hours: 72
+      - window_type: "RECOVERY_WINDOW"
+        relative_offset_start_hours: 72
+        relative_offset_end_hours: 336
 
   - event_name: "Pipeline Validation Event: Ronaldo Al Nassr Unveiling"
     external_event_id: "TRANSFER_AL_NASSR_2023"
@@ -41,6 +44,9 @@ events:
       - window_type: "LATE_POST_EVENT"
         relative_offset_start_hours: 24
         relative_offset_end_hours: 72
+      - window_type: "RECOVERY_WINDOW"
+        relative_offset_start_hours: 72
+        relative_offset_end_hours: 336
 
   - event_name: "Pipeline Validation Event: 2023 Ballon d'Or Ceremony"
     external_event_id: "BALLON_DOR_2023"
@@ -61,3 +67,6 @@ events:
       - window_type: "LATE_POST_EVENT"
         relative_offset_start_hours: 24
         relative_offset_end_hours: 72
+      - window_type: "RECOVERY_WINDOW"
+        relative_offset_start_hours: 72
+        relative_offset_end_hours: 336

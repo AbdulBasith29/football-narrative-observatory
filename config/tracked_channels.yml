@@ -1,143 +1,43 @@
 # config/tracked_channels.yml
-# Methodology Version: 1.1
+# Methodology Version: 1.2
+# Note: This file defines the PIPELINE_PILOT frame membership. 
+# Event-relative classification (Channel Type x Player Focus) is derived later via event-channel assessment snapshots.
+
+frame_name: "Pilot Pipeline Frame"
+frame_purpose: "PIPELINE_PILOT"
 
 channels:
   - channel_id: "UCNAf1k0yIjyGu3k9BwAg3lg"
     channel_name: "Sky Sports Premier League"
-    channel_type_value: "BROAD_REACH_PUBLISHER"
-    player_focus_value: "MIXED_FOCUS"
-    channel_type_confidence: "HIGH"
-    player_focus_confidence: "MEDIUM"
-    classification_evidence:
-      reference_period_start: "2022-08-01T00:00:00Z"
-      reference_period_end: "2022-10-30T00:00:00Z"
-      effective_window_days: 90
-      eligible_video_count: 450
-      messi_video_count: 55
-      ronaldo_video_count: 70
-      messi_prevalence: 0.12
-      ronaldo_prevalence: 0.15
-      focus_ratio: 0.78
-      fallback_used: false
-      reviewer_id: "seed_pilot"
-      evidence_source: "manual_bootstrap"
+    discovery_source: "manual_bootstrap"
+    discovery_source_version: "pilot_v1"
 
   - channel_id: "UC_5kL-3t0fUzi8kHwRTY-zQ"
     channel_name: "Mark Goldbridge That's Football"
-    channel_type_value: "INDEPENDENT_CREATOR"
-    player_focus_value: "MIXED_FOCUS"
-    channel_type_confidence: "HIGH"
-    player_focus_confidence: "HIGH"
-    classification_evidence:
-      reference_period_start: "2022-08-01T00:00:00Z"
-      reference_period_end: "2022-10-30T00:00:00Z"
-      effective_window_days: 90
-      eligible_video_count: 120
-      messi_video_count: 30
-      ronaldo_video_count: 35
-      messi_prevalence: 0.25
-      ronaldo_prevalence: 0.29
-      focus_ratio: 0.86
-      fallback_used: false
-      reviewer_id: "seed_pilot"
-      evidence_source: "manual_bootstrap"
+    discovery_source: "manual_bootstrap"
+    discovery_source_version: "pilot_v1"
 
   - channel_id: "UCqGqA2hV9e95F9Cj3k2M0gQ"
     channel_name: "TalkFCB"
-    channel_type_value: "CLUB_MEDIA"
-    player_focus_value: "MESSI_FOCUSED"
-    channel_type_confidence: "HIGH"
-    player_focus_confidence: "HIGH"
-    classification_evidence:
-      reference_period_start: "2022-08-01T00:00:00Z"
-      reference_period_end: "2022-10-30T00:00:00Z"
-      effective_window_days: 90
-      eligible_video_count: 85
-      messi_video_count: 65
-      ronaldo_video_count: 5
-      messi_prevalence: 0.76
-      ronaldo_prevalence: 0.05
-      focus_ratio: 11.00 # (65+1)/(5+1)
-      fallback_used: false
-      reviewer_id: "seed_pilot"
-      evidence_source: "manual_bootstrap"
+    discovery_source: "manual_bootstrap"
+    discovery_source_version: "pilot_v1"
 
   - channel_id: "UCMmVPVb0BwSIOWVeDwlPocQ"
     channel_name: "The United Stand"
-    channel_type_value: "CLUB_MEDIA"
-    player_focus_value: "RONALDO_FOCUSED"
-    channel_type_confidence: "HIGH"
-    player_focus_confidence: "HIGH"
-    classification_evidence:
-      reference_period_start: "2022-08-01T00:00:00Z"
-      reference_period_end: "2022-10-30T00:00:00Z"
-      effective_window_days: 90
-      eligible_video_count: 300
-      messi_video_count: 15
-      ronaldo_video_count: 150
-      messi_prevalence: 0.05
-      ronaldo_prevalence: 0.50
-      focus_ratio: 0.10 # (15+1)/(150+1) -> ronaldo/messi ratio = 9.4
-      fallback_used: false
-      reviewer_id: "seed_pilot"
-      evidence_source: "manual_bootstrap"
+    discovery_source: "manual_bootstrap"
+    discovery_source_version: "pilot_v1"
 
   - channel_id: "UC-lHJZR3Gqxm24_Vd_AJ5Yw"
     channel_name: "IShowSpeed"
-    channel_type_value: "INDEPENDENT_CREATOR"
-    player_focus_value: "RONALDO_FOCUSED"
-    channel_type_confidence: "HIGH"
-    player_focus_confidence: "HIGH"
-    classification_evidence:
-      reference_period_start: "2022-08-01T00:00:00Z"
-      reference_period_end: "2022-10-30T00:00:00Z"
-      effective_window_days: 90
-      eligible_video_count: 40
-      messi_video_count: 5
-      ronaldo_video_count: 25
-      messi_prevalence: 0.12
-      ronaldo_prevalence: 0.62
-      focus_ratio: 0.23
-      fallback_used: false
-      reviewer_id: "seed_pilot"
-      evidence_source: "manual_bootstrap"
+    discovery_source: "manual_bootstrap"
+    discovery_source_version: "pilot_v1"
 
   - channel_id: "UCbX6M_6E0iMzi1Z7H2Bv9KA"
     channel_name: "Statman Dave"
-    channel_type_value: "ANALYSIS_PUBLISHER"
-    player_focus_value: "MIXED_FOCUS"
-    channel_type_confidence: "HIGH"
-    player_focus_confidence: "MEDIUM"
-    classification_evidence:
-      reference_period_start: "2022-08-01T00:00:00Z"
-      reference_period_end: "2022-10-30T00:00:00Z"
-      effective_window_days: 90
-      eligible_video_count: 50
-      messi_video_count: 10
-      ronaldo_video_count: 12
-      messi_prevalence: 0.20
-      ronaldo_prevalence: 0.24
-      focus_ratio: 0.84
-      fallback_used: false
-      reviewer_id: "seed_pilot"
-      evidence_source: "manual_bootstrap"
+    discovery_source: "manual_bootstrap"
+    discovery_source_version: "pilot_v1"
 
   - channel_id: "UCiWLfSweyRNmLpgEHekhoAg"
     channel_name: "ESPN FC"
-    channel_type_value: "BROAD_REACH_PUBLISHER"
-    player_focus_value: "MIXED_FOCUS"
-    channel_type_confidence: "HIGH"
-    player_focus_confidence: "HIGH"
-    classification_evidence:
-      reference_period_start: "2022-08-01T00:00:00Z"
-      reference_period_end: "2022-10-30T00:00:00Z"
-      effective_window_days: 90
-      eligible_video_count: 600
-      messi_video_count: 150
-      ronaldo_video_count: 160
-      messi_prevalence: 0.25
-      ronaldo_prevalence: 0.26
-      focus_ratio: 0.93
-      fallback_used: false
-      reviewer_id: "seed_pilot"
-      evidence_source: "manual_bootstrap"
+    discovery_source: "manual_bootstrap"
+    discovery_source_version: "pilot_v1"

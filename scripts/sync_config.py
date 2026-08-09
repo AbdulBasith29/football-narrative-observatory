@@ -48,6 +48,7 @@ def sync_events(conn, config_path):
         event_name = event['event_name']
         occurred_at = event['occurred_at']
         rationale = event.get('inclusion_rationale')
+        event_terms = event.get('event_terms', [])
         
         cursor.execute("SELECT event_key FROM CORE.DIM_EVENT WHERE external_event_id = %s", (ext_id,))
         row = cursor.fetchone()
@@ -61,15 +62,16 @@ def sync_events(conn, config_path):
         # Get or create version
         cursor.execute("SELECT event_version_key FROM CORE.DIM_EVENT_VERSION WHERE event_key = %s AND is_current = TRUE", (event_key,))
         v_row = cursor.fetchone()
+        terms_json = json.dumps(event_terms)
         if v_row:
             version_key = v_row[0]
             # Simple update for now instead of full SCD2
-            cursor.execute('''UPDATE CORE.DIM_EVENT_VERSION SET event_name=%s, occurred_at=%s, inclusion_rationale=%s
-                              WHERE event_version_key=%s''', (event_name, occurred_at, rationale, version_key))
+            cursor.execute('''UPDATE CORE.DIM_EVENT_VERSION SET event_name=%s, occurred_at=%s, inclusion_rationale=%s, event_terms=PARSE_JSON(%s)
+                              WHERE event_version_key=%s''', (event_name, occurred_at, rationale, terms_json, version_key))
         else:
             version_key = str(uuid.uuid4())
-            cursor.execute('''INSERT INTO CORE.DIM_EVENT_VERSION (event_version_key, event_key, event_name, occurred_at, inclusion_rationale, valid_from, is_current)
-                              VALUES (%s, %s, %s, %s, %s, %s, TRUE)''', (version_key, event_key, event_name, occurred_at, rationale, now))
+            cursor.execute('''INSERT INTO CORE.DIM_EVENT_VERSION (event_version_key, event_key, event_name, occurred_at, inclusion_rationale, event_terms, valid_from, is_current)
+                              VALUES (%s, %s, %s, %s, %s, PARSE_JSON(%s), %s, TRUE)''', (version_key, event_key, event_name, occurred_at, rationale, terms_json, now))
                               
         # Sync windows
         occurred_dt = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
@@ -92,6 +94,9 @@ def sync_events(conn, config_path):
                                   VALUES (%s, %s, %s, %s, %s, %s, %s)''', 
                                   (str(uuid.uuid4()), version_key, w_type, start_hours, end_hours, abs_start, abs_end))
 
+import hashlib
+import json
+
 def sync_channels(conn, config_path):
     with open(config_path, 'r') as f:
         data = yaml.safe_load(f)
@@ -99,12 +104,31 @@ def sync_channels(conn, config_path):
     cursor = conn.cursor()
     now = datetime.now(timezone.utc).isoformat()
     
+    frame_name = data.get('frame_name', 'Unknown Frame')
+    frame_purpose = data.get('frame_purpose', 'UNKNOWN')
+    methodology_version = data.get('methodology_version', '1.2')
+    
+    config_hash = hashlib.sha256(json.dumps(data, sort_keys=True).encode('utf-8')).hexdigest()
+    
+    # Sync frame version
+    cursor.execute("SELECT frame_version_key FROM CORE.DIM_CHANNEL_FRAME_VERSION WHERE configuration_hash=%s", (config_hash,))
+    row = cursor.fetchone()
+    if row:
+        frame_version_key = row[0]
+    else:
+        frame_version_key = str(uuid.uuid4())
+        cursor.execute('''INSERT INTO CORE.DIM_CHANNEL_FRAME_VERSION 
+                          (frame_version_key, frame_name, frame_purpose, methodology_version, configuration_version, configuration_hash, git_commit_sha, constructed_at, configuration_provenance)
+                          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s))''',
+                       (frame_version_key, frame_name, frame_purpose, methodology_version, 'v1', config_hash, 'dev', now, json.dumps(data)))
+    
     for ch in data.get('channels', []):
         ch_id = ch['channel_id']
         ch_name = ch['channel_name']
-        c_type = ch['channel_type_value']
-        p_focus = ch['player_focus_value']
+        disc_source = ch.get('discovery_source', 'manual_bootstrap')
+        disc_version = ch.get('discovery_source_version', 'pilot_v1')
         
+        # Sync Channel Identity
         cursor.execute("SELECT channel_key FROM CORE.DIM_CHANNEL WHERE source_system='YOUTUBE' AND source_id=%s", (ch_id,))
         row = cursor.fetchone()
         if row:
@@ -115,29 +139,28 @@ def sync_channels(conn, config_path):
             cursor.execute("INSERT INTO CORE.DIM_CHANNEL (channel_key, source_system, source_id, channel_name) VALUES (%s, 'YOUTUBE', %s, %s)",
                            (channel_key, ch_id, ch_name))
                            
-        # Stratum Sync
-        cursor.execute("SELECT stratum_key FROM CORE.DIM_CHANNEL_STRATUM WHERE channel_type_value=%s AND player_focus_value=%s", (c_type, p_focus))
-        s_row = cursor.fetchone()
-        if s_row:
-            stratum_key = s_row[0]
+        # Sync Bridge Frame Channel
+        cursor.execute("SELECT frame_channel_key FROM CORE.BRIDGE_FRAME_CHANNEL WHERE frame_version_key=%s AND channel_key=%s", (frame_version_key, channel_key))
+        b_row = cursor.fetchone()
+        if b_row:
+            frame_channel_key = b_row[0]
         else:
-            stratum_key = str(uuid.uuid4())
-            cursor.execute("INSERT INTO CORE.DIM_CHANNEL_STRATUM (stratum_key, channel_type_value, player_focus_value, analytical_eligibility) VALUES (%s, %s, %s, TRUE)",
-                           (stratum_key, c_type, p_focus))
+            frame_channel_key = str(uuid.uuid4())
+            cursor.execute('''INSERT INTO CORE.BRIDGE_FRAME_CHANNEL 
+                              (frame_channel_key, frame_version_key, channel_key, evaluated_at, eligibility_rule_version, frame_inclusion_status)
+                              VALUES (%s, %s, %s, %s, %s, %s)''',
+                           (frame_channel_key, frame_version_key, channel_key, now, methodology_version, 'ELIGIBLE'))
                            
-        # Channel Stratum Version mapping
-        cursor.execute("SELECT stratum_version_key, stratum_key FROM CORE.DIM_CHANNEL_STRATUM_VERSION WHERE channel_key=%s AND is_current=TRUE", (channel_key,))
-        v_row = cursor.fetchone()
-        if v_row:
-            if v_row[1] != stratum_key:
-                # Expire old
-                cursor.execute("UPDATE CORE.DIM_CHANNEL_STRATUM_VERSION SET is_current=FALSE, valid_to=%s WHERE stratum_version_key=%s", (now, v_row[0]))
-                # Insert new
-                cursor.execute('''INSERT INTO CORE.DIM_CHANNEL_STRATUM_VERSION (stratum_version_key, channel_key, stratum_key, valid_from, is_current)
-                                  VALUES (%s, %s, %s, %s, TRUE)''', (str(uuid.uuid4()), channel_key, stratum_key, now))
-        else:
-            cursor.execute('''INSERT INTO CORE.DIM_CHANNEL_STRATUM_VERSION (stratum_version_key, channel_key, stratum_key, valid_from, is_current)
-                              VALUES (%s, %s, %s, %s, TRUE)''', (str(uuid.uuid4()), channel_key, stratum_key, now))
+        # Sync Source Observation
+        cursor.execute('''SELECT frame_channel_source_observation_key FROM CORE.FRAME_CHANNEL_SOURCE_OBSERVATION 
+                          WHERE frame_channel_key=%s AND discovery_source=%s AND discovery_source_version=%s''', 
+                       (frame_channel_key, disc_source, disc_version))
+        o_row = cursor.fetchone()
+        if not o_row:
+            cursor.execute('''INSERT INTO CORE.FRAME_CHANNEL_SOURCE_OBSERVATION 
+                              (frame_channel_source_observation_key, frame_channel_key, discovery_source, discovery_source_version, source_retrieved_at)
+                              VALUES (%s, %s, %s, %s, %s)''',
+                           (str(uuid.uuid4()), frame_channel_key, disc_source, disc_version, now))
 
 if __name__ == "__main__":
     from dotenv import load_dotenv

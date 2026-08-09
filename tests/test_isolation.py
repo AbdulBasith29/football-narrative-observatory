@@ -7,7 +7,7 @@ from discovery_youtube import discover_videos
 def test_run_purpose_enforcement():
     # Should raise ValueError if not INTEGRATION_TEST or RESEARCH
     with pytest.raises(ValueError, match="run_purpose must be 'INTEGRATION_TEST' or 'RESEARCH'"):
-        discover_videos(run_purpose="DEV_TEST")
+        discover_videos(run_purpose="DEV_TEST", frame_version_key="dummy")
     
     with pytest.raises(ValueError):
-        discover_videos(run_purpose=None)
+        discover_videos(run_purpose=None, frame_version_key="dummy")
