@@ -1,0 +1,23 @@
+# config/player_aliases.yml
+# Methodology Version: 1.1
+
+targets:
+  - entity_name: "Lionel Messi"
+    entity_type: "PLAYER"
+    wikidata_id: "Q615"
+    transfermarkt_id: "28003"
+    aliases:
+      - text: "Lionel Messi"
+      - text: "Leo Messi"
+      - text: "Messi"
+      - text: "LM10"
+      - text: "La Pulga"
+  - entity_name: "Cristiano Ronaldo"
+    entity_type: "PLAYER"
+    wikidata_id: "Q11571"
+    transfermarkt_id: "8198"
+    aliases:
+      - text: "Cristiano Ronaldo"
+      - text: "Cristiano"
+      - text: "Ronaldo"
+      - text: "CR7"

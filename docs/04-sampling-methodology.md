@@ -1,9 +1,10 @@
 # Sampling Methodology
 
-**Version**: 1.1
-**Status**: Frozen for Version 1.1
+**Version**: 1.2
+**Status**: Frozen for Version 1.2
 
-> **Methodology Revision Notice**: Protocol Version 1.1 replaces the legacy single-axis channel stratum model with the formal Two-Axis Classification Taxonomy (Channel Type × Player Focus) defined in the Channel Stratification Protocol.
+> **Methodology Revision Notice**: Protocol Version 1.2 explicitly revokes the subjective pre-selection of channels based on expected historical orientation (v1.1) and mandates that the observable channel frame must be a Constructed Panel derived strictly from pre-specified, version-controlled external registries.
+> Protocol Version 1.1 replaced the legacy single-axis channel stratum model with the formal Two-Axis Classification Taxonomy (Channel Type × Player Focus) defined in the Channel Stratification Protocol.
 
 This document defines the exact analytical population and the specific criteria determining what observations belong in the study. We define the sample *before* retrieval rather than taking whatever the API happens to return. The integrity of our findings depends entirely on respecting these boundaries.
 
@@ -24,8 +25,10 @@ flowchart TD
 ```
 
 ## 3. Analytical Population Definitions
-- **Target Population**: Public English-language football discourse appearing on videos published by tracked channels and selected under the documented event and video-sampling rules.
-- **Observed Sample**: Comments successfully retrieved from selected public YouTube videos according to this sampling protocol.
+- **Conceptual Target Population**: Public English-language football discourse surrounding major events on YouTube.
+- **Observable Candidate-Channel Frame**: Because the conceptual target population cannot be comprehensively or historically enumerated via YouTube's API without severe algorithmic and survivorship bias, the observable frame is restricted to a **Constructed Panel** compiled exclusively from pre-specified, version-controlled external registries. Frame selection introduces transparent coverage bias, which must be explicitly documented.
+- **Inference Population**: Statistical inferences apply **strictly** to the discourse appearing on videos published by channels included within the versioned Constructed Panel. No extrapolations will be made to the unobservable long-tail of YouTube.
+- **Observed Sample**: Comments successfully retrieved from selected public YouTube videos within the Constructed Panel according to this sampling protocol.
 
 No extrapolations will be made to other platforms (e.g., X, Reddit) or unretrieved historical comments.
 
@@ -37,7 +40,8 @@ No extrapolations will be made to other platforms (e.g., X, Reddit) or unretriev
 - **Comments**: Textual reactions authored by YouTube users.
 
 ## 5. Channel Eligibility and Versioning
-Channels are pre-selected based on their historical coverage orientation and audience profile to form distinct comparison strata. Under the Version 1.1 protocol, classification strictly follows the Two-Axis Model:
+The observable candidate-channel frame is a Constructed Panel compiled exclusively from pre-specified, version-controlled external registries. Frame construction precedes all classification. 
+Under the Version 1.2 protocol, classification strictly follows the Two-Axis Model:
 
 **Axis A: Channel Type**
 - `BROAD_REACH_PUBLISHER`, `CLUB_MEDIA`, `ANALYSIS_PUBLISHER`, `INDEPENDENT_CREATOR`, `OTHER`, `UNCLASSIFIED`.
@@ -85,6 +89,11 @@ To prevent entity resolution failures from artificially reducing observed overal
 - **Retrieved corpus**: All successfully retrieved comments. Used for completeness and API capacity metrics.
 - **Primary chronological corpus**: Chronological, in-window comments satisfying source-level eligibility rules, regardless of detected language. Language filtering is applied only when constructing language-dependent analytical subsets. Used for general participation volume and author-ID coverage metrics.
 - **Target-opinion analytical subset**: English comments with an accepted target resolution. Used for target-opinion metrics.
+
+## 10b. Aggregation Estimands and Weighting
+Every published metric must have a pre-declared aggregation unit and weighting rule in the Metric Dictionary prior to analysis. Analysts are not permitted to freely choose weighting schemes after observing results. Alternative weighting schemes must be registered as separate predefined metrics or sensitivity analyses.
+- **Comment-Weighted Metrics**: These describe only the eligible observed comments under the documented sampling and retrieval process. They do not represent the "entire observable ecosystem."
+- **Video-Weighted / Channel-Weighted**: For specific comparative hypothesis testing, metrics may be aggregated first to the video or channel level before averaging across strata, treating each channel's institutional stance equally regardless of their raw upload volume.
 
 ## 11. Event-Relative Windows
 Discourse is captured across explicit temporal windows anchored to the event:
