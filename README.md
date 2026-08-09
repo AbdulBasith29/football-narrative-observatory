@@ -42,8 +42,8 @@ For the full list of our research questions, see [Research Questions](docs/01-re
 
 ## Current Project Status
 
-**Phase 0 — Repository and Methodology**
-Currently establishing the repository structure, core methodology documents, research questions, and data governance policies. The implementation folders remain empty until the methodological design is finalised.
+**Phase 1B — Snowflake Warehouse Bootstrap**
+Phase 1B currently contains temporary live integration-test data. No Version 1.0 research sample has been ingested yet.
 
 ## Repository Navigation
 

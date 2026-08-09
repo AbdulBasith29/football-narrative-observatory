@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS FACT_INGESTION_RUN (
     run_outcome VARCHAR(64),
     continuity_status VARCHAR(64),
     source_availability_status VARCHAR(64),
-    backfill_status VARCHAR(64)
+    backfill_status VARCHAR(64),
+    run_purpose VARCHAR(64)
 );
 
 CREATE TABLE IF NOT EXISTS FACT_API_REQUEST (
@@ -34,9 +35,9 @@ CREATE TABLE IF NOT EXISTS FACT_API_REQUEST (
     endpoint VARCHAR(128) NOT NULL,
     requested_at TIMESTAMP_NTZ NOT NULL,
     completed_at TIMESTAMP_NTZ,
-    http_status NUMBER(38,0),
-    page_token_used VARCHAR(128),
-    next_page_token_returned VARCHAR(128),
+    http_status NUMBER(3,0),
+    page_token_used VARCHAR(1024),
+    next_page_token_returned VARCHAR(1024),
     retry_number NUMBER(38,0),
     error_code VARCHAR(128),
     estimated_quota_cost NUMBER(38,0)
@@ -53,7 +54,7 @@ CREATE TABLE IF NOT EXISTS CURRENT_CHECKPOINT (
     committed_watermark_at TIMESTAMP_NTZ,
     candidate_watermark_at TIMESTAMP_NTZ,
     last_complete_scan_at TIMESTAMP_NTZ,
-    continuation_token_hint VARCHAR(128),
+    continuation_token_hint VARCHAR(1024),
     current_continuity_state VARCHAR(64),
     checkpoint_transaction_lineage VARCHAR(256),
     updated_at TIMESTAMP_NTZ NOT NULL
@@ -65,7 +66,7 @@ CREATE TABLE IF NOT EXISTS CHECKPOINT_HISTORY (
     committed_watermark_at TIMESTAMP_NTZ,
     candidate_watermark_at TIMESTAMP_NTZ,
     last_complete_scan_at TIMESTAMP_NTZ,
-    continuation_token_hint VARCHAR(128),
+    continuation_token_hint VARCHAR(1024),
     current_continuity_state VARCHAR(64),
     checkpoint_transaction_lineage VARCHAR(256),
     updated_at TIMESTAMP_NTZ NOT NULL
