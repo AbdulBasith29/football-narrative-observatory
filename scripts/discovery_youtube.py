@@ -226,7 +226,7 @@ def discover_videos(target_db="FOOTBALL_NARRATIVE_DEV", run_purpose="RESEARCH", 
                     
                 cursor.execute('''INSERT INTO CORE.BRIDGE_VIDEO_EVENT 
                                   (video_event_key, video_key, event_version_key, sampling_policy_version_key, inclusion_status, primary_exclusion_reason, discovery_method, discovery_provenance)
-                                  VALUES (%s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s))''',
+                                  SELECT %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s)''',
                                (str(uuid.uuid4()), v_key, ev_key, sampling_policy_version_key, status, reason, discovery_method, provenance))
                                
     conn.commit()

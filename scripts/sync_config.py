@@ -74,7 +74,7 @@ def sync_events(conn, config_path):
         else:
             version_key = str(uuid.uuid4())
             cursor.execute('''INSERT INTO CORE.DIM_EVENT_VERSION (event_version_key, event_key, event_name, occurred_at, inclusion_rationale, event_terms, valid_from, is_current)
-                              VALUES (%s, %s, %s, %s, %s, PARSE_JSON(%s), %s, TRUE)''', (version_key, event_key, event_name, occurred_at, rationale, terms_json, now))
+                              SELECT %s, %s, %s, %s, %s, PARSE_JSON(%s), %s, TRUE''', (version_key, event_key, event_name, occurred_at, rationale, terms_json, now))
                               
         # Sync windows
         occurred_dt = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
@@ -141,7 +141,7 @@ def sync_channels(conn, config_path):
         frame_version_key = str(uuid.uuid4())
         cursor.execute('''INSERT INTO CORE.DIM_CHANNEL_FRAME_VERSION 
                           (frame_version_key, frame_name, frame_purpose, methodology_version, configuration_version, configuration_hash, git_commit_sha, constructed_at, configuration_provenance)
-                          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s))''',
+                          SELECT %s, %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s)''',
                        (frame_version_key, frame_name, frame_purpose, methodology_version, 'v1', config_hash, git_sha_to_store, now, json.dumps(data)))
     
     for ch in data.get('channels', []):
