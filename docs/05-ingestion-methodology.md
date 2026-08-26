@@ -226,7 +226,15 @@ Every request records:
 - `quota_reset_at`
 - `request_count`
 
-Quota budgets are configuration-driven. The project currently receives separate API quota buckets (10,000 general queries and 100 search queries per day).
+Quota budgets are configuration-driven. The project receives separate API quota buckets: general queries (10,000/day) and YouTube Search Queries (100 search calls/day).
+
+### Search Fallback Quota Management & Resumable Discovery
+- **Call Accounting**: `search.list` consumes 1 Search Query per call from the separate YouTube Search Queries bucket (default 100 search queries/day). Pagination requests (`nextPageToken`) count as additional search query calls.
+- **Process Call Budget**: Process executions operate under a `run_search_call_budget` parameter limiting calls per execution without assuming exclusive project-level quota.
+- **Pre-run Call Metrics**: Calculates `minimum_required_calls` (count of uncompleted initial query pages) prior to API execution.
+- **Page-Level Token Checkpointing**: State is stored in `OPS.DISCOVERY_UNIT_STATE` tracking `(frame_version_key, channel_key, window_key, discovery_policy_version, query_hash)`. Mid-batch halts persist `next_page_token` and `pages_completed`, allowing subsequent runs to resume pagination directly.
+- **HTTP 429 Handling**: API quota errors (HTTP 429 / `quotaExceeded`) are caught non-destructively, persisting completed page progress and setting run status to `PARTIAL_QUOTA_LIMIT`.
+- **Set-Based Completeness Audit**: Historical frame discovery status becomes `COMPLETE` if and only if `REMAINING_UNITS == 0` (where `REMAINING_UNITS = len(EXPECTED_UNITS - COMPLETED_UNITS)`). Partial runs set status `PARTIAL_QUOTA_LIMIT` and strictly prohibit universe promotion.
 
 ## 18. Checkpoint Transaction Rules
 Checkpoint advancement occurs only after:

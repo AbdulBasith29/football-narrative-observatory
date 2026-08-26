@@ -22,5 +22,5 @@ frame_key = row[0]
 conn.close()
 
 print(f"Starting discovery on {target_db} with frame {frame_key}...")
-discover_videos(target_db=target_db, run_purpose='INTEGRATION_TEST', frame_version_key=frame_key)
+discover_videos(target_db=target_db, run_purpose='INTEGRATION_TEST', frame_version_key=frame_key, use_search_fallback=True)
 print("Discovery complete!")
