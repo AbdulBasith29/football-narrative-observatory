@@ -260,7 +260,7 @@ def test_pre_run_estimation():
     ]
     aliases = ["alias1"]
     
-    expected_units = generate_discovery_units("frame1", channels, windows, aliases, "sp1")
+    expected_units = generate_discovery_units("frame1", channels, windows, aliases, "sp1", discovery_policy_version="1.0")
     assert len(expected_units) == 2
     
     metrics = estimate_search_calls(expected_units, {})
@@ -269,7 +269,8 @@ def test_pre_run_estimation():
     assert metrics["remaining_units_count"] == 2
     assert metrics["minimum_required_calls"] == 2
     
-    unit1_key = (expected_units[0]["channel_key"], expected_units[0]["window_key"], expected_units[0]["query_hash"])
+    unit1 = expected_units[0]
+    unit1_key = (unit1["frame_version_key"], unit1["channel_key"], unit1["window_key"], unit1["discovery_policy_version"], unit1["query_hash"])
     existing_states = {
         unit1_key: {"status": "COMPLETED"}
     }
@@ -362,7 +363,7 @@ def test_mid_pagination_resume(mock_windows, mock_aliases, mock_get_conn, mock_g
         if "DIM_SAMPLING_POLICY_VERSION" in sql:
             return ("sp_key_1",)
         if "DISCOVERY_UNIT_STATE" in sql and "SELECT discovery_unit_key" in sql:
-            return ("unit_1",)
+            return ("unit_1", "2022-12-01T00:00:00Z")
         return None
 
     def fetchall_impl():
@@ -375,9 +376,9 @@ def test_mid_pagination_resume(mock_windows, mock_aliases, mock_get_conn, mock_g
         if "DISCOVERY_UNIT_STATE" in sql:
             unit_state_calls += 1
             if unit_state_calls == 1:
-                return [("unit_1", "ch_key_1", "w1", q_hash, "PARTIAL_QUOTA_LIMIT", 1, "resume_token_123", 1, 10, 10)]
+                return [("unit_1", "frame_1", "ch_key_1", "w1", "sp_key_1", "1.0", 1, q_hash, '"messi"', "PARTIAL_QUOTA_LIMIT", 1, "resume_token_123", 10, 10, 1, "2022-12-01T00:00:00Z", "2022-12-01T00:00:00Z", None, None, None, "run1", "run1")]
             else:
-                return [("unit_1", "ch_key_1", "w1", q_hash, "COMPLETED", 2, None, 2, 20, 20)]
+                return [("unit_1", "frame_1", "ch_key_1", "w1", "sp_key_1", "1.0", 1, q_hash, '"messi"', "COMPLETED", 2, None, 20, 20, 2, "2022-12-01T00:00:00Z", "2022-12-01T00:00:00Z", "2022-12-01T00:00:00Z", None, None, "run1", "run2")]
         return []
 
     mock_cursor.fetchone.side_effect = fetchone_impl
@@ -470,3 +471,191 @@ def test_http_429_quota_handling(mock_windows, mock_aliases, mock_get_conn, mock
     )
     
     assert result["run_status"] == "PARTIAL_QUOTA_LIMIT"
+
+@patch("discovery_youtube.build")
+@patch("discovery_youtube.os.getenv")
+@patch("discovery_youtube.get_snowflake_connection")
+@patch("discovery_youtube.get_aliases")
+@patch("discovery_youtube.get_event_windows_and_terms")
+def test_non_quota_operational_failure(mock_windows, mock_aliases, mock_get_conn, mock_getenv, mock_build):
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_get_conn.return_value = mock_conn
+    mock_conn.cursor.return_value = mock_cursor
+    
+    def fetchone_impl():
+        if not mock_cursor.execute.call_args:
+            return None
+        sql = mock_cursor.execute.call_args[0][0]
+        if "DIM_CHANNEL_FRAME_VERSION" in sql:
+            return ("RESEARCH",)
+        if "DIM_SAMPLING_POLICY_VERSION" in sql:
+            return ("sp_key_1",)
+        return None
+
+    def fetchall_impl():
+        if not mock_cursor.execute.call_args:
+            return []
+        sql = mock_cursor.execute.call_args[0][0]
+        if "BRIDGE_FRAME_CHANNEL" in sql:
+            return [("ch_key_1", "ch_id_1")]
+        return []
+
+    mock_cursor.fetchone.side_effect = fetchone_impl
+    mock_cursor.fetchall.side_effect = fetchall_impl
+    
+    mock_youtube = MagicMock()
+    mock_build.return_value = mock_youtube
+    mock_req = MagicMock()
+    mock_youtube.search().list.return_value = mock_req
+    
+    mock_resp = MagicMock()
+    mock_resp.status = 500
+    from googleapiclient.errors import HttpError
+    mock_req.execute.side_effect = HttpError(mock_resp, b'{"error": {"message": "Internal Server Error"}}')
+    
+    mock_aliases.return_value = ["messi"]
+    mock_windows.return_value = [{
+        'window_key': 'w1',
+        'event_version_key': 'ev1',
+        'start': datetime(2022, 12, 1, tzinfo=timezone.utc),
+        'end': datetime(2022, 12, 31, tzinfo=timezone.utc),
+        'terms': []
+    }]
+    
+    result = discover_videos(
+        run_purpose="RESEARCH",
+        frame_version_key="frame_1",
+        use_search_fallback=True,
+        run_search_call_budget=10
+    )
+    
+    assert result["run_status"] == "PARTIAL_ERROR"
+
+def test_long_page_token_persistence():
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_cursor.fetchone.return_value = None
+    
+    long_token = "A" * 1500  # Token > 512 chars (e.g. 1500 chars)
+    st_record = {
+        "frame_version_key": "frame_1",
+        "channel_key": "ch_1",
+        "window_key": "w_1",
+        "sampling_policy_version_key": "sp_1",
+        "discovery_policy_version": "1.0",
+        "query_batch_number": 1,
+        "query_hash": "hash_123",
+        "search_query": "test query",
+        "status": "PARTIAL_QUOTA_LIMIT",
+        "pages_completed": 2,
+        "next_page_token": long_token,
+        "items_observed": 50,
+        "unique_video_ids_observed": 45,
+        "search_calls_consumed": 2,
+        "started_at": "2022-12-01T00:00:00Z",
+        "completed_at": None,
+        "ingestion_run_id": "run_1"
+    }
+    
+    from discovery_youtube import upsert_discovery_unit_state
+    unit_key = upsert_discovery_unit_state(mock_conn, st_record)
+    assert unit_key is not None
+    assert mock_cursor.execute.call_count >= 2
+
+def test_pending_unit_null_started_at():
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_cursor.fetchone.return_value = None
+    
+    st_record = {
+        "frame_version_key": "frame_1",
+        "channel_key": "ch_1",
+        "window_key": "w_1",
+        "sampling_policy_version_key": "sp_1",
+        "discovery_policy_version": "1.0",
+        "query_batch_number": 1,
+        "query_hash": "hash_123",
+        "search_query": "test query",
+        "status": "PENDING",
+        "pages_completed": 0,
+        "next_page_token": None,
+        "items_observed": 0,
+        "unique_video_ids_observed": 0,
+        "search_calls_consumed": 0,
+        "started_at": None,
+        "completed_at": None,
+        "ingestion_run_id": "run_1"
+    }
+    
+    from discovery_youtube import upsert_discovery_unit_state
+    upsert_discovery_unit_state(mock_conn, st_record)
+    insert_args = mock_cursor.execute.call_args_list[1][0][1]
+    started_at_arg = insert_args[15]
+    assert started_at_arg is None
+
+def test_discovery_policy_version_invalidation():
+    channels = [("ch1_key", "ch1_id")]
+    windows = [{
+        'window_key': 'w1',
+        'event_version_key': 'ev1',
+        'start': datetime(2022, 12, 1, tzinfo=timezone.utc),
+        'end': datetime(2022, 12, 31, tzinfo=timezone.utc),
+        'terms': ['term1']
+    }]
+    aliases = ["alias1"]
+    
+    units_v1 = generate_discovery_units("frame1", channels, windows, aliases, "sp1", discovery_policy_version="1.0")
+    units_v2 = generate_discovery_units("frame1", channels, windows, aliases, "sp1", discovery_policy_version="2.0")
+    
+    q_hash = units_v1[0]["query_hash"]
+    key_v1 = (units_v1[0]["frame_version_key"], units_v1[0]["channel_key"], units_v1[0]["window_key"], "1.0", q_hash)
+    
+    existing_states = {
+        key_v1: {"status": "COMPLETED"}
+    }
+    
+    metrics_v2 = estimate_search_calls(units_v2, existing_states)
+    assert metrics_v2["completed_units_count"] == 0
+    assert metrics_v2["remaining_units_count"] == 1
+
+def test_resumed_unit_clears_stale_errors():
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_cursor.fetchone.return_value = ("unit_1", "2022-12-01T00:00:00Z")
+    
+    st_record = {
+        "frame_version_key": "frame_1",
+        "channel_key": "ch_1",
+        "window_key": "w_1",
+        "sampling_policy_version_key": "sp_1",
+        "discovery_policy_version": "1.0",
+        "query_batch_number": 1,
+        "query_hash": "hash_123",
+        "search_query": "test query",
+        "status": "COMPLETED",
+        "pages_completed": 2,
+        "next_page_token": None,
+        "items_observed": 50,
+        "unique_video_ids_observed": 45,
+        "search_calls_consumed": 2,
+        "started_at": "2022-12-01T00:00:00Z",
+        "completed_at": "2022-12-01T01:00:00Z",
+        "last_error_code": "HTTP_500",
+        "last_error_message": "Stale Error",
+        "ingestion_run_id": "run_2"
+    }
+    
+    from discovery_youtube import upsert_discovery_unit_state
+    upsert_discovery_unit_state(mock_conn, st_record)
+    
+    update_args = mock_cursor.execute.call_args_list[1][0][1]
+    # Check that last_error_code and last_error_message are passed as None when status == COMPLETED
+    last_err_code_arg = update_args[9]
+    last_err_msg_arg = update_args[10]
+    assert last_err_code_arg is None
+    assert last_err_msg_arg is None
+

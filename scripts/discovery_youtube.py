@@ -135,8 +135,12 @@ def get_discovery_unit_states(conn, frame_version_key, discovery_policy_version=
     cursor = conn.cursor()
     try:
         cursor.execute('''
-            SELECT discovery_unit_key, channel_key, window_key, query_hash, status, pages_completed, 
-                   next_page_token, search_calls_consumed, items_observed, unique_video_ids_observed
+            SELECT discovery_unit_key, frame_version_key, channel_key, window_key, 
+                   sampling_policy_version_key, discovery_policy_version, query_batch_number, 
+                   query_hash, search_query, status, pages_completed, next_page_token, 
+                   items_observed, unique_video_ids_observed, search_calls_consumed, 
+                   started_at, updated_at, completed_at, last_error_code, last_error_message, 
+                   first_ingestion_run_id, latest_ingestion_run_id
             FROM OPS.DISCOVERY_UNIT_STATE
             WHERE frame_version_key = %s AND discovery_policy_version = %s
         ''', (frame_version_key, discovery_policy_version))
@@ -146,57 +150,83 @@ def get_discovery_unit_states(conn, frame_version_key, discovery_policy_version=
         
     states = {}
     for r in rows:
-        key = (r[1], r[2], r[3]) # (channel_key, window_key, query_hash)
+        key = (r[1], r[2], r[3], r[5], r[7]) # (frame_version_key, channel_key, window_key, discovery_policy_version, query_hash)
         states[key] = {
             "discovery_unit_key": r[0],
-            "channel_key": r[1],
-            "window_key": r[2],
-            "query_hash": r[3],
-            "status": r[4],
-            "pages_completed": r[5] or 0,
-            "next_page_token": r[6],
-            "search_calls_consumed": r[7] or 0,
-            "items_observed": r[8] or 0,
-            "unique_video_ids_observed": r[9] or 0
+            "frame_version_key": r[1],
+            "channel_key": r[2],
+            "window_key": r[3],
+            "sampling_policy_version_key": r[4],
+            "discovery_policy_version": r[5],
+            "query_batch_number": r[6],
+            "query_hash": r[7],
+            "search_query": r[8],
+            "status": r[9],
+            "pages_completed": r[10] or 0,
+            "next_page_token": r[11],
+            "items_observed": r[12] or 0,
+            "unique_video_ids_observed": r[13] or 0,
+            "search_calls_consumed": r[14] or 0,
+            "started_at": r[15],
+            "updated_at": r[16],
+            "completed_at": r[17],
+            "last_error_code": r[18],
+            "last_error_message": r[19],
+            "first_ingestion_run_id": r[20],
+            "latest_ingestion_run_id": r[21]
         }
     return states
 
 def upsert_discovery_unit_state(conn, state):
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT discovery_unit_key FROM OPS.DISCOVERY_UNIT_STATE 
+        SELECT discovery_unit_key, started_at FROM OPS.DISCOVERY_UNIT_STATE 
         WHERE frame_version_key = %s AND channel_key = %s AND window_key = %s 
           AND discovery_policy_version = %s AND query_hash = %s
     ''', (state['frame_version_key'], state['channel_key'], state['window_key'], state['discovery_policy_version'], state['query_hash']))
     row = cursor.fetchone()
     now_iso = datetime.now(timezone.utc).isoformat()
+    
+    last_error_code = state.get('last_error_code')
+    last_error_message = state.get('last_error_message')
+    if state['status'] == 'COMPLETED':
+        last_error_code = None
+        last_error_message = None
+        
     if row:
         unit_key = row[0]
+        existing_started_at = row[1]
+        started_at = existing_started_at or state.get('started_at')
         cursor.execute('''
             UPDATE OPS.DISCOVERY_UNIT_STATE 
             SET status = %s, pages_completed = %s, next_page_token = %s, 
                 items_observed = %s, unique_video_ids_observed = %s, search_calls_consumed = %s, 
-                updated_at = %s, completed_at = %s, latest_ingestion_run_id = %s
+                started_at = %s, updated_at = %s, completed_at = %s, 
+                last_error_code = %s, last_error_message = %s, latest_ingestion_run_id = %s
             WHERE discovery_unit_key = %s
         ''', (state['status'], state['pages_completed'], state.get('next_page_token'),
               state['items_observed'], state['unique_video_ids_observed'], state['search_calls_consumed'],
-              now_iso, state.get('completed_at'), state.get('ingestion_run_id'), unit_key))
+              started_at, now_iso, state.get('completed_at'),
+              last_error_code, last_error_message, state.get('ingestion_run_id'), unit_key))
     else:
         unit_key = str(uuid.uuid4())
+        started_at = state.get('started_at')
         cursor.execute('''
             INSERT INTO OPS.DISCOVERY_UNIT_STATE (
                 discovery_unit_key, frame_version_key, channel_key, window_key, 
                 sampling_policy_version_key, discovery_policy_version, query_batch_number, 
                 query_hash, search_query, status, pages_completed, next_page_token, 
                 items_observed, unique_video_ids_observed, search_calls_consumed, 
-                started_at, updated_at, completed_at, first_ingestion_run_id, latest_ingestion_run_id
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                started_at, updated_at, completed_at, last_error_code, last_error_message, 
+                first_ingestion_run_id, latest_ingestion_run_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ''', (
             unit_key, state['frame_version_key'], state['channel_key'], state['window_key'],
             state['sampling_policy_version_key'], state['discovery_policy_version'], state['query_batch_number'],
             state['query_hash'], state['search_query'], state['status'], state['pages_completed'],
             state.get('next_page_token'), state['items_observed'], state['unique_video_ids_observed'],
-            state['search_calls_consumed'], now_iso, now_iso, state.get('completed_at'),
+            state['search_calls_consumed'], started_at, now_iso, state.get('completed_at'),
+            last_error_code, last_error_message,
             state.get('ingestion_run_id'), state.get('ingestion_run_id')
         ))
     conn.commit()
@@ -205,21 +235,21 @@ def upsert_discovery_unit_state(conn, state):
 def estimate_search_calls(expected_units, existing_states):
     total_expected = len(expected_units)
     completed_count = 0
-    remaining_units = []
+    unfinished_units = []
     
     for u in expected_units:
-        key = (u['channel_key'], u['window_key'], u['query_hash'])
+        key = (u['frame_version_key'], u['channel_key'], u['window_key'], u['discovery_policy_version'], u['query_hash'])
         st = existing_states.get(key)
         if st and st['status'] == 'COMPLETED':
             completed_count += 1
         else:
-            remaining_units.append(u)
+            unfinished_units.append(u)
             
     return {
         "total_expected_units": total_expected,
         "completed_units_count": completed_count,
-        "remaining_units_count": len(remaining_units),
-        "minimum_required_calls": len(remaining_units)
+        "remaining_units_count": len(unfinished_units),
+        "minimum_required_calls": len(unfinished_units)
     }
 
 def fetch_search_items_for_windows(youtube, channel_id, aliases, windows, search_query_character_budget=500, run_search_call_budget=100):
@@ -406,27 +436,31 @@ def discover_videos(
               f"Minimum Required Calls={pre_run_metrics['minimum_required_calls']}")
               
         stopped_early = False
+        encountered_non_quota_error = False
         
         for unit in expected_units:
-            unit_key = (unit['channel_key'], unit['window_key'], unit['query_hash'])
+            unit_key = (unit['frame_version_key'], unit['channel_key'], unit['window_key'], unit['discovery_policy_version'], unit['query_hash'])
             curr_state = existing_states.get(unit_key)
             
             if curr_state and curr_state['status'] == 'COMPLETED':
                 continue
                 
-            if stopped_early:
+            if stopped_early or encountered_non_quota_error:
                 break
                 
             page_token = curr_state['next_page_token'] if curr_state else None
             pages_completed = curr_state['pages_completed'] if curr_state else 0
             items_observed = curr_state['items_observed'] if curr_state else 0
             calls_this_unit = curr_state['search_calls_consumed'] if curr_state else 0
+            started_at = (curr_state.get('started_at') if curr_state else None) or datetime.now(timezone.utc).isoformat()
             
             unit_items = {}
             min_date_str = unit['start'].isoformat().replace("+00:00", "Z")
             max_date_str = unit['end'].isoformat().replace("+00:00", "Z")
             
             unit_status = 'IN_PROGRESS'
+            last_error_code = None
+            last_error_message = None
             hit_limit = False
             
             while True:
@@ -455,14 +489,20 @@ def discover_videos(
                     resp = req.execute()
                 except Exception as err:
                     err_str = str(err).lower()
-                    if "429" in err_str or "quotaexceeded" in err_str or "ratelimitexceeded" in err_str or (hasattr(err, 'resp') and getattr(err.resp, 'status', None) in (429, 403)):
+                    status_code = getattr(getattr(err, 'resp', None), 'status', None)
+                    if status_code in (429, 403) or "429" in err_str or "quotaexceeded" in err_str or "ratelimitexceeded" in err_str:
                         print("API Quota Limit (429) hit during search list. Halting clean and persisting state.")
                         unit_status = 'PARTIAL_QUOTA_LIMIT'
                         hit_limit = True
                         stopped_early = True
                         break
                     else:
-                        raise err
+                        print(f"Non-quota error hit during search list: {err}")
+                        unit_status = 'PARTIAL_ERROR'
+                        encountered_non_quota_error = True
+                        last_error_code = f"HTTP_{status_code}" if status_code else "API_ERROR"
+                        last_error_message = str(err)[:1024]
+                        break
                         
                 new_items = resp.get("items", [])
                 items_observed += len(new_items)
@@ -494,7 +534,10 @@ def discover_videos(
                 "items_observed": items_observed,
                 "unique_video_ids_observed": len(unit_items),
                 "search_calls_consumed": calls_this_unit,
+                "started_at": started_at,
                 "completed_at": datetime.now(timezone.utc).isoformat() if unit_status == 'COMPLETED' else None,
+                "last_error_code": last_error_code,
+                "last_error_message": last_error_message,
                 "ingestion_run_id": ingestion_run_id
             }
             upsert_discovery_unit_state(conn, st_record)
@@ -547,14 +590,23 @@ def discover_videos(
                                    
         # Check completeness audit rule
         post_states = get_discovery_unit_states(conn, frame_version_key, discovery_policy_version=discovery_policy_version)
-        expected_hashes = {u['query_hash'] for u in expected_units}
-        completed_hashes = {st['query_hash'] for st in post_states.values() if st['status'] == 'COMPLETED'}
-        remaining_hashes = expected_hashes - completed_hashes
+        expected_keys = {
+            (u['frame_version_key'], u['channel_key'], u['window_key'], u['discovery_policy_version'], u['query_hash'])
+            for u in expected_units
+        }
+        completed_keys = {
+            k for k, st in post_states.items() if st['status'] == 'COMPLETED'
+        }
+        remaining_keys = expected_keys - completed_keys
         
-        if len(remaining_hashes) == 0:
+        if len(remaining_keys) == 0:
             run_outcome = "COMPLETE"
-        else:
+        elif stopped_early:
             run_outcome = "PARTIAL_QUOTA_LIMIT"
+        elif encountered_non_quota_error:
+            run_outcome = "PARTIAL_ERROR"
+        else:
+            run_outcome = "FAILED"
             
     else:
         # Uploads playlist path

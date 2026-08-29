@@ -6,7 +6,7 @@ Can YouTube actually provide the data required to answer each research question,
 - **Source name**: YouTube Data API v3
 - **API or access method**: REST API (`https://www.googleapis.com/youtube/v3/`)
 - **Authentication requirements**: API Key (Server-to-Server)
-- **Quota model**: Separate daily limits: 10,000 general queries (for comment/video endpoints), 100 search queries, and 10,000 video batch statistics queries.
+- **Quota model**: Separate daily limits: 10,000 general queries (for comment/video endpoints), 100 search queries (`search.list` quota bucket), and 10,000 video batch statistics queries. Note that `run_search_call_budget` is a process guardrail limiting maximum Search API calls per run, distinct from provider-side remaining quota.
 - **Historical availability**: Generally exhaustive for active videos, but subject to deletion, privacy changes, and missing historical context if a video is removed or comments are disabled.
 - **Terms and policy constraints**: Strict rules against deriving personally identifiable information (PII), storing raw author identifiers indefinitely without pseudonymisation, or exposing API data in ways that violate YouTube's Developer Policies.
 

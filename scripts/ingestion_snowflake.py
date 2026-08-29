@@ -386,6 +386,7 @@ def ingest_video(video_id: str, hmac_secret: str, youtube, run_type: str = "HOT_
 
 def clean_database(conn):
     c = conn.cursor()
+    c.execute("DELETE FROM OPS.DISCOVERY_UNIT_STATE")
     c.execute("DELETE FROM OPS.CHECKPOINT_WATERMARK_COMMENT_HISTORY")
     c.execute("DELETE FROM OPS.CHECKPOINT_WATERMARK_COMMENT")
     c.execute("DELETE FROM OPS.CHECKPOINT_HISTORY")
