@@ -659,3 +659,14 @@ def test_resumed_unit_clears_stale_errors():
     assert last_err_code_arg is None
     assert last_err_msg_arg is None
 
+def test_v006_migration_upgrades_existing_table_without_data_loss():
+    mig_path = os.path.join(os.path.dirname(__file__), '..', 'infra', 'snowflake', 'migrations', 'V006__create_discovery_unit_state.sql')
+    assert os.path.exists(mig_path)
+    with open(mig_path, 'r') as f:
+        sql = f.read()
+    assert "ALTER TABLE OPS.DISCOVERY_UNIT_STATE MODIFY COLUMN next_page_token VARCHAR(2048);" in sql
+    assert "ALTER TABLE OPS.DISCOVERY_UNIT_STATE ALTER COLUMN started_at DROP NOT NULL;" in sql
+    assert "ALTER TABLE OPS.DISCOVERY_UNIT_STATE ADD COLUMN IF NOT EXISTS last_error_code VARCHAR(128);" in sql
+    assert "ALTER TABLE OPS.DISCOVERY_UNIT_STATE ADD COLUMN IF NOT EXISTS last_error_message VARCHAR(1024);" in sql
+
+
