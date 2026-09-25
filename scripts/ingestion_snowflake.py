@@ -21,6 +21,17 @@ def get_snowflake_connection(bootstrap=False, target_db="FOOTBALL_NARRATIVE_DEV"
     wh = os.getenv("SNOWFLAKE_WAREHOUSE")
     if wh:
         conn_params["warehouse"] = wh
+    role = os.getenv("SNOWFLAKE_ROLE")
+    if role:
+        conn_params["role"] = role
+    auth = os.getenv("SNOWFLAKE_AUTHENTICATOR", "").strip()
+    if auth and auth.lower() not in ("snowflake", "default"):
+        conn_params["authenticator"] = auth
+    passcode = os.getenv("SNOWFLAKE_PASSCODE")
+    if passcode:
+        conn_params["passcode"] = passcode
+    if os.getenv("SNOWFLAKE_PASSCODE_IN_PASSWORD", "").lower() in ("true", "1"):
+        conn_params["passcode_in_password"] = True
         
     if not bootstrap:
         conn_params["database"] = target_db
