@@ -769,4 +769,354 @@ def test_partial_error_recovery_lineage(mock_windows, mock_aliases, mock_get_con
     assert unit_key_arg == "unit_key_100"
 
 
+@patch("discovery_youtube.build")
+@patch("discovery_youtube.os.getenv")
+@patch("discovery_youtube.get_snowflake_connection")
+@patch("discovery_youtube.get_aliases")
+@patch("discovery_youtube.get_event_windows_and_terms")
+def test_partial_error_page_token_preservation_and_resume(mock_windows, mock_aliases, mock_get_conn, mock_getenv, mock_build):
+    """
+    Offline regression test proving:
+    Page 1 success -> Page 2 failure -> next_page_token preserved in PARTIAL_ERROR ->
+    Resume from Page 2 -> COMPLETED while preserving first/latest run lineage.
+    """
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_get_conn.return_value = mock_conn
+    mock_conn.cursor.return_value = mock_cursor
 
+    mock_aliases.return_value = ["messi"]
+    mock_windows.return_value = [{
+        'window_key': 'w1',
+        'event_version_key': 'ev1',
+        'start': datetime(2022, 12, 1, tzinfo=timezone.utc),
+        'end': datetime(2022, 12, 31, tzinfo=timezone.utc),
+        'terms': []
+    }]
+    q_hash = compute_query_hash('"messi"')
+
+    # STEP 1: Execute Run 1 where Page 1 succeeds and Page 2 encounters a non-quota connection failure
+    def fetchone_run1():
+        sql = mock_cursor.execute.call_args[0][0] if mock_cursor.execute.call_args else ""
+        if "DIM_CHANNEL_FRAME_VERSION" in sql:
+            return ("RESEARCH",)
+        if "DIM_SAMPLING_POLICY_VERSION" in sql:
+            return ("sp_key_1",)
+        if "FROM OPS.DISCOVERY_UNIT_STATE" in sql:
+            return None
+        return None
+
+    def fetchall_run1():
+        sql = mock_cursor.execute.call_args[0][0] if mock_cursor.execute.call_args else ""
+        if "BRIDGE_FRAME_CHANNEL" in sql:
+            return [("ch_key_1", "ch_id_1")]
+        if "FROM OPS.DISCOVERY_UNIT_STATE" in sql:
+            return []
+        return []
+
+    mock_cursor.fetchone.side_effect = fetchone_run1
+    mock_cursor.fetchall.side_effect = fetchall_run1
+
+    mock_youtube = MagicMock()
+    mock_build.return_value = mock_youtube
+    req_page1 = MagicMock()
+    req_page2 = MagicMock()
+    mock_youtube.search().list.side_effect = [req_page1, req_page2]
+
+    req_page1.execute.return_value = {
+        "items": [{"id": {"videoId": "v1"}, "snippet": {"publishedAt": "2022-12-05T12:00:00Z", "title": "v1", "description": ""}}],
+        "nextPageToken": "token_for_page_2"
+    }
+    req_page2.execute.side_effect = ConnectionResetError("Connection dropped mid-batch")
+
+    res1 = discover_videos(
+        run_purpose="RESEARCH",
+        frame_version_key="frame_1",
+        use_search_fallback=True,
+        run_search_call_budget=10
+    )
+
+    assert res1["run_status"] == "PARTIAL_ERROR"
+
+    insert_calls = [
+        call for call in mock_cursor.execute.call_args_list 
+        if "INSERT INTO OPS.DISCOVERY_UNIT_STATE" in call[0][0]
+    ]
+    assert len(insert_calls) == 1
+    ins_args = insert_calls[0][0][1]
+    (u_key, f_key, ch_key, w_key, sp_key, dp_ver, q_batch, qh, query,
+     status, pages_comp, token, items_obs, uniq_obs, calls_used,
+     start_at, upd_at, comp_at, err_code, err_msg, first_run_id, latest_run_id) = ins_args
+
+    assert status == "PARTIAL_ERROR"
+    assert pages_comp == 1
+    assert token == "token_for_page_2", "next_page_token must be preserved on PARTIAL_ERROR when page 1 succeeded"
+    assert items_obs == 1
+    assert uniq_obs == 1
+    assert err_code == "API_ERROR"
+    assert "Connection dropped" in err_msg
+    assert first_run_id == res1["ingestion_run_id"]
+    assert latest_run_id == res1["ingestion_run_id"]
+
+    # STEP 2: Resume in Run 2 from the persisted PARTIAL_ERROR state
+    mock_cursor.reset_mock()
+    unit_calls = 0
+
+    def fetchone_run2():
+        sql = mock_cursor.execute.call_args[0][0] if mock_cursor.execute.call_args else ""
+        if "DIM_CHANNEL_FRAME_VERSION" in sql:
+            return ("RESEARCH",)
+        if "DIM_SAMPLING_POLICY_VERSION" in sql:
+            return ("sp_key_1",)
+        if "FROM OPS.DISCOVERY_UNIT_STATE" in sql:
+            return (u_key, start_at)
+        return None
+
+    def fetchall_run2():
+        nonlocal unit_calls
+        sql = mock_cursor.execute.call_args[0][0] if mock_cursor.execute.call_args else ""
+        if "BRIDGE_FRAME_CHANNEL" in sql:
+            return [("ch_key_1", "ch_id_1")]
+        if "FROM OPS.DISCOVERY_UNIT_STATE" in sql:
+            unit_calls += 1
+            if unit_calls == 1:
+                return [(
+                    u_key, "frame_1", "ch_key_1", "w1", "sp_key_1", "1.0", 1,
+                    q_hash, '"messi"', "PARTIAL_ERROR", 1, "token_for_page_2", 1, 1, 2,
+                    start_at, upd_at, None, "API_ERROR", "Connection dropped",
+                    res1["ingestion_run_id"], res1["ingestion_run_id"]
+                )]
+            else:
+                return [(
+                    u_key, "frame_1", "ch_key_1", "w1", "sp_key_1", "1.0", 1,
+                    q_hash, '"messi"', "COMPLETED", 2, None, 2, 2, 3,
+                    start_at, upd_at, "2022-12-05T12:05:00Z", None, None,
+                    res1["ingestion_run_id"], "run2_id"
+                )]
+        return []
+
+    mock_cursor.fetchone.side_effect = fetchone_run2
+    mock_cursor.fetchall.side_effect = fetchall_run2
+
+    req_page2_resume = MagicMock()
+    mock_youtube.search().list.side_effect = None
+    mock_youtube.search().list.return_value = req_page2_resume
+    req_page2_resume.execute.return_value = {
+        "items": [{"id": {"videoId": "v2"}, "snippet": {"publishedAt": "2022-12-06T12:00:00Z", "title": "v2", "description": ""}}],
+        "nextPageToken": None
+    }
+
+    res2 = discover_videos(
+        run_purpose="RESEARCH",
+        frame_version_key="frame_1",
+        use_search_fallback=True,
+        run_search_call_budget=10
+    )
+
+    call_kwargs = mock_youtube.search().list.call_args[1]
+    assert call_kwargs["pageToken"] == "token_for_page_2"
+    assert res2["run_status"] == "COMPLETE"
+
+    update_calls = [
+        call for call in mock_cursor.execute.call_args_list 
+        if "UPDATE OPS.DISCOVERY_UNIT_STATE" in call[0][0]
+    ]
+    assert len(update_calls) == 1
+    upd_args = update_calls[0][0][1]
+    (upd_status, upd_pages, upd_token, upd_items, upd_uniq, upd_calls,
+     upd_started, upd_updated, upd_completed, upd_err_code, upd_err_msg,
+     upd_run_id, upd_key) = upd_args
+
+    assert upd_status == "COMPLETED"
+    assert upd_pages == 2
+    assert upd_token is None
+    assert upd_items == 2
+    assert upd_uniq == 2
+    assert upd_completed is not None
+    assert upd_err_code is None
+    assert upd_err_msg is None
+    assert upd_run_id == res2["ingestion_run_id"]
+    assert upd_run_id != res1["ingestion_run_id"]
+    assert upd_key == u_key
+
+
+@patch("discovery_youtube.build")
+@patch("discovery_youtube.os.getenv")
+@patch("discovery_youtube.get_snowflake_connection")
+@patch("discovery_youtube.get_aliases")
+@patch("discovery_youtube.get_event_windows_and_terms")
+def test_http_403_distinguishes_quota_from_forbidden(mock_windows, mock_aliases, mock_get_conn, mock_getenv, mock_build):
+    """
+    Proves that HTTP 403 is NOT automatically classified as quota exhaustion.
+    Ordinary 403 (accessNotConfigured/forbidden) becomes PARTIAL_ERROR with HTTP_403.
+    Only documented quota reasons (quotaExceeded) become PARTIAL_QUOTA_LIMIT.
+    """
+    from googleapiclient.errors import HttpError
+    from httplib2 import Response
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_get_conn.return_value = mock_conn
+    mock_conn.cursor.return_value = mock_cursor
+
+    mock_aliases.return_value = ["messi"]
+    mock_windows.return_value = [{
+        'window_key': 'w1',
+        'event_version_key': 'ev1',
+        'start': datetime(2022, 12, 1, tzinfo=timezone.utc),
+        'end': datetime(2022, 12, 31, tzinfo=timezone.utc),
+        'terms': []
+    }]
+
+    def fetchone_impl():
+        sql = mock_cursor.execute.call_args[0][0] if mock_cursor.execute.call_args else ""
+        if "DIM_CHANNEL_FRAME_VERSION" in sql:
+            return ("RESEARCH",)
+        if "DIM_SAMPLING_POLICY_VERSION" in sql:
+            return ("sp_key_1",)
+        return None
+
+    def fetchall_impl():
+        sql = mock_cursor.execute.call_args[0][0] if mock_cursor.execute.call_args else ""
+        if "BRIDGE_FRAME_CHANNEL" in sql:
+            return [("ch_key_1", "ch_id_1")]
+        return []
+
+    mock_cursor.fetchone.side_effect = fetchone_impl
+    mock_cursor.fetchall.side_effect = fetchall_impl
+
+    mock_youtube = MagicMock()
+    mock_build.return_value = mock_youtube
+    mock_req = MagicMock()
+    mock_youtube.search().list.return_value = mock_req
+
+    # Case 1: HTTP 403 with ordinary auth/forbidden reason (e.g., accessNotConfigured)
+    resp_forbidden = Response({"status": "403"})
+    err_forbidden = HttpError(resp_forbidden, b'{"error": {"errors": [{"reason": "accessNotConfigured", "message": "API not enabled"}]}}')
+    mock_req.execute.side_effect = err_forbidden
+
+    res_auth = discover_videos(
+        run_purpose="RESEARCH",
+        frame_version_key="frame_1",
+        use_search_fallback=True,
+        run_search_call_budget=10
+    )
+    assert res_auth["run_status"] == "PARTIAL_ERROR", "Ordinary HTTP 403 must be PARTIAL_ERROR, not quota limit"
+
+    # Case 2: HTTP 403 with documented quota reason (quotaExceeded)
+    resp_quota = Response({"status": "403"})
+    err_quota = HttpError(resp_quota, b'{"error": {"errors": [{"reason": "quotaExceeded", "message": "The request cannot be completed because you have exceeded your quota."}]}}')
+    mock_req.execute.side_effect = err_quota
+
+    res_quota = discover_videos(
+        run_purpose="RESEARCH",
+        frame_version_key="frame_1",
+        use_search_fallback=True,
+        run_search_call_budget=10
+    )
+    assert res_quota["run_status"] == "PARTIAL_QUOTA_LIMIT", "HTTP 403 with quotaExceeded must be PARTIAL_QUOTA_LIMIT"
+
+
+@patch("discovery_youtube.build")
+@patch("discovery_youtube.os.getenv")
+@patch("discovery_youtube.get_snowflake_connection")
+@patch("discovery_youtube.get_aliases")
+@patch("discovery_youtube.get_event_windows_and_terms")
+def test_unique_video_ids_observed_cumulative_dedup(mock_windows, mock_aliases, mock_get_conn, mock_getenv, mock_build):
+    """
+    Proves that unique_video_ids_observed is semantically correct across resumed executions.
+    If run 1 observed video 'v1' and resumed run 2 observes 'v1' and 'v2',
+    unique_video_ids_observed is 2 (cumulative and deduplicated), not 1 or 3.
+    """
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_get_conn.return_value = mock_conn
+    mock_conn.cursor.return_value = mock_cursor
+
+    mock_aliases.return_value = ["messi"]
+    mock_windows.return_value = [{
+        'window_key': 'w1',
+        'event_version_key': 'ev1',
+        'start': datetime(2022, 12, 1, tzinfo=timezone.utc),
+        'end': datetime(2022, 12, 31, tzinfo=timezone.utc),
+        'terms': []
+    }]
+    q_hash = compute_query_hash('"messi"')
+
+    unit_calls = 0
+
+    def fetchone_impl():
+        sql = mock_cursor.execute.call_args[0][0] if mock_cursor.execute.call_args else ""
+        if "DIM_CHANNEL_FRAME_VERSION" in sql:
+            return ("RESEARCH",)
+        if "DIM_SAMPLING_POLICY_VERSION" in sql:
+            return ("sp_key_1",)
+        if "FROM OPS.DISCOVERY_UNIT_STATE" in sql:
+            return ("u1", "2022-12-01T00:00:00Z")
+        return None
+
+    def fetchall_impl():
+        nonlocal unit_calls
+        sql = mock_cursor.execute.call_args[0][0] if mock_cursor.execute.call_args else ""
+        if "BRIDGE_FRAME_CHANNEL" in sql:
+            return [("ch_key_1", "ch_id_1")]
+        if "SELECT DISTINCT v.source_id" in sql:
+            # Return previously observed video 'v1' from database
+            return [("v1",)]
+        if "FROM OPS.DISCOVERY_UNIT_STATE" in sql:
+            unit_calls += 1
+            if unit_calls == 1:
+                # Prior state had 1 item, 1 unique video ('v1')
+                return [(
+                    "u1", "frame_1", "ch_key_1", "w1", "sp_key_1", "1.0", 1,
+                    q_hash, '"messi"', "PARTIAL_QUOTA_LIMIT", 1, "tok2", 1, 1, 1,
+                    "2022-12-01T00:00:00Z", "2022-12-01T00:01:00Z", None, None, None,
+                    "run1", "run1"
+                )]
+            else:
+                return [(
+                    "u1", "frame_1", "ch_key_1", "w1", "sp_key_1", "1.0", 1,
+                    q_hash, '"messi"', "COMPLETED", 2, None, 3, 2, 2,
+                    "2022-12-01T00:00:00Z", "2022-12-01T00:02:00Z", "2022-12-01T00:02:00Z", None, None,
+                    "run1", "run2"
+                )]
+        return []
+
+    mock_cursor.fetchone.side_effect = fetchone_impl
+    mock_cursor.fetchall.side_effect = fetchall_impl
+
+    mock_youtube = MagicMock()
+    mock_build.return_value = mock_youtube
+    req = MagicMock()
+    mock_youtube.search().list.return_value = req
+    # Resumed page 2 returns 'v1' (duplicate from page 1) and 'v2' (new)
+    req.execute.return_value = {
+        "items": [
+            {"id": {"videoId": "v1"}, "snippet": {"publishedAt": "2022-12-05T12:00:00Z", "title": "v1", "description": ""}},
+            {"id": {"videoId": "v2"}, "snippet": {"publishedAt": "2022-12-06T12:00:00Z", "title": "v2", "description": ""}}
+        ],
+        "nextPageToken": None
+    }
+
+    res = discover_videos(
+        run_purpose="RESEARCH",
+        frame_version_key="frame_1",
+        use_search_fallback=True,
+        run_search_call_budget=10
+    )
+
+    assert res["run_status"] == "COMPLETE"
+
+    update_calls = [
+        call for call in mock_cursor.execute.call_args_list 
+        if "UPDATE OPS.DISCOVERY_UNIT_STATE" in call[0][0]
+    ]
+    assert len(update_calls) == 1
+    upd_args = update_calls[0][0][1]
+    upd_items = upd_args[3]
+    upd_uniq = upd_args[4]
+
+    # items_observed: 1 (from prior) + 2 (from page 2) = 3
+    assert upd_items == 3
+    # unique_video_ids_observed: set union of {'v1'} | {'v1', 'v2'} = 2
+    assert upd_uniq == 2

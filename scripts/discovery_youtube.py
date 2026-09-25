@@ -33,8 +33,6 @@ def get_event_windows_and_terms(conn):
             terms = json.loads(terms_raw)
         else:
             terms = terms_raw or []
-        terms = [str(t).lower() for t in terms]
-            
         windows.append({
             'window_key': row[0],
             'event_version_key': row[1],
@@ -43,6 +41,48 @@ def get_event_windows_and_terms(conn):
             'terms': terms
         })
     return windows
+
+def is_quota_or_rate_limit_error(err) -> bool:
+    """
+    Distinguishes documented quota/rate-limit reasons from ordinary HTTP 403 forbidden/auth errors.
+    In the YouTube Data API:
+    - HTTP 429 is rate limit / quota.
+    - HTTP 403 is quota ONLY if the error reason indicates quota exhaustion:
+      'quotaExceeded', 'rateLimitExceeded', 'userRateLimitExceeded', or 'dailyLimitExceeded'.
+    - Other HTTP 403 errors (e.g. accessNotConfigured, forbidden, insufficientPermissions)
+      are ordinary access/auth failures (PARTIAL_ERROR).
+    """
+    status_code = getattr(getattr(err, 'resp', None), 'status', None)
+    err_str = str(err).lower()
+    
+    if status_code == 429 or "429" in err_str:
+        return True
+        
+    quota_reasons = {
+        "quotaexceeded",
+        "ratelimitexceeded",
+        "userratelimitexceeded",
+        "dailylimitexceeded"
+    }
+    
+    if hasattr(err, 'error_details'):
+        for detail in err.error_details:
+            if isinstance(detail, dict):
+                reason = detail.get('reason', '').lower()
+                if reason in quota_reasons:
+                    return True
+                    
+    content = getattr(err, 'content', b'')
+    if isinstance(content, bytes):
+        content_str = content.decode('utf-8', errors='ignore').lower()
+    else:
+        content_str = str(content).lower()
+        
+    for qr in quota_reasons:
+        if qr in err_str or qr in content_str:
+            return True
+            
+    return False
 
 def fetch_playlist_items(youtube, playlist_id, min_date, max_date):
     items = []
@@ -449,31 +489,31 @@ def discover_videos(
                 break
                 
             page_token = curr_state['next_page_token'] if curr_state else None
-            pages_completed = curr_state['pages_completed'] if curr_state else 0
+            pages_completed_initial = curr_state['pages_completed'] if curr_state else 0
+            pages_succeeded_this_run = 0
             items_observed = curr_state['items_observed'] if curr_state else 0
             calls_this_unit = curr_state['search_calls_consumed'] if curr_state else 0
+            prev_unique_count = curr_state['unique_video_ids_observed'] if curr_state else 0
             started_at = (curr_state.get('started_at') if curr_state else None) or datetime.now(timezone.utc).isoformat()
             
             unit_items = {}
+            current_attempt_unique_ids = set()
             min_date_str = unit['start'].isoformat().replace("+00:00", "Z")
             max_date_str = unit['end'].isoformat().replace("+00:00", "Z")
             
             unit_status = 'IN_PROGRESS'
             last_error_code = None
             last_error_message = None
-            hit_limit = False
             
             while True:
                 if actual_search_calls >= run_search_call_budget:
                     print(f"Hit process search call budget ({run_search_call_budget}). Halting clean.")
                     unit_status = 'PARTIAL_QUOTA_LIMIT'
-                    hit_limit = True
                     stopped_early = True
                     break
                     
                 actual_search_calls += 1
                 calls_this_unit += 1
-                pages_completed += 1
                 
                 try:
                     req = youtube.search().list(
@@ -488,15 +528,13 @@ def discover_videos(
                     )
                     resp = req.execute()
                 except Exception as err:
-                    err_str = str(err).lower()
-                    status_code = getattr(getattr(err, 'resp', None), 'status', None)
-                    if status_code in (429, 403) or "429" in err_str or "quotaexceeded" in err_str or "ratelimitexceeded" in err_str:
-                        print("API Quota Limit (429) hit during search list. Halting clean and persisting state.")
+                    if is_quota_or_rate_limit_error(err):
+                        print("API Quota Limit (429 / quotaExceeded) hit during search list. Halting clean and persisting state.")
                         unit_status = 'PARTIAL_QUOTA_LIMIT'
-                        hit_limit = True
                         stopped_early = True
                         break
                     else:
+                        status_code = getattr(getattr(err, 'resp', None), 'status', None)
                         print(f"Non-quota error hit during search list: {err}")
                         unit_status = 'PARTIAL_ERROR'
                         encountered_non_quota_error = True
@@ -504,6 +542,7 @@ def discover_videos(
                         last_error_message = str(err)[:1024]
                         break
                         
+                pages_succeeded_this_run += 1
                 new_items = resp.get("items", [])
                 items_observed += len(new_items)
                 
@@ -512,12 +551,38 @@ def discover_videos(
                         v_id = i['id']['videoId']
                         i['snippet']['resourceId'] = {'videoId': v_id}
                         unit_items[v_id] = i
+                        current_attempt_unique_ids.add(v_id)
                         
-                page_token = resp.get("nextPageToken")
-                if not page_token:
+                next_page_token = resp.get("nextPageToken")
+                page_token = next_page_token
+                if not next_page_token:
                     unit_status = 'COMPLETED'
                     break
             
+            # Semantic unique video count across executions
+            existing_video_ids = set()
+            try:
+                cursor.execute('''
+                    SELECT DISTINCT v.source_id 
+                    FROM CORE.DIM_VIDEO v
+                    JOIN CORE.BRIDGE_VIDEO_EVENT b ON v.video_key = b.video_key
+                    WHERE v.channel_key = %s AND b.event_version_key = %s AND b.discovery_method = 'search_list_fallback'
+                ''', (unit['channel_key'], unit['event_version_key']))
+                existing_video_ids = {row[0] for row in cursor.fetchall()}
+            except Exception:
+                pass
+
+            if existing_video_ids:
+                total_unique_videos = len(existing_video_ids | current_attempt_unique_ids)
+            else:
+                total_unique_videos = max(prev_unique_count, prev_unique_count + len(current_attempt_unique_ids))
+                
+            # Determine next page token to persist
+            if unit_status == 'COMPLETED':
+                persisted_page_token = None
+            else:
+                persisted_page_token = page_token
+
             # Persist Discovery Unit State
             st_record = {
                 "frame_version_key": unit['frame_version_key'],
@@ -529,10 +594,10 @@ def discover_videos(
                 "query_hash": unit['query_hash'],
                 "search_query": unit['search_query'],
                 "status": unit_status,
-                "pages_completed": pages_completed if unit_status == 'COMPLETED' else max(0, pages_completed - 1),
-                "next_page_token": page_token if hit_limit else None,
+                "pages_completed": pages_completed_initial + pages_succeeded_this_run,
+                "next_page_token": persisted_page_token,
                 "items_observed": items_observed,
-                "unique_video_ids_observed": len(unit_items),
+                "unique_video_ids_observed": total_unique_videos,
                 "search_calls_consumed": calls_this_unit,
                 "started_at": started_at,
                 "completed_at": datetime.now(timezone.utc).isoformat() if unit_status == 'COMPLETED' else None,

@@ -232,12 +232,15 @@ Quota budgets are configuration-driven. The project receives separate API quota 
 - **Call Accounting**: `search.list` consumes 1 Search Query per call from the separate YouTube Search Queries bucket (default 100 search queries/day). Pagination requests (`nextPageToken`) count as additional 1-call search query requests.
 - **Process Call Budget**: Process executions operate under a `run_search_call_budget` parameter limiting Search API calls per execution without assuming exclusive project-level quota.
 - **Pre-run Call Estimation**: Calculates `minimum_required_calls` as the count of all unfinished discovery units (including `PENDING` units and resumed units with saved page tokens).
-- **Page-Level Token Checkpointing**: State is stored in `OPS.DISCOVERY_UNIT_STATE` tracking the 5-tuple key `(frame_version_key, channel_key, window_key, discovery_policy_version, query_hash)` with `next_page_token VARCHAR(2048)`, nullable `started_at` (populated when execution begins), and operational error fields (`last_error_code`, `last_error_message`). Mid-batch halts persist `next_page_token` and `pages_completed`, allowing subsequent runs to resume pagination directly.
-- **Unexpected API 429 Handling**: Provider API quota errors (HTTP 429 / `quotaExceeded` / `rateLimitExceeded`) are caught non-destructively, persisting completed page progress and setting run status to `PARTIAL_QUOTA_LIMIT`.
+- **Page-Level Token Checkpointing**: State is stored in `OPS.DISCOVERY_UNIT_STATE` tracking the 5-tuple key `(frame_version_key, channel_key, window_key, discovery_policy_version, query_hash)` with `next_page_token VARCHAR(2048)`, nullable `started_at` (populated when execution begins), and operational error fields (`last_error_code`, `last_error_message`). Mid-batch halts persist `next_page_token` and `pages_completed`, allowing subsequent runs to resume pagination directly from the next page. When one or more pages succeed before an operational non-quota failure (`PARTIAL_ERROR`), `next_page_token` is preserved rather than cleared.
+- **Quota Error Discrimination**: Google API errors are classified explicitly:
+  - HTTP 429 and documented quota exhaustion reasons (`quotaExceeded`, `rateLimitExceeded`, `userRateLimitExceeded`, `dailyLimitExceeded`) are classified as `PARTIAL_QUOTA_LIMIT`.
+  - Ordinary HTTP 403 errors (e.g., `accessNotConfigured`, `forbidden`, `insufficientPermissions`) are categorized as operational failures (`PARTIAL_ERROR` with `last_error_code = 'HTTP_403'`), preventing authorization bugs from masquerading as quota limits.
+- **Cumulative Unique Video Metrics**: `unique_video_ids_observed` is semantically cumulative across resumed executions. It tracks the distinct video IDs discovered across all pages of the discovery unit lifecycle, combining previously persisted IDs with newly observed IDs via set union to guarantee non-decreasing, monotonic progression across multi-attempt runs.
 - **Distinct Run Outcomes**: Incomplete universes are categorized explicitly into:
   - `COMPLETE`: `len(remaining_units) == 0`.
-  - `PARTIAL_QUOTA_LIMIT`: Halted specifically due to process search call budget or API HTTP 429 quota limits.
-  - `PARTIAL_ERROR`: Operational non-quota failure (e.g., HTTP 500 error) encountered on a unit after partial progress; error diagnostics logged.
+  - `PARTIAL_QUOTA_LIMIT`: Halted specifically due to process search call budget or API HTTP 429/`quotaExceeded` limits.
+  - `PARTIAL_ERROR`: Operational non-quota failure (e.g., connection reset, HTTP 500/503, or ordinary HTTP 403 auth failure) encountered on a unit; diagnostic error codes logged.
   - `FAILED`: Unhandled global processing failure.
 - **Set-Based Completeness Audit**: Historical frame discovery status becomes `COMPLETE` if and only if `len(remaining_units) == 0` (where `remaining_units = EXPECTED_5TUPLES - COMPLETED_5TUPLES`). Non-complete runs strictly prohibit candidate universe promotion.
 
