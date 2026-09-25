@@ -669,4 +669,91 @@ def test_v006_migration_upgrades_existing_table_without_data_loss():
     assert "ALTER TABLE OPS.DISCOVERY_UNIT_STATE ADD COLUMN IF NOT EXISTS last_error_code VARCHAR(128);" in sql
     assert "ALTER TABLE OPS.DISCOVERY_UNIT_STATE ADD COLUMN IF NOT EXISTS last_error_message VARCHAR(1024);" in sql
 
+@patch("discovery_youtube.build")
+@patch("discovery_youtube.os.getenv")
+@patch("discovery_youtube.get_snowflake_connection")
+@patch("discovery_youtube.get_aliases")
+@patch("discovery_youtube.get_event_windows_and_terms")
+def test_partial_error_recovery_lineage(mock_windows, mock_aliases, mock_get_conn, mock_getenv, mock_build):
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_get_conn.return_value = mock_conn
+    mock_conn.cursor.return_value = mock_cursor
+
+    mock_aliases.return_value = ["messi"]
+    mock_windows.return_value = [{
+        'window_key': 'w1',
+        'event_version_key': 'ev1',
+        'start': datetime(2022, 12, 1, tzinfo=timezone.utc),
+        'end': datetime(2022, 12, 31, tzinfo=timezone.utc),
+        'terms': []
+    }]
+
+    # Return existing PARTIAL_ERROR state row for get_discovery_unit_states
+    def fetchall_impl():
+        sql = mock_cursor.execute.call_args[0][0] if mock_cursor.execute.call_args else ""
+        if "BRIDGE_FRAME_CHANNEL" in sql:
+            return [("ch_key_1", "ch_id_1")]
+        if "FROM OPS.DISCOVERY_UNIT_STATE" in sql:
+            # r[0]..r[21] matching get_discovery_unit_states schema
+            return [(
+                "unit_key_100", "frame_1", "ch_key_1", "w1", "sp_key_1", "1.0", 1,
+                "414842db44900023e16f0575ee14051d25f3022bf6227d72bb9dd5d4613da9d8",
+                '"messi"', "PARTIAL_ERROR", 0, None, 0, 0, 1,
+                "2022-12-01T00:00:00Z", "2022-12-01T00:01:00Z", None,
+                "API_ERROR", "[WinError 10054] connection closed",
+                "run_failed_001", "run_failed_001"
+            )]
+        return []
+
+    def fetchone_impl():
+        sql = mock_cursor.execute.call_args[0][0] if mock_cursor.execute.call_args else ""
+        if "DIM_CHANNEL_FRAME_VERSION" in sql:
+            return ("RESEARCH",)
+        if "DIM_SAMPLING_POLICY_VERSION" in sql:
+            return ("sp_key_1",)
+        if "FROM OPS.DISCOVERY_UNIT_STATE" in sql:
+            return ("unit_key_100", "2022-12-01T00:00:00Z")
+        return None
+
+    mock_cursor.fetchall.side_effect = fetchall_impl
+    mock_cursor.fetchone.side_effect = fetchone_impl
+
+    mock_youtube = MagicMock()
+    mock_build.return_value = mock_youtube
+    mock_req = MagicMock()
+    mock_youtube.search().list.return_value = mock_req
+    mock_req.execute.return_value = {
+        "items": [],
+        "nextPageToken": None
+    }
+
+    result = discover_videos(
+        run_purpose="RESEARCH",
+        frame_version_key="frame_1",
+        use_search_fallback=True,
+        run_search_call_budget=10
+    )
+
+    assert result["run_status"] == "COMPLETE"
+
+    # Verify upsert_discovery_unit_state issued UPDATE with cleared errors and new ingestion_run_id
+    update_calls = [
+        call for call in mock_cursor.execute.call_args_list 
+        if "UPDATE OPS.DISCOVERY_UNIT_STATE" in call[0][0]
+    ]
+    assert len(update_calls) == 1
+    update_args = update_calls[0][0][1]
+    status_arg, pages_arg, token_arg, items_arg, unique_arg, calls_arg, started_arg, updated_arg, completed_arg, err_code_arg, err_msg_arg, run_id_arg, unit_key_arg = update_args
+
+    assert status_arg == "COMPLETED"
+    assert token_arg is None
+    assert completed_arg is not None
+    assert err_code_arg is None
+    assert err_msg_arg is None
+    assert run_id_arg == result["ingestion_run_id"]
+    assert run_id_arg != "run_failed_001"
+    assert unit_key_arg == "unit_key_100"
+
+
 
