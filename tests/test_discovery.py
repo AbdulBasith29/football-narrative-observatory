@@ -689,22 +689,35 @@ def test_partial_error_recovery_lineage(mock_windows, mock_aliases, mock_get_con
         'terms': []
     }]
 
-    # Return existing PARTIAL_ERROR state row for get_discovery_unit_states
+    q_hash = compute_query_hash('"messi"')
+    unit_calls = 0
     def fetchall_impl():
+        nonlocal unit_calls
         sql = mock_cursor.execute.call_args[0][0] if mock_cursor.execute.call_args else ""
         if "BRIDGE_FRAME_CHANNEL" in sql:
             return [("ch_key_1", "ch_id_1")]
         if "FROM OPS.DISCOVERY_UNIT_STATE" in sql:
-            # r[0]..r[21] matching get_discovery_unit_states schema
-            return [(
-                "unit_key_100", "frame_1", "ch_key_1", "w1", "sp_key_1", "1.0", 1,
-                "414842db44900023e16f0575ee14051d25f3022bf6227d72bb9dd5d4613da9d8",
-                '"messi"', "PARTIAL_ERROR", 0, None, 0, 0, 1,
-                "2022-12-01T00:00:00Z", "2022-12-01T00:01:00Z", None,
-                "API_ERROR", "[WinError 10054] connection closed",
-                "run_failed_001", "run_failed_001"
-            )]
+            unit_calls += 1
+            if unit_calls == 1:
+                return [(
+                    "unit_key_100", "frame_1", "ch_key_1", "w1", "sp_key_1", "1.0", 1,
+                    q_hash,
+                    '"messi"', "PARTIAL_ERROR", 0, None, 0, 0, 1,
+                    "2022-12-01T00:00:00Z", "2022-12-01T00:01:00Z", None,
+                    "API_ERROR", "[WinError 10054] connection closed",
+                    "run_failed_001", "run_failed_001"
+                )]
+            else:
+                return [(
+                    "unit_key_100", "frame_1", "ch_key_1", "w1", "sp_key_1", "1.0", 1,
+                    q_hash,
+                    '"messi"', "COMPLETED", 1, None, 0, 0, 1,
+                    "2022-12-01T00:00:00Z", "2022-12-01T00:01:00Z", "2022-12-01T00:02:00Z",
+                    None, None,
+                    "run_failed_001", "run_new"
+                )]
         return []
+
 
     def fetchone_impl():
         sql = mock_cursor.execute.call_args[0][0] if mock_cursor.execute.call_args else ""
