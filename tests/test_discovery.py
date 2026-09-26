@@ -1120,3 +1120,201 @@ def test_unique_video_ids_observed_cumulative_dedup(mock_windows, mock_aliases, 
     assert upd_items == 3
     # unique_video_ids_observed: set union of {'v1'} | {'v1', 'v2'} = 2
     assert upd_uniq == 2
+
+
+@patch("discovery_youtube.build")
+@patch("discovery_youtube.os.getenv")
+@patch("discovery_youtube.get_snowflake_connection")
+@patch("discovery_youtube.get_aliases")
+@patch("discovery_youtube.get_event_windows_and_terms")
+def test_unique_video_ids_observed_scoped_to_exact_discovery_unit(mock_windows, mock_aliases, mock_get_conn, mock_getenv, mock_build):
+    """
+    Regression test containing TWO discovery units for the SAME channel/event with DIFFERENT query hashes.
+    Proves videos observed by Unit A cannot increase Unit B's unique_video_ids_observed.
+    """
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_get_conn.return_value = mock_conn
+    mock_conn.cursor.return_value = mock_cursor
+
+    mock_aliases.return_value = ["messi"]
+    mock_windows.return_value = [{
+        'window_key': 'w1',
+        'event_version_key': 'ev1',
+        'start': datetime(2022, 12, 1, tzinfo=timezone.utc),
+        'end': datetime(2022, 12, 31, tzinfo=timezone.utc),
+        'terms': ['world cup']
+    }]
+
+    # Query hashes for the two distinct query batches
+    q_hash_A = compute_query_hash('"messi"')
+    q_hash_B = compute_query_hash('"world cup"')
+
+    # Track discovered videos in mock database
+    # Key: query_hash -> set of video source_ids
+    mock_db_unit_videos = {
+        q_hash_A: set(),
+        q_hash_B: set()
+    }
+    
+    persisted_states = {}
+
+    def fetchone_impl():
+        if not mock_cursor.execute.call_args:
+            return None
+        sql = mock_cursor.execute.call_args[0][0]
+        if "DIM_CHANNEL_FRAME_VERSION" in sql:
+            return ("RESEARCH",)
+        if "DIM_SAMPLING_POLICY_VERSION" in sql:
+            return ("sp_key_1",)
+        if "SELECT video_key FROM CORE.DIM_VIDEO" in sql:
+            return None
+        if "SELECT video_event_key" in sql:
+            return None
+        if "SELECT discovery_unit_key" in sql:
+            params = mock_cursor.execute.call_args[0][1]
+            qh = params[4]
+            if qh in persisted_states:
+                return (persisted_states[qh]["discovery_unit_key"], persisted_states[qh]["started_at"])
+            return None
+        return None
+
+    def fetchall_impl():
+        if not mock_cursor.execute.call_args:
+            return []
+        sql = mock_cursor.execute.call_args[0][0]
+        params = mock_cursor.execute.call_args[0][1] if len(mock_cursor.execute.call_args[0]) > 1 else ()
+        if "BRIDGE_FRAME_CHANNEL" in sql:
+            return [("ch_key_1", "ch_id_1")]
+        if "SELECT DISTINCT v.source_id" in sql:
+            # params: (channel_key, event_version_key, frame_version_key, window_key, discovery_policy_version, query_hash)
+            qh = params[5] if len(params) > 5 else None
+            return [(v_id,) for v_id in mock_db_unit_videos.get(qh, set())]
+        if "FROM OPS.DISCOVERY_UNIT_STATE" in sql:
+            return [
+                (
+                    st["discovery_unit_key"], st["frame_version_key"], st["channel_key"], st["window_key"],
+                    st["sampling_policy_version_key"], st["discovery_policy_version"], st["query_batch_number"],
+                    st["query_hash"], st["search_query"], st["status"], st["pages_completed"],
+                    st["next_page_token"], st["items_observed"], st["unique_video_ids_observed"],
+                    st["search_calls_consumed"], st["started_at"], st["updated_at"], st["completed_at"],
+                    st["last_error_code"], st["last_error_message"], st["first_ingestion_run_id"],
+                    st["latest_ingestion_run_id"]
+                )
+                for st in persisted_states.values()
+            ]
+        return []
+
+    def execute_impl(sql, params=None):
+        if params and "INSERT INTO OPS.DISCOVERY_UNIT_STATE" in sql:
+            qh = params[7]
+            persisted_states[qh] = {
+                "discovery_unit_key": params[0],
+                "frame_version_key": params[1],
+                "channel_key": params[2],
+                "window_key": params[3],
+                "sampling_policy_version_key": params[4],
+                "discovery_policy_version": params[5],
+                "query_batch_number": params[6],
+                "query_hash": params[7],
+                "search_query": params[8],
+                "status": params[9],
+                "pages_completed": params[10],
+                "next_page_token": params[11],
+                "items_observed": params[12],
+                "unique_video_ids_observed": params[13],
+                "search_calls_consumed": params[14],
+                "started_at": params[15],
+                "updated_at": params[16],
+                "completed_at": params[17],
+                "last_error_code": params[18],
+                "last_error_message": params[19],
+                "first_ingestion_run_id": params[20],
+                "latest_ingestion_run_id": params[21]
+            }
+
+    mock_cursor.execute.side_effect = execute_impl
+    mock_cursor.fetchone.side_effect = fetchone_impl
+    mock_cursor.fetchall.side_effect = fetchall_impl
+
+    # Mock YouTube API:
+    # Unit A ("messi") returns video 'vA1'
+    # Unit B ("world cup") returns 0 videos
+    mock_youtube = MagicMock()
+    mock_build.return_value = mock_youtube
+
+    def search_list_impl(**kwargs):
+        req = MagicMock()
+        q = kwargs.get("q", "")
+        if "messi" in q:
+            req.execute.return_value = {
+                "items": [
+                    {"id": {"videoId": "vA1"}, "snippet": {"publishedAt": "2022-12-05T12:00:00Z", "title": "vA1", "description": ""}}
+                ],
+                "nextPageToken": None
+            }
+            # Record in mock DB under Unit A
+            mock_db_unit_videos[q_hash_A].add("vA1")
+        else:
+            req.execute.return_value = {
+                "items": [],
+                "nextPageToken": None
+            }
+        return req
+
+    mock_youtube.search().list.side_effect = search_list_impl
+
+    # Run discovery with character budget = 10 to force two distinct batches
+    res = discover_videos(
+        run_purpose="RESEARCH",
+        frame_version_key="frame_1",
+        use_search_fallback=True,
+        run_search_call_budget=10,
+        search_query_character_budget=10
+    )
+
+    assert res["run_status"] == "COMPLETE"
+
+    # Find the INSERT INTO OPS.DISCOVERY_UNIT_STATE calls
+    insert_calls = [
+        call for call in mock_cursor.execute.call_args_list 
+        if "INSERT INTO OPS.DISCOVERY_UNIT_STATE" in call[0][0]
+    ]
+    assert len(insert_calls) == 2
+
+    states_by_hash = {}
+    for call in insert_calls:
+        args = call[0][1]
+        qh = args[7]
+        uniq_count = args[13]
+        states_by_hash[qh] = uniq_count
+
+    # Verify SELECT DISTINCT query was executed for both discovery units with exact scoping parameters
+    select_calls = [
+        call for call in mock_cursor.execute.call_args_list 
+        if "SELECT DISTINCT v.source_id" in call[0][0]
+    ]
+    assert len(select_calls) == 2
+    for call in select_calls:
+        sql = call[0][0]
+        params = call[0][1]
+        assert "LATERAL FLATTEN(input => b.discovery_provenance:queries)" in sql
+        assert "q.value:frame_version_key::STRING = %s" in sql
+        assert "q.value:window_key::STRING = %s" in sql
+        assert "q.value:discovery_policy_version::STRING = %s" in sql
+        assert "q.value:query_hash::STRING = %s" in sql
+        # params: (channel_key, event_version_key, frame_version_key, window_key, discovery_policy_version, query_hash)
+        assert len(params) == 6
+        assert params[0] == "ch_key_1"
+        assert params[1] == "ev1"
+        assert params[2] == "frame_1"
+        assert params[3] == "w1"
+        assert params[4] == "1.0"
+        assert params[5] in (q_hash_A, q_hash_B)
+
+    # Unit A observed 1 unique video
+    assert states_by_hash[q_hash_A] == 1
+
+    # Unit B observed 0 videos; Unit A's video did not increase Unit B's count
+    assert states_by_hash[q_hash_B] == 0
+

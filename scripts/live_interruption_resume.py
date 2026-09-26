@@ -11,7 +11,25 @@ from discovery_youtube import discover_videos
 def run_live_test():
     load_dotenv()
     target_db = 'FOOTBALL_NARRATIVE_TEST'
-    frame_key = '69ea3d0b-6766-43d2-a34d-58811f5be278' # PIPELINE_PILOT frame
+    
+    # Dynamically resolve the latest PIPELINE_PILOT frame
+    conn = get_snowflake_connection(target_db=target_db)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT frame_version_key 
+        FROM CORE.DIM_CHANNEL_FRAME_VERSION 
+        WHERE frame_purpose = 'PIPELINE_PILOT' 
+        ORDER BY constructed_at DESC 
+        LIMIT 1
+    """)
+    row = cursor.fetchone()
+    if not row:
+        cursor.close()
+        conn.close()
+        raise RuntimeError("No PIPELINE_PILOT frame found in CORE.DIM_CHANNEL_FRAME_VERSION.")
+    frame_key = row[0]
+    cursor.close()
+    conn.close()
 
     print("=" * 70)
     print("STEP 1: Executing Run 1 (Interruption Test) with run_search_call_budget = 1")

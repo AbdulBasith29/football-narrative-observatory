@@ -559,15 +559,22 @@ def discover_videos(
                     unit_status = 'COMPLETED'
                     break
             
-            # Semantic unique video count across executions
+            # Semantic unique video count across executions scoped to this exact discovery unit
             existing_video_ids = set()
             try:
                 cursor.execute('''
                     SELECT DISTINCT v.source_id 
                     FROM CORE.DIM_VIDEO v
-                    JOIN CORE.BRIDGE_VIDEO_EVENT b ON v.video_key = b.video_key
-                    WHERE v.channel_key = %s AND b.event_version_key = %s AND b.discovery_method = 'search_list_fallback'
-                ''', (unit['channel_key'], unit['event_version_key']))
+                    JOIN CORE.BRIDGE_VIDEO_EVENT b ON v.video_key = b.video_key,
+                    LATERAL FLATTEN(input => b.discovery_provenance:queries) q
+                    WHERE v.channel_key = %s 
+                      AND b.event_version_key = %s 
+                      AND b.discovery_method = 'search_list_fallback'
+                      AND q.value:frame_version_key::STRING = %s
+                      AND q.value:window_key::STRING = %s
+                      AND q.value:discovery_policy_version::STRING = %s
+                      AND q.value:query_hash::STRING = %s
+                ''', (unit['channel_key'], unit['event_version_key'], unit['frame_version_key'], unit['window_key'], unit['discovery_policy_version'], unit['query_hash']))
                 existing_video_ids = {row[0] for row in cursor.fetchall()}
             except Exception:
                 pass
@@ -609,7 +616,10 @@ def discover_videos(
             
             # Save discovered videos to DB
             search_provenance = [{
+                "frame_version_key": unit["frame_version_key"],
+                "channel_key": unit["channel_key"],
                 "window_key": unit["window_key"],
+                "discovery_policy_version": unit["discovery_policy_version"],
                 "batch_number": unit["query_batch_number"],
                 "query": unit["search_query"],
                 "query_hash": unit["query_hash"],
@@ -642,10 +652,30 @@ def discover_videos(
                 
                 results = evaluate_video_against_events(item, aliases, event_to_windows)
                 for ev_key, status, reason in results:
-                    cursor.execute('''SELECT video_event_key FROM CORE.BRIDGE_VIDEO_EVENT 
+                    cursor.execute('''SELECT video_event_key, discovery_provenance FROM CORE.BRIDGE_VIDEO_EVENT 
                                       WHERE video_key = %s AND event_version_key = %s AND sampling_policy_version_key = %s''', 
                                    (v_key, ev_key, sampling_policy_version_key))
-                    if cursor.fetchone():
+                    row = cursor.fetchone()
+                    if row:
+                        ve_key = row[0]
+                        cur_prov = row[1] if len(row) > 1 else None
+                        try:
+                            if isinstance(cur_prov, str):
+                                prov_dict = json.loads(cur_prov)
+                            elif isinstance(cur_prov, dict):
+                                prov_dict = cur_prov
+                            else:
+                                prov_dict = {}
+                            queries = prov_dict.get("queries", [])
+                            if not any(isinstance(q, dict) and q.get("query_hash") == unit["query_hash"] for q in queries):
+                                queries.append(search_provenance[0])
+                                prov_dict["queries"] = queries
+                                cursor.execute('''UPDATE CORE.BRIDGE_VIDEO_EVENT 
+                                                  SET discovery_provenance = PARSE_JSON(%s) 
+                                                  WHERE video_event_key = %s''',
+                                               (json.dumps(prov_dict), ve_key))
+                        except Exception:
+                            pass
                         continue
                         
                     cursor.execute('''INSERT INTO CORE.BRIDGE_VIDEO_EVENT 

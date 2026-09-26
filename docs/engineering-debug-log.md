@@ -97,3 +97,21 @@ The test fixture hardcoded a legacy SHA-256 hash string (`414842db...`) computed
 
 ### Resolution
 Replaced hardcoded hash strings in test fixtures with dynamic calls to `compute_query_hash('"messi"')`, ensuring 100% deterministic key alignment between generation, state persistence, and audit reconciliation.
+
+---
+
+## Incident 6: Discovery Unit Grain Isolation for Unique Video Counting & Frame Binding
+
+### Context
+1. In cross-unit runs for the same channel and event window, historical video membership queries at `channel_key × event_version_key` grain erroneously caused videos observed by Unit A (query hash 1) to leak into Unit B's (query hash 2) `unique_video_ids_observed`.
+2. Live and offline test runners had a hard-coded UUID (`69ea3d0b-6766-43d2-a34d-58811f5be278`) in `scripts/live_interruption_resume.py` and lacked explicit `frame_purpose = 'PIPELINE_PILOT'` filtering in `scripts/run_test_discovery.py`.
+
+### Root Cause Analysis
+- `DIM_VIDEO` joined with `BRIDGE_VIDEO_EVENT` without filtering on the exact discovery unit provenance (`frame_version_key`, `channel_key`, `window_key`, `discovery_policy_version`, `query_hash`). Consequently, any video discovered for that channel and event under any query hash was returned as historical membership.
+- `live_interruption_resume.py` referenced a static frame UUID created during earlier local bootstrapping rather than dynamically querying Snowflake for the active pilot frame.
+
+### Resolution
+- **Exact Provenance Scoping**: Refactored the historical video query in [`scripts/discovery_youtube.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/scripts/discovery_youtube.py) using Snowflake `LATERAL FLATTEN(input => b.discovery_provenance:queries)` to strictly match `(frame_version_key, channel_key, window_key, discovery_policy_version, query_hash)`. Discovery provenance is enriched with all unit coordinates and appended when videos bridge across queries.
+- **Dynamic Pilot Frame Resolution**: Updated [`scripts/live_interruption_resume.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/scripts/live_interruption_resume.py) and [`scripts/run_test_discovery.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/scripts/run_test_discovery.py) to dynamically query `CORE.DIM_CHANNEL_FRAME_VERSION` with `WHERE frame_purpose = 'PIPELINE_PILOT' ORDER BY constructed_at DESC LIMIT 1`.
+- **Regression Test**: Added `test_unique_video_ids_observed_scoped_to_exact_discovery_unit` to [`tests/test_discovery.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/tests/test_discovery.py), asserting that for two discovery units sharing channel and event with different query hashes, Unit A's observed videos cannot increase Unit B's unique video count.
+

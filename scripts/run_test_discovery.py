@@ -13,8 +13,14 @@ def main():
     conn = get_snowflake_connection(target_db=target_db)
     cursor = conn.cursor()
 
-    # Get the latest frame_version_key synced for the TEST database
-    cursor.execute("SELECT frame_version_key FROM CORE.DIM_CHANNEL_FRAME_VERSION ORDER BY constructed_at DESC LIMIT 1")
+    # Get the latest PIPELINE_PILOT frame_version_key synced for the TEST database
+    cursor.execute("""
+        SELECT frame_version_key 
+        FROM CORE.DIM_CHANNEL_FRAME_VERSION 
+        WHERE frame_purpose = 'PIPELINE_PILOT' 
+        ORDER BY constructed_at DESC 
+        LIMIT 1
+    """)
     row = cursor.fetchone()
     if not row:
         print("No frame found. Did you run sync_config.py?")
