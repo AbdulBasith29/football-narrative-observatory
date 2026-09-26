@@ -14,7 +14,7 @@ This protocol enforces deterministic validation, methodology protection, and str
 ## Verification Steps
 
 ### 1. Diff & Branch Inspection
-- Inspect the current branch name (`git branch --show-current`). Ensure work is on `feature/<name>` or `chore/<name>`, never `main`.
+- Inspect the current branch name (`git branch --show-current`). Ensure work is on `feature/<name>`, `chore/<name>`, or `fix/<name>`, never `main`.
 - Resolve the base commit SHA (`git merge-base main HEAD` or target PR base) and the current HEAD SHA (`git rev-parse HEAD`).
 - Inspect the file diff against base (`git diff --stat <base_sha>..HEAD`). Identify all modified, added, or deleted files.
 
