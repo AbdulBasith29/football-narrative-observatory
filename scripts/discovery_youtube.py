@@ -667,7 +667,16 @@ def discover_videos(
                             else:
                                 prov_dict = {}
                             queries = prov_dict.get("queries", [])
-                            if not any(isinstance(q, dict) and q.get("query_hash") == unit["query_hash"] for q in queries):
+                            is_already_recorded = any(
+                                isinstance(q, dict)
+                                and q.get("frame_version_key") == unit["frame_version_key"]
+                                and q.get("channel_key") == unit["channel_key"]
+                                and q.get("window_key") == unit["window_key"]
+                                and q.get("discovery_policy_version") == unit["discovery_policy_version"]
+                                and q.get("query_hash") == unit["query_hash"]
+                                for q in queries
+                            )
+                            if not is_already_recorded:
                                 queries.append(search_provenance[0])
                                 prov_dict["queries"] = queries
                                 cursor.execute('''UPDATE CORE.BRIDGE_VIDEO_EVENT 

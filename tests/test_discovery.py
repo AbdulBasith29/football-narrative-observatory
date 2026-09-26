@@ -2,6 +2,7 @@ import pytest
 from datetime import datetime, timezone
 import sys
 import os
+import json
 from unittest.mock import patch, MagicMock
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'scripts')))
@@ -1317,4 +1318,237 @@ def test_unique_video_ids_observed_scoped_to_exact_discovery_unit(mock_windows, 
 
     # Unit B observed 0 videos; Unit A's video did not increase Unit B's count
     assert states_by_hash[q_hash_B] == 0
+
+
+@patch("discovery_youtube.build")
+@patch("discovery_youtube.os.getenv")
+@patch("discovery_youtube.get_snowflake_connection")
+@patch("discovery_youtube.get_aliases")
+@patch("discovery_youtube.get_event_windows_and_terms")
+def test_provenance_and_unique_videos_across_discovery_policy_versions(mock_windows, mock_aliases, mock_get_conn, mock_getenv, mock_build):
+    """
+    Focused regression test proving that two observations with the same query_hash
+    but different discovery_policy_version retain separate provenance in BRIDGE_VIDEO_EVENT,
+    and that resumed unique-video accounting for the newer policy remains deduplicated.
+    """
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_get_conn.return_value = mock_conn
+    mock_conn.cursor.return_value = mock_cursor
+
+    mock_aliases.return_value = ["messi"]
+    mock_windows.return_value = [{
+        'window_key': 'w1',
+        'event_version_key': 'ev1',
+        'start': datetime(2022, 12, 1, tzinfo=timezone.utc),
+        'end': datetime(2022, 12, 31, tzinfo=timezone.utc),
+        'terms': []
+    }]
+
+    q_hash = compute_query_hash('"messi"')
+
+    # Existing video 'v1' already bridged to ev1 from earlier discovery_policy_version '1.0'
+    bridge_records = {
+        "v1": {
+            "video_event_key": "ve_1",
+            "prov": {
+                "method": "search_list_fallback",
+                "queries": [{
+                    "frame_version_key": "frame_1",
+                    "channel_key": "ch_key_1",
+                    "window_key": "w1",
+                    "discovery_policy_version": "1.0",
+                    "batch_number": 1,
+                    "query": '"messi"',
+                    "query_hash": q_hash,
+                    "unit_status": "COMPLETED"
+                }]
+            }
+        }
+    }
+
+    # State store for OPS.DISCOVERY_UNIT_STATE
+    persisted_states = {}
+
+    def fetchone_impl():
+        if not mock_cursor.execute.call_args:
+            return None
+        sql = mock_cursor.execute.call_args[0][0]
+        if "DIM_CHANNEL_FRAME_VERSION" in sql:
+            return ("RESEARCH",)
+        if "DIM_SAMPLING_POLICY_VERSION" in sql:
+            return ("sp_key_1",)
+        if "SELECT video_key FROM CORE.DIM_VIDEO" in sql:
+            params = mock_cursor.execute.call_args[0][1]
+            return ("k_" + params[0],) if params[0] in bridge_records else None
+        if "SELECT video_event_key, discovery_provenance" in sql:
+            params = mock_cursor.execute.call_args[0][1]
+            v_key = params[0]
+            v_id = v_key.replace("k_", "")
+            if v_id in bridge_records:
+                return (bridge_records[v_id]["video_event_key"], json.dumps(bridge_records[v_id]["prov"]))
+            return None
+        if "SELECT discovery_unit_key" in sql:
+            params = mock_cursor.execute.call_args[0][1]
+            qh = params[4]
+            if qh in persisted_states:
+                return (persisted_states[qh]["discovery_unit_key"], persisted_states[qh]["started_at"])
+            return None
+        return None
+
+    def fetchall_impl():
+        if not mock_cursor.execute.call_args:
+            return []
+        sql = mock_cursor.execute.call_args[0][0]
+        params = mock_cursor.execute.call_args[0][1] if len(mock_cursor.execute.call_args[0]) > 1 else ()
+        if "BRIDGE_FRAME_CHANNEL" in sql:
+            return [("ch_key_1", "ch_id_1")]
+        if "SELECT DISTINCT v.source_id" in sql:
+            # params: (channel_key, event_version_key, frame_version_key, window_key, discovery_policy_version, query_hash)
+            dpv = params[4] if len(params) > 4 else None
+            matching_ids = []
+            for v_id, rec in bridge_records.items():
+                prov_queries = rec["prov"].get("queries", [])
+                if any(isinstance(q, dict) and q.get("discovery_policy_version") == dpv and q.get("query_hash") == q_hash for q in prov_queries):
+                    matching_ids.append((v_id,))
+            return matching_ids
+        if "FROM OPS.DISCOVERY_UNIT_STATE" in sql:
+            return [
+                (
+                    st["discovery_unit_key"], st["frame_version_key"], st["channel_key"], st["window_key"],
+                    st["sampling_policy_version_key"], st["discovery_policy_version"], st["query_batch_number"],
+                    st["query_hash"], st["search_query"], st["status"], st["pages_completed"],
+                    st["next_page_token"], st["items_observed"], st["unique_video_ids_observed"],
+                    st["search_calls_consumed"], st["started_at"], st["updated_at"], st["completed_at"],
+                    st["last_error_code"], st["last_error_message"], st["first_ingestion_run_id"],
+                    st["latest_ingestion_run_id"]
+                )
+                for st in persisted_states.values()
+            ]
+        return []
+
+    def execute_impl(sql, params=None):
+        if params and "UPDATE CORE.BRIDGE_VIDEO_EVENT" in sql:
+            new_prov_json, ve_key = params[0], params[1]
+            for rec in bridge_records.values():
+                if rec["video_event_key"] == ve_key:
+                    rec["prov"] = json.loads(new_prov_json)
+        elif params and "INSERT INTO CORE.BRIDGE_VIDEO_EVENT" in sql:
+            ve_key, v_key = params[0], params[1]
+            prov_json = params[7]
+            v_id = v_key.replace("k_", "")
+            bridge_records[v_id] = {
+                "video_event_key": ve_key,
+                "prov": json.loads(prov_json)
+            }
+        elif params and "INSERT INTO OPS.DISCOVERY_UNIT_STATE" in sql:
+            qh = params[7]
+            persisted_states[qh] = {
+                "discovery_unit_key": params[0],
+                "frame_version_key": params[1],
+                "channel_key": params[2],
+                "window_key": params[3],
+                "sampling_policy_version_key": params[4],
+                "discovery_policy_version": params[5],
+                "query_batch_number": params[6],
+                "query_hash": params[7],
+                "search_query": params[8],
+                "status": params[9],
+                "pages_completed": params[10],
+                "next_page_token": params[11],
+                "items_observed": params[12],
+                "unique_video_ids_observed": params[13],
+                "search_calls_consumed": params[14],
+                "started_at": params[15],
+                "updated_at": params[16],
+                "completed_at": params[17],
+                "last_error_code": params[18],
+                "last_error_message": params[19],
+                "first_ingestion_run_id": params[20],
+                "latest_ingestion_run_id": params[21]
+            }
+        elif params and "UPDATE OPS.DISCOVERY_UNIT_STATE" in sql:
+            st_key = params[12]
+            for st in persisted_states.values():
+                if st["discovery_unit_key"] == st_key:
+                    st["status"] = params[0]
+                    st["pages_completed"] = params[1]
+                    st["next_page_token"] = params[2]
+                    st["items_observed"] = params[3]
+                    st["unique_video_ids_observed"] = params[4]
+                    st["search_calls_consumed"] = params[5]
+                    st["updated_at"] = params[6]
+                    st["completed_at"] = params[7]
+                    st["last_error_code"] = params[8]
+                    st["last_error_message"] = params[9]
+                    st["latest_ingestion_run_id"] = params[10]
+
+    mock_cursor.execute.side_effect = execute_impl
+    mock_cursor.fetchone.side_effect = fetchone_impl
+    mock_cursor.fetchall.side_effect = fetchall_impl
+
+    mock_youtube = MagicMock()
+    mock_build.return_value = mock_youtube
+
+    # Run 1: Discovery under discovery_policy_version = "2.0", page 1 returns video 'v1' with next_page_token="tok2", budget=1
+    req1 = MagicMock()
+    req1.execute.return_value = {
+        "items": [
+            {"id": {"videoId": "v1"}, "snippet": {"publishedAt": "2022-12-05T12:00:00Z", "title": "v1", "description": ""}}
+        ],
+        "nextPageToken": "tok2"
+    }
+    mock_youtube.search().list.return_value = req1
+
+    res1 = discover_videos(
+        run_purpose="RESEARCH",
+        frame_version_key="frame_1",
+        discovery_policy_version="2.0",
+        use_search_fallback=True,
+        run_search_call_budget=1
+    )
+
+    assert res1["run_status"] == "PARTIAL_QUOTA_LIMIT"
+
+    # Verify separate provenance entries were retained in BRIDGE_VIDEO_EVENT for policy "1.0" and policy "2.0"
+    v1_prov_queries = bridge_records["v1"]["prov"]["queries"]
+    assert len(v1_prov_queries) == 2
+    policies = [q["discovery_policy_version"] for q in v1_prov_queries]
+    assert "1.0" in policies
+    assert "2.0" in policies
+
+    # In Run 1, policy 2.0 observed 1 unique video
+    assert persisted_states[q_hash]["unique_video_ids_observed"] == 1
+    assert persisted_states[q_hash]["next_page_token"] == "tok2"
+
+    # Run 2: Resume policy 2.0 from "tok2". Page 2 returns 'v1' (duplicate) and 'v2' (new).
+    req2 = MagicMock()
+    req2.execute.return_value = {
+        "items": [
+            {"id": {"videoId": "v1"}, "snippet": {"publishedAt": "2022-12-05T12:00:00Z", "title": "v1", "description": ""}},
+            {"id": {"videoId": "v2"}, "snippet": {"publishedAt": "2022-12-06T12:00:00Z", "title": "v2", "description": ""}}
+        ],
+        "nextPageToken": None
+    }
+    mock_youtube.search().list.return_value = req2
+
+    res2 = discover_videos(
+        run_purpose="RESEARCH",
+        frame_version_key="frame_1",
+        discovery_policy_version="2.0",
+        use_search_fallback=True,
+        run_search_call_budget=10
+    )
+
+    assert res2["run_status"] == "COMPLETE"
+
+    # Verify unique_video_ids_observed for policy 2.0 remained deduplicated:
+    # Prior observed 'v1', page 2 observed 'v1' and 'v2' -> union is {'v1', 'v2'} = 2 (not 3)
+    assert persisted_states[q_hash]["items_observed"] == 3
+    assert persisted_states[q_hash]["unique_video_ids_observed"] == 2
+
+    # Verify policy 2.0 was not duplicated in provenance queries when observed again
+    v1_prov_queries_after = bridge_records["v1"]["prov"]["queries"]
+    assert len(v1_prov_queries_after) == 2
+
 
