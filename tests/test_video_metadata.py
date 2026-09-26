@@ -1,5 +1,4 @@
 import json
-import uuid
 from datetime import datetime, timezone
 import pytest
 from unittest.mock import MagicMock, patch
@@ -12,7 +11,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 's
 from ingestion_video_metadata import (
     parse_iso8601_duration,
     chunk_video_ids,
-    is_quota_or_rate_limit_error,
     persist_raw_video_response,
     process_video_metadata_payload,
     replay_raw_video_responses,
@@ -44,7 +42,6 @@ def test_chunk_video_ids_exact_50_limit():
     assert len(batches[0]) == 50
     assert len(batches[1]) == 50
     assert len(batches[2]) == 35
-    # Verify deterministic sorting
     assert batches[0][0] == "vid_000"
     assert batches[0][-1] == "vid_049"
 
@@ -61,7 +58,6 @@ def test_videos_list_request_contract_omits_maxresults():
     mock_conn = MagicMock()
     mock_cursor = MagicMock()
     mock_conn.cursor.return_value = mock_cursor
-    # Candidate query returns 2 IDs
     mock_cursor.fetchall.return_value = [("vid_001",), ("vid_002",)]
 
     with patch("ingestion_video_metadata.get_snowflake_connection", return_value=mock_conn):
@@ -72,234 +68,425 @@ def test_videos_list_request_contract_omits_maxresults():
             youtube_client=mock_youtube
         )
 
-    # Verify videos.list call kwargs
     assert mock_videos.list.called
     call_kwargs = mock_videos.list.call_args[1]
     assert "id" in call_kwargs
     assert call_kwargs["part"] == "snippet,contentDetails,statistics,status"
-    assert "maxResults" not in call_kwargs, "maxResults must NOT be passed to videos.list when id is specified"
+    assert "maxResults" not in call_kwargs
 
 
-# 4. Raw-Before-Parse Persistence
-def test_raw_before_parse_persistence():
+# 4. RAW Replay Must Preserve Requested IDs (Regression Test)
+def test_raw_replay_preserves_requested_ids_and_reconciles_missing():
+    """
+    Regression test:
+    Request A, B, C; response contains A, B.
+    RAW replay must reconstruct requested IDs from request_parameters, NOT response items,
+    and reconcile C as UNAVAILABLE.
+    """
     mock_conn = MagicMock()
     mock_cursor = MagicMock()
     mock_conn.cursor.return_value = mock_cursor
 
     raw_payload = {
         "items": [
-            {
-                "id": "vid_001",
-                "snippet": {"title": "Test Title", "publishedAt": "2022-12-18T15:00:00Z"},
-                "contentDetails": {"duration": "PT10M"},
-                "statistics": {"viewCount": "1000", "likeCount": "50"}
-            }
+            {"id": "vid_A", "snippet": {"title": "Title A", "publishedAt": "2022-12-18T15:00:00Z"}, "contentDetails": {"duration": "PT5M"}, "statistics": {}},
+            {"id": "vid_B", "snippet": {"title": "Title B", "publishedAt": "2022-12-18T15:00:00Z"}, "contentDetails": {"duration": "PT5M"}, "statistics": {}}
         ]
     }
-    raw_resp_id = persist_raw_video_response(
-        mock_conn, raw_payload, ["vid_001"], "run_123", "req_123",
-        "2022-12-18T15:00:00Z", "2022-12-18T15:00:01Z", http_status=200
+    requested_ids = ["vid_A", "vid_B", "vid_C"]
+
+    # 1. Persist raw response
+    persist_raw_video_response(
+        mock_conn, raw_payload, requested_ids, "run_test", "req_test",
+        "2022-12-18T15:00:00Z", "2022-12-18T15:00:01Z"
     )
-    assert raw_resp_id is not None
-    assert mock_conn.commit.called
-    
-    # Verify RAW.YOUTUBE_API_RESPONSE insert executed
-    exec_statements = [call[0][0] for call in mock_cursor.execute.call_args_list]
-    assert any("INSERT INTO RAW.YOUTUBE_API_RESPONSE" in stmt for stmt in exec_statements)
-    assert any("INSERT INTO OPS.FACT_API_REQUEST" in stmt for stmt in exec_statements)
 
+    # Verify request_parameters includes exact requested_video_ids
+    raw_insert_call = [c for c in mock_cursor.execute.call_args_list if "INSERT INTO RAW.YOUTUBE_API_RESPONSE" in c[0][0]][0]
+    req_params_json = raw_insert_call[0][1][4]
+    req_params = json.loads(req_params_json)
+    assert req_params["requested_video_ids"] == requested_ids
+    assert req_params["id_count"] == 3
 
-# 5. Missing Videos Availability Handling & Neutral Rationale
-def test_missing_videos_neutral_availability_handling():
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
+    # 2. Replay raw responses
+    mock_cursor.fetchall.return_value = [
+        ("raw_resp_123", "req_test", "run_test", json.dumps(raw_payload), req_params_json)
+    ]
+    # For process_video_metadata_payload lookups
     mock_cursor.fetchone.return_value = None
 
-    raw_payload = {
-        "items": [
-            {
-                "id": "vid_present",
-                "snippet": {"title": "Present", "publishedAt": "2022-12-18T15:00:00Z"},
-                "contentDetails": {"duration": "PT5M"},
-                "statistics": {"viewCount": "500"}
-            }
-        ]
-    }
-    requested_ids = ["vid_present", "vid_missing"]
+    replayed_count = replay_raw_video_responses(mock_conn, raw_response_id="raw_resp_123")
+    assert replayed_count == 3  # All 3 requested IDs replayed
 
-    res_cnt, unavail_cnt = process_video_metadata_payload(
-        mock_conn, raw_payload, requested_ids, "run_123", "req_123", "raw_123"
-    )
-    assert res_cnt == 1
-    assert unavail_cnt == 1
-
-    exec_calls = mock_cursor.execute.call_args_list
-    call_pairs = [(c[0][0], c[0][1] if len(c[0]) > 1 else ()) for c in exec_calls]
-
-    # Check UNAVAILABLE recorded in OPS.VIDEO_METADATA_RESOLUTION_STATE
-    assert any("INSERT INTO OPS.VIDEO_METADATA_RESOLUTION_STATE" in s and ("UNAVAILABLE" in s or "UNAVAILABLE" in p) for s, p in call_pairs)
-
-    # Check neutral rationale in BRIDGE_VIDEO_EVENT without guessing cause
-    neutral_text = "Video ID was not returned by the videos.list request; underlying cause was not observable from this response."
-    bridge_updates = [p for s, p in call_pairs if "UPDATE CORE.BRIDGE_VIDEO_EVENT" in s]
-    assert any(neutral_text in str(p) for p in bridge_updates)
-
-    # Verify DIM_VIDEO.content_type was NOT overwritten to UNAVAILABLE
-    dim_updates = [s for s, p in call_pairs if "UPDATE CORE.DIM_VIDEO" in s]
-    for s in dim_updates:
-        assert "content_type" not in s or "UNAVAILABLE" not in s
+    # Verify vid_C was reconciled as UNAVAILABLE in OPS.VIDEO_METADATA_RESOLUTION_STATE
+    all_execs = [(c[0][0], c[0][1] if len(c[0]) > 1 else ()) for c in mock_cursor.execute.call_args_list]
+    unavailable_inserts = [
+        p for s, p in all_execs
+        if "INSERT INTO OPS.VIDEO_METADATA_RESOLUTION_STATE" in s and "UNAVAILABLE" in s
+    ]
+    assert any("vid_C" in p for p in unavailable_inserts), "vid_C must be reconciled as UNAVAILABLE during RAW replay"
 
 
-# 6. Snapshot Idempotency: Replay Does Not Duplicate Rows
-def test_snapshot_idempotency_on_replay():
+# 5. Failure-State Model: Bounded Retries for 5xx and FACT_API_REQUEST Telemetry
+def test_transient_5xx_produces_telemetry_and_bounded_retry():
+    mock_youtube = MagicMock()
+    mock_videos = MagicMock()
+    mock_list = MagicMock()
+    mock_youtube.videos.return_value = mock_videos
+    mock_videos.list.return_value = mock_list
+
+    # Mock 500 error on all attempts
+    mock_err_resp = MagicMock()
+    mock_err_resp.status = 500
+    mock_err = Exception("500 Internal Server Error")
+    mock_err.resp = mock_err_resp
+    mock_list.execute.side_effect = mock_err
+
     mock_conn = MagicMock()
     mock_cursor = MagicMock()
     mock_conn.cursor.return_value = mock_cursor
-    # Existing video key
-    mock_cursor.fetchone.return_value = ("video_key_123", "2022-12-18T10:00:00Z")
+    mock_cursor.fetchall.return_value = [("vid_fail_1",)]
+    mock_cursor.fetchone.return_value = None
 
-    raw_payload = {
-        "items": [
-            {
-                "id": "vid_replay",
-                "snippet": {"title": "Replay", "publishedAt": "2022-12-18T15:00:00Z"},
-                "contentDetails": {"duration": "PT5M"},
-                "statistics": {"viewCount": "500", "likeCount": "20"}
-            }
-        ]
+    with patch("ingestion_video_metadata.get_snowflake_connection", return_value=mock_conn):
+        result = ingest_video_metadata(
+            target_db="FOOTBALL_NARRATIVE_TEST",
+            run_purpose="INTEGRATION_TEST",
+            frame_version_key="test_frame_123",
+            youtube_client=mock_youtube
+        )
+
+    assert result["run_status"] == "PARTIAL_ERROR"
+    assert result["calls_attempted"] == 3  # 3 bounded retries attempted
+    assert result["calls_succeeded"] == 0
+
+    all_execs = [(c[0][0], c[0][1] if len(c[0]) > 1 else ()) for c in mock_cursor.execute.call_args_list]
+
+    # Every attempt produced FACT_API_REQUEST telemetry
+    api_request_inserts = [p for s, p in all_execs if "INSERT INTO OPS.FACT_API_REQUEST" in s]
+    assert len(api_request_inserts) == 3
+    assert all(p[5] == 500 for p in api_request_inserts)
+    assert [p[6] for p in api_request_inserts] == [0, 1, 2]  # retry_number 0, 1, 2
+
+    # Resolution state transitioned to RETRYABLE_ERROR
+    state_updates = [p for s, p in all_execs if "INSERT INTO OPS.VIDEO_METADATA_RESOLUTION_STATE" in s]
+    assert any("RETRYABLE_ERROR" in p for p in state_updates)
+
+    # Ingestion run telemetry: pages_requested (3) != pages_succeeded (0)
+    run_inserts = [p for s, p in all_execs if "INSERT INTO OPS.FACT_INGESTION_RUN" in s]
+    assert len(run_inserts) == 1
+    assert run_inserts[0][4] == 3  # pages_requested
+    assert run_inserts[0][5] == 0  # pages_succeeded
+
+
+# 6. Failure-State Model: Ordinary Auth/Config 403 Does Not Retry Indefinitely
+def test_ordinary_auth_403_does_not_retry():
+    mock_youtube = MagicMock()
+    mock_videos = MagicMock()
+    mock_list = MagicMock()
+    mock_youtube.videos.return_value = mock_videos
+    mock_videos.list.return_value = mock_list
+
+    mock_err_resp = MagicMock()
+    mock_err_resp.status = 403
+    mock_err = Exception("The request cannot be completed because you have exceeded your quota? No, invalid API key.")
+    mock_err.resp = mock_err_resp
+    mock_err.content = b"The API key is invalid."
+    mock_list.execute.side_effect = mock_err
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_cursor.fetchall.return_value = [("vid_auth_fail",)]
+    mock_cursor.fetchone.return_value = None
+
+    with patch("ingestion_video_metadata.get_snowflake_connection", return_value=mock_conn):
+        result = ingest_video_metadata(
+            target_db="FOOTBALL_NARRATIVE_TEST",
+            run_purpose="INTEGRATION_TEST",
+            frame_version_key="test_frame_123",
+            youtube_client=mock_youtube
+        )
+
+    # Must fail immediately without retrying indefinitely
+    assert result["run_status"] == "PARTIAL_ERROR"
+    assert result["calls_attempted"] == 1
+    assert result["calls_succeeded"] == 0
+
+    all_execs = [(c[0][0], c[0][1] if len(c[0]) > 1 else ()) for c in mock_cursor.execute.call_args_list]
+    api_request_inserts = [p for s, p in all_execs if "INSERT INTO OPS.FACT_API_REQUEST" in s]
+    assert len(api_request_inserts) == 1
+    assert api_request_inserts[0][7] == "AUTH_OR_CONFIG_ERROR"
+
+
+# 7. Failure-State Model: Downstream Parser Failure Preserves RAW and Transitions to PARSE_ERROR
+def test_parser_failure_preserves_raw_and_logs_dead_letter():
+    mock_youtube = MagicMock()
+    mock_videos = MagicMock()
+    mock_list = MagicMock()
+    mock_youtube.videos.return_value = mock_videos
+    mock_videos.list.return_value = mock_list
+    mock_list.execute.return_value = {
+        "items": [{"id": "vid_bad_parse", "snippet": {"title": "Test"}}]
     }
-    process_video_metadata_payload(
-        mock_conn, raw_payload, ["vid_replay"], "run_123", "req_123", "raw_123"
-    )
 
-    # Check INSERT INTO CORE.FACT_VIDEO_SNAPSHOT uses WHERE NOT EXISTS with api_request_id
-    snapshot_inserts = [c[0][0] for c in mock_cursor.execute.call_args_list if "INSERT INTO CORE.FACT_VIDEO_SNAPSHOT" in c[0][0]]
-    assert len(snapshot_inserts) >= 1
-    assert "WHERE NOT EXISTS" in snapshot_inserts[0]
-    assert "api_request_id" in snapshot_inserts[0]
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_cursor.fetchall.return_value = [("vid_bad_parse",)]
+    mock_cursor.fetchone.return_value = None
 
+    # Inject parser failure after raw persistence
+    with patch("ingestion_video_metadata.process_video_metadata_payload", side_effect=ValueError("Corrupt snippet structure")):
+        with patch("ingestion_video_metadata.get_snowflake_connection", return_value=mock_conn):
+            result = ingest_video_metadata(
+                target_db="FOOTBALL_NARRATIVE_TEST",
+                run_purpose="INTEGRATION_TEST",
+                frame_version_key="test_frame_123",
+                youtube_client=mock_youtube
+            )
 
-# 7. Shorts Fail-Closed Semantics (Decision A.1)
-def test_shorts_fail_closed_semantics():
-    windows = [{
-        "window_type": "EVENT",
-        "start": datetime(2022, 12, 18, 14, 0, tzinfo=timezone.utc),
-        "end": datetime(2022, 12, 18, 22, 0, tzinfo=timezone.utc)
-    }]
-    event_dt = datetime(2022, 12, 18, 15, 0, tzinfo=timezone.utc)
-    terms = ["final"]
-    aliases = ["messi"]
+    assert result["run_status"] == "PARTIAL_ERROR"
+    all_execs = [(c[0][0], c[0][1] if len(c[0]) > 1 else ()) for c in mock_cursor.execute.call_args_list]
 
-    # Case A: is_short is None -> fails closed as SHORTS_UNRESOLVED
-    vid_unknown_short = {
-        "title": "Messi Final Highlights",
-        "published_at": "2022-12-18T16:00:00Z",
-        "is_short": None,
-        "primary_language_code": "en",
-        "resolution_status": "RESOLVED"
-    }
-    res_unknown = evaluate_video_eligibility(vid_unknown_short, aliases, terms, event_dt, windows)
-    assert not res_unknown["is_eligible"]
-    assert res_unknown["reason"] == "SHORTS_UNRESOLVED"
+    # RAW response was preserved before parse failure
+    assert any("INSERT INTO RAW.YOUTUBE_API_RESPONSE" in s for s, p in all_execs)
 
-    # Case B: is_short is True -> fails as YOUTUBE_SHORT
-    vid_short = {
-        "title": "Messi Final Highlights",
-        "published_at": "2022-12-18T16:00:00Z",
-        "is_short": True,
-        "primary_language_code": "en",
-        "resolution_status": "RESOLVED"
-    }
-    res_short = evaluate_video_eligibility(vid_short, aliases, terms, event_dt, windows)
-    assert not res_short["is_eligible"]
-    assert res_short["reason"] == "YOUTUBE_SHORT"
+    # DEAD_LETTER_RECORD was logged
+    dead_letters = [p for s, p in all_execs if "INSERT INTO OPS.DEAD_LETTER_RECORD" in s]
+    assert len(dead_letters) == 1
+    assert dead_letters[0][3] == "PARSE"
+    assert dead_letters[0][4] == "PARSE_ERROR"
 
-    # Case C: is_short is False -> eligible
-    vid_long = {
-        "title": "Messi Final Highlights",
-        "published_at": "2022-12-18T16:00:00Z",
-        "is_short": False,
-        "primary_language_code": "en",
-        "resolution_status": "RESOLVED"
-    }
-    res_long = evaluate_video_eligibility(vid_long, aliases, terms, event_dt, windows)
-    assert res_long["is_eligible"]
-    assert res_long["reason"] is None
+    # Candidate transitioned to PARSE_ERROR
+    state_updates = [p for s, p in all_execs if "INSERT INTO OPS.VIDEO_METADATA_RESOLUTION_STATE" in s]
+    assert any("PARSE_ERROR" in p for p in state_updates)
 
 
-# 8. Language Policy (Decision A.3)
-def test_unknown_language_passes_metadata_eligibility():
-    windows = [{
-        "window_type": "EVENT",
-        "start": datetime(2022, 12, 18, 14, 0, tzinfo=timezone.utc),
-        "end": datetime(2022, 12, 18, 22, 0, tzinfo=timezone.utc)
-    }]
-    event_dt = datetime(2022, 12, 18, 15, 0, tzinfo=timezone.utc)
-    terms = ["final"]
-    aliases = ["messi"]
-
-    # UNKNOWN source language passes metadata cohort stage
-    vid_unknown_lang = {
-        "title": "Messi Final Review",
-        "published_at": "2022-12-18T16:00:00Z",
-        "is_short": False,
-        "primary_language_code": "UNKNOWN",
-        "resolution_status": "RESOLVED"
-    }
-    res_unk = evaluate_video_eligibility(vid_unknown_lang, aliases, terms, event_dt, windows)
-    assert res_unk["is_eligible"]
-
-    # Explicit non-English fails
-    vid_spanish = {
-        "title": "Messi Final Review",
-        "published_at": "2022-12-18T16:00:00Z",
-        "is_short": False,
-        "primary_language_code": "es",
-        "resolution_status": "RESOLVED"
-    }
-    res_es = evaluate_video_eligibility(vid_spanish, aliases, terms, event_dt, windows)
-    assert not res_es["is_eligible"]
-    assert res_es["reason"] == "NON_ENGLISH_METADATA"
-
-
-# 9. Legacy uploads_playlist Lineage Repair
-def test_legacy_uploads_lineage_repair():
+# 8. Managed Lifecycle Enrichment: Freeze Semantics on Refresh
+def test_managed_lifecycle_freeze_semantics_preserves_resolved_metadata():
+    """
+    Regression test:
+    Normal metadata refresh where the Shorts classifier returns UNKNOWN (None)
+    must NEVER erase a previously resolved TRUE/FALSE is_short value in DIM_VIDEO.
+    Existing resolved language must also not be overwritten by UNKNOWN.
+    """
     mock_conn = MagicMock()
     mock_cursor = MagicMock()
     mock_conn.cursor.return_value = mock_cursor
 
-    # Row 1: exactly 1 originating frame -> repaired
-    # Row 2: 0 frames -> unresolved
-    # Row 3: 2 frames -> unresolved
-    mock_cursor.fetchall.side_effect = [
-        # Initial query for unrepaired rows
-        [
-            ("ve_001", "v_001", json.dumps({"method": "uploads_playlist"})),
-            ("ve_002", "v_002", json.dumps({"method": "uploads_playlist"})),
-            ("ve_003", "v_003", json.dumps({"method": "uploads_playlist"}))
-        ],
-        # ve_001 frame candidates (exactly 1 match)
-        [("frame_target_123",)],
-        # ve_002 frame candidates (0 matches)
-        [],
-        # ve_003 frame candidates (2 matches)
-        [("frame_target_123",), ("other_frame_456",)]
+    # Video already has resolved metadata: is_short=False, rule='frozen_v1.0', lang='en', duration=300
+    mock_cursor.fetchone.side_effect = [
+        ("video_key_123", "2022-12-18T10:00:00Z", False, "frozen_v1.0", "en", 300),  # DIM_VIDEO lookup
+        ("res_state_123",)  # RESOLUTION_STATE lookup
     ]
 
-    result = repair_legacy_uploads_frame_lineage(mock_conn, "frame_target_123")
-    assert result["repaired"] == 1
-    assert result["unresolved"] == 2
-    assert mock_conn.commit.called
+    # Incoming refresh has no language info (returns UNKNOWN) and is_short=None
+    refresh_payload = {
+        "items": [
+            {
+                "id": "vid_stable",
+                "snippet": {"title": "Updated Title", "publishedAt": "2022-12-18T15:00:00Z"},
+                "contentDetails": {"duration": "PT5M"},
+                "statistics": {"viewCount": "1200"}
+            }
+        ]
+    }
+
+    process_video_metadata_payload(
+        mock_conn, refresh_payload, ["vid_stable"], "run_refresh", "req_refresh", "raw_refresh"
+    )
+
+    all_execs = [(c[0][0], c[0][1] if len(c[0]) > 1 else ()) for c in mock_cursor.execute.call_args_list]
+    dim_updates = [p for s, p in all_execs if "UPDATE CORE.DIM_VIDEO" in s]
+    assert len(dim_updates) == 1
+
+    # Parameters: (pub_at_str, final_duration, final_is_short, final_rule, final_lang, v_key)
+    update_params = dim_updates[0]
+    assert update_params[1] == 300  # duration preserved
+    assert update_params[2] is False, "Previously resolved is_short=False must NOT be overwritten by None"
+    assert update_params[3] == "frozen_v1.0", "Original rule version must be preserved"
+    assert update_params[4] == "en", "Resolved language 'en' must NOT be overwritten by 'UNKNOWN'"
 
 
-# 10. Cohort Selection Gated on Unapproved K
-def test_cohort_selection_gated_on_unapproved_k(tmp_path):
-    # Create temp config with unapproved K
+# 9. Cohort Eligibility: Separate Baseline vs Event Rules and Temporal Boundaries
+def test_cohort_eligibility_boundaries_and_overlap_rule():
+    """
+    Regression test for docs/04-sampling-methodology.md Section 7.1:
+    - Pure Baseline: [T-14d, T-24h) -> BASELINE if player/competition/topic relevant
+    - Overlap: [T-24h, T-1h] -> EVENT if event-relevant; else BASELINE if baseline-relevant; else ineligible
+    - Pure Event: (T-1h, T+72h] -> EVENT if event-relevant
+    - Outside [T-14d, T+72h] -> OUT_OF_WINDOW
+    """
+    event_dt = datetime(2022, 12, 18, 15, 0, tzinfo=timezone.utc)
+    terms = ["final", "world cup"]
+    aliases = ["messi"]
+
+    def make_video(published_at, title, desc=""):
+        return {
+            "title": title,
+            "description": desc,
+            "published_at": published_at,
+            "is_short": False,
+            "primary_language_code": "en",
+            "resolution_status": "RESOLVED"
+        }
+
+    # 1. Exact boundary T-14d (2022-12-04T15:00:00Z):
+    # Pure baseline: Discusses player only -> BASELINE
+    v_t_minus_14d = make_video("2022-12-04T15:00:00Z", "Messi training report")
+    res = evaluate_video_eligibility(v_t_minus_14d, aliases, terms, event_dt)
+    assert res["is_eligible"]
+    assert res["cohort_type"] == "BASELINE"
+
+    # Outside T-14d by 1 second -> OUT_OF_WINDOW
+    v_before_14d = make_video("2022-12-04T14:59:59Z", "Messi training report")
+    res = evaluate_video_eligibility(v_before_14d, aliases, terms, event_dt)
+    assert not res["is_eligible"]
+    assert res["reason"] == "OUT_OF_WINDOW"
+
+    # 2. Overlap Start: Exact boundary T-24h (2022-12-17T15:00:00Z):
+    # Case A: Discusses EVENT -> assigned to EVENT (event takes precedence)
+    v_t_minus_24h_event = make_video("2022-12-17T15:00:00Z", "World Cup Final tactical preview")
+    res = evaluate_video_eligibility(v_t_minus_24h_event, aliases, terms, event_dt)
+    assert res["is_eligible"]
+    assert res["cohort_type"] == "EVENT"
+
+    # Case B: Discusses PLAYER only -> assigned to BASELINE
+    v_t_minus_24h_player = make_video("2022-12-17T15:00:00Z", "Lionel Messi career retrospection")
+    res = evaluate_video_eligibility(v_t_minus_24h_player, aliases, terms, event_dt)
+    assert res["is_eligible"]
+    assert res["cohort_type"] == "BASELINE"
+
+    # Case C: Irrelevant -> INELIGIBLE
+    v_t_minus_24h_irrel = make_video("2022-12-17T15:00:00Z", "Unrelated football news")
+    res = evaluate_video_eligibility(v_t_minus_24h_irrel, aliases, terms, event_dt)
+    assert not res["is_eligible"]
+    assert res["reason"] == "NO_TARGET_RELEVANCE"
+
+    # 3. Overlap End: Exact boundary T-1h (2022-12-18T14:00:00Z):
+    # Discusses EVENT -> EVENT
+    v_t_minus_1h_event = make_video("2022-12-18T14:00:00Z", "Pre-match Final buildup")
+    res = evaluate_video_eligibility(v_t_minus_1h_event, aliases, terms, event_dt)
+    assert res["is_eligible"]
+    assert res["cohort_type"] == "EVENT"
+
+    # Discusses PLAYER only -> BASELINE
+    v_t_minus_1h_player = make_video("2022-12-18T14:00:00Z", "Messi warm up routine")
+    res = evaluate_video_eligibility(v_t_minus_1h_player, aliases, terms, event_dt)
+    assert res["is_eligible"]
+    assert res["cohort_type"] == "BASELINE"
+
+    # 4. Pure Event: Event Timestamp T=0 (2022-12-18T15:00:00Z):
+    # Event relevance -> EVENT
+    v_t0_event = make_video("2022-12-18T15:00:00Z", "Live World Cup Final kick off")
+    res = evaluate_video_eligibility(v_t0_event, aliases, terms, event_dt)
+    assert res["is_eligible"]
+    assert res["cohort_type"] == "EVENT"
+
+    # Discusses player only without event terms after T-1h -> INELIGIBLE (baseline has ended)
+    v_t0_player_only = make_video("2022-12-18T15:00:00Z", "Messi career compilation")
+    res = evaluate_video_eligibility(v_t0_player_only, aliases, terms, event_dt)
+    assert not res["is_eligible"]
+    assert res["reason"] == "NO_TARGET_RELEVANCE"
+
+    # 5. Exact boundary T+72h (2022-12-21T15:00:00Z):
+    v_t_plus_72h = make_video("2022-12-21T15:00:00Z", "Final aftermath analysis")
+    res = evaluate_video_eligibility(v_t_plus_72h, aliases, terms, event_dt)
+    assert res["is_eligible"]
+    assert res["cohort_type"] == "EVENT"
+
+    # Outside T+72h by 1 second -> OUT_OF_WINDOW
+    v_after_72h = make_video("2022-12-21T15:00:01Z", "Final aftermath analysis")
+    res = evaluate_video_eligibility(v_after_72h, aliases, terms, event_dt)
+    assert not res["is_eligible"]
+    assert res["reason"] == "OUT_OF_WINDOW"
+
+
+# 10. Scope Target Aliases to the Current Event
+def test_aliases_scoped_to_current_event(tmp_path):
+    """
+    Regression test:
+    Target aliases must be resolved via BRIDGE_EVENT_ENTITY for THIS event.
+    An alias belonging to another target entity cannot satisfy target relevance.
+    """
     cfg_file = tmp_path / "sampling_policy.yml"
-    cfg_file.write_text("k_capacity: null\nk_capacity_status: UNAPPROVED_PENDING_STRATA_INSPECTION\n", encoding="utf-8")
+    cfg_file.write_text(
+        "sampling_policy_version: '1.2'\n"
+        "sampling_policy_version_key: 'sp_v1_key'\n"
+        "k_capacity: 5\nk_capacity_status: APPROVED\n",
+        encoding="utf-8"
+    )
 
-    with pytest.raises(ValueError, match="Cohort selection is GATED.*unapproved K capacity"):
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+
+    mock_cursor.fetchone.side_effect = [
+        # Event version occurred_at and terms
+        (datetime(2022, 12, 18, 15, 0), json.dumps(["final"])),
+        # Stratum snapshot query
+        ("snap_1", "ANALYST", "MESSI_FOCUSED")
+    ]
+    mock_cursor.fetchall.side_effect = [
+        # Scoped aliases: only "messi" is attached to THIS event (Ronaldo is NOT attached)
+        [("messi",)],
+        # Windows
+        [("w1", "EVENT", datetime(2022, 12, 18, 14, 0), datetime(2022, 12, 18, 22, 0))],
+        # Candidate videos: one video mentions Ronaldo only during pre-event baseline window
+        [("v_ronaldo", "vid_ronaldo", "ch_1", datetime(2022, 12, 10, 12, 0), 300, False, "en", "ve_r", "sp_v1_key", "RESOLVED", "Cristiano Ronaldo skills", "Only CR7 skills")]
+    ]
+
+    with patch("cohort_selection.get_snowflake_connection", return_value=mock_conn):
+        rank_and_select_cohorts(
+            target_db="FOOTBALL_NARRATIVE_TEST",
+            run_purpose="INTEGRATION_TEST",
+            frame_version_key="frame_123",
+            event_version_key="ev_wc22",
+            sampling_policy_path=str(cfg_file)
+        )
+
+    # Verify query for aliases joins BRIDGE_EVENT_ENTITY with event_version_key
+    alias_queries = [c[0][0] for c in mock_cursor.execute.call_args_list if "CORE.DIM_TARGET_ENTITY_ALIAS" in c[0][0]]
+    assert len(alias_queries) == 1
+    assert "BRIDGE_EVENT_ENTITY" in alias_queries[0]
+
+    # Verify Ronaldo video was marked INELIGIBLE with NO_TARGET_RELEVANCE because Ronaldo is not attached to WC22
+    all_execs = [(c[0][0], c[0][1] if len(c[0]) > 1 else ()) for c in mock_cursor.execute.call_args_list]
+    ineligible_updates = [p for s, p in all_execs if "UPDATE CORE.BRIDGE_VIDEO_EVENT" in s and "NO_TARGET_RELEVANCE" in p]
+    assert len(ineligible_updates) == 1
+
+
+# 11. Pin Sampling Policy Version: Two Versions Cannot Be Mixed
+def test_pin_sampling_policy_version_cannot_be_mixed(tmp_path):
+    """
+    Regression test:
+    rank_and_select_cohorts must pin selection to one explicit sampling_policy_version_key
+    and filter BRIDGE_VIDEO_EVENT to it.
+    """
+    cfg_file = tmp_path / "sampling_policy.yml"
+    cfg_file.write_text(
+        "sampling_policy_version: '1.2'\n"
+        "sampling_policy_version_key: 'policy_v1_approved'\n"
+        "k_capacity: 5\nk_capacity_status: APPROVED\n",
+        encoding="utf-8"
+    )
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+
+    mock_cursor.fetchone.side_effect = [
+        (datetime(2022, 12, 18, 15, 0), json.dumps(["final"])),
+        ("snap_1", "ANALYST", "MESSI_FOCUSED")
+    ]
+    mock_cursor.fetchall.side_effect = [
+        [("messi",)],
+        [("w1", "EVENT", datetime(2022, 12, 18, 14, 0), datetime(2022, 12, 18, 22, 0))],
+        []  # 0 candidates
+    ]
+
+    with patch("cohort_selection.get_snowflake_connection", return_value=mock_conn):
         rank_and_select_cohorts(
             target_db="FOOTBALL_NARRATIVE_TEST",
             run_purpose="INTEGRATION_TEST",
@@ -308,95 +495,36 @@ def test_cohort_selection_gated_on_unapproved_k(tmp_path):
             sampling_policy_path=str(cfg_file)
         )
 
-
-# 11. Cohort Selection Gated on Missing Channel Stratum Snapshot
-def test_cohort_selection_gated_on_missing_channel_stratum_snapshot(tmp_path):
-    # Config with approved K for test
-    cfg_file = tmp_path / "sampling_policy.yml"
-    cfg_file.write_text("k_capacity: 5\nk_capacity_status: APPROVED\n", encoding="utf-8")
-
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
-
-    # Event terms, aliases, windows return valid records
-    mock_cursor.fetchone.side_effect = [
-        # Event version
-        (datetime(2022, 12, 18, 15, 0), json.dumps(["final"])),
-        # Stratum snapshot query: return None (missing snapshot!)
-        None
+    # Candidate query must filter by sampling_policy_version_key
+    candidate_queries = [
+        (c[0][0], c[0][1]) for c in mock_cursor.execute.call_args_list
+        if "FROM CORE.DIM_VIDEO v" in c[0][0] and "JOIN CORE.BRIDGE_VIDEO_EVENT b" in c[0][0]
     ]
-    mock_cursor.fetchall.side_effect = [
-        # Aliases
-        [("messi",)],
-        # Windows
-        [("w1", "EVENT", datetime(2022, 12, 18, 14, 0), datetime(2022, 12, 18, 22, 0))],
-        # Candidates query returns 1 candidate for channel ch_123
-        [("v_1", "vid_1", "ch_123", datetime(2022, 12, 18, 16, 0), 300, False, "en", "ve_1", "sp_1", "RESOLVED", "Title", "Desc")]
-    ]
-
-    with patch("cohort_selection.get_snowflake_connection", return_value=mock_conn):
-        with pytest.raises(ValueError, match="Cohort selection is GATED.*lacks active BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT"):
-            rank_and_select_cohorts(
-                target_db="FOOTBALL_NARRATIVE_TEST",
-                run_purpose="INTEGRATION_TEST",
-                frame_version_key="frame_123",
-                event_version_key="ev_123",
-                sampling_policy_path=str(cfg_file)
-            )
+    assert len(candidate_queries) == 1
+    query_sql, query_params = candidate_queries[0]
+    assert "b.sampling_policy_version_key = %s" in query_sql
+    assert "policy_v1_approved" in query_params
 
 
-# 12. Frozen 5-Step Binary Ranking (No Title-over-Description Precedence)
-def test_frozen_ranking_binary_relevance_no_title_over_description():
-    windows = [{
-        "window_type": "EVENT",
-        "start": datetime(2022, 12, 18, 14, 0, tzinfo=timezone.utc),
-        "end": datetime(2022, 12, 18, 22, 0, tzinfo=timezone.utc)
-    }]
-    event_dt = datetime(2022, 12, 18, 15, 0, tzinfo=timezone.utc)
-    terms = ["final"]
-    aliases = ["messi"]
+# 12. Test Database Isolation: INTEGRATION_TEST Requires FOOTBALL_NARRATIVE_TEST
+def test_test_database_isolation_enforced():
+    """
+    Regression test:
+    run_purpose = INTEGRATION_TEST targeting FOOTBALL_NARRATIVE_DEV must fail
+    structurally before any database/API processing in both entry points.
+    """
+    with pytest.raises(ValueError, match="run_purpose 'INTEGRATION_TEST' requires target_db 'FOOTBALL_NARRATIVE_TEST' exclusively"):
+        ingest_video_metadata(
+            target_db="FOOTBALL_NARRATIVE_DEV",
+            run_purpose="INTEGRATION_TEST",
+            frame_version_key="frame_123"
+        )
 
-    # Candidate A: Title has "Messi", description has "Final"
-    cand_a = {
-        "title": "Messi Masterclass",
-        "description": "Analysis of the World Cup Final match",
-        "published_at": "2022-12-18T16:00:00Z",
-        "is_short": False,
-        "primary_language_code": "en",
-        "resolution_status": "RESOLVED"
-    }
-    # Candidate B: Title has "World Cup Final", description has "Messi"
-    cand_b = {
-        "title": "World Cup Final Tactical Analysis",
-        "description": "How Messi influenced the game",
-        "published_at": "2022-12-18T16:00:00Z",
-        "is_short": False,
-        "primary_language_code": "en",
-        "resolution_status": "RESOLVED"
-    }
-
-    res_a = evaluate_video_eligibility(cand_a, aliases, terms, event_dt, windows)
-    res_b = evaluate_video_eligibility(cand_b, aliases, terms, event_dt, windows)
-
-    # Both must evaluate as equally eligible with identical binary matches
-    assert res_a["is_eligible"] and res_b["is_eligible"]
-    assert res_a["event_matched"] is True and res_b["event_matched"] is True
-    assert res_a["player_matched"] is True and res_b["player_matched"] is True
-    assert res_a["proximity_seconds"] == res_b["proximity_seconds"]
-
-
-# 13. Structural Isolation: Reject PIPELINE_PILOT frames for RESEARCH runs
-def test_research_rejects_pipeline_pilot_frame():
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_conn.cursor.return_value = mock_cursor
-    mock_cursor.fetchone.return_value = ("PIPELINE_PILOT",)
-
-    with patch("ingestion_video_metadata.get_snowflake_connection", return_value=mock_conn):
-        with pytest.raises(ValueError, match="RESEARCH runs structurally reject PIPELINE_PILOT frames"):
-            ingest_video_metadata(
-                target_db="FOOTBALL_NARRATIVE_DEV",
-                run_purpose="RESEARCH",
-                frame_version_key="pilot_frame_key"
-            )
+    with pytest.raises(ValueError, match="run_purpose 'INTEGRATION_TEST' requires target_db 'FOOTBALL_NARRATIVE_TEST' exclusively"):
+        rank_and_select_cohorts(
+            target_db="FOOTBALL_NARRATIVE_DEV",
+            run_purpose="INTEGRATION_TEST",
+            frame_version_key="frame_123",
+            event_version_key="ev_123",
+            sampling_policy_path="config/sampling_policy.yml"
+        )

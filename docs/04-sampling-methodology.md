@@ -69,6 +69,12 @@ To accurately measure audience dynamics (e.g., returning vs newly observed autho
 - **Baseline Video Cohort**: Videos published during the pre-event reference period (T-14 days to T-1 hour) that explicitly discuss the target player, relevant competition, or a pre-registered event-specific topic defined before comment retrieval. Every baseline video requires a documented inclusion rationale.
 - **Event Video Cohort**: Videos published between T-24 hours and T+72 hours that explicitly discuss the event.
 
+### 7.1 Temporal Overlap Disambiguation Rule (T-24 Hours to T-1 Hour)
+For a given event and sampling-policy version, a video belongs to at most one cohort (mutually exclusive assignment). Within the overlapping interval between T-24 hours and T-1 hour:
+1. If the video satisfies explicit **Event relevance** (discusses the event), it is assigned to the **Event Video Cohort** (`EVENT`).
+2. Otherwise, if the video satisfies the **Baseline relevance** criteria (explicitly discusses the target player, relevant competition, or pre-registered baseline topic), it is assigned to the **Baseline Video Cohort** (`BASELINE`).
+3. Otherwise, the video is classified as ineligible (`INELIGIBLE`).
+
 ## 8. Video-Selection Algorithm
 Eligible videos are ranked and selected using only pre-comment metadata. For every event, we select up to *K* videos per channel stratum using the following deterministic criteria (*K* is defined in a versioned sampling configuration and may vary by release, provided the same value is applied across comparable strata for a given event study):
 1. Explicit event relevance.
