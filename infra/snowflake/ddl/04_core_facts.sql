@@ -52,5 +52,7 @@ CREATE TABLE IF NOT EXISTS FACT_VIDEO_SNAPSHOT (
     description VARCHAR(5000),
     views NUMBER(38,0),
     likes NUMBER(38,0),
-    ingestion_run_id VARCHAR(36) NOT NULL
+    ingestion_run_id VARCHAR(36) NOT NULL,
+    api_request_id VARCHAR(36),
+    raw_response_id VARCHAR(36)
 );

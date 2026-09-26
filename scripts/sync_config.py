@@ -38,6 +38,29 @@ def sync_aliases(conn, config_path):
                 cursor.execute('''INSERT INTO CORE.DIM_TARGET_ENTITY_ALIAS (alias_key, target_entity_key, alias_text, valid_from, is_active, source)
                                   VALUES (%s, %s, %s, %s, TRUE, 'CONFIG')''', (str(uuid.uuid4()), entity_key, text, now))
 
+def normalize_datetime_utc(dt_val):
+    if dt_val is None:
+        return None
+    if isinstance(dt_val, datetime):
+        dt = dt_val
+    else:
+        dt = datetime.fromisoformat(str(dt_val).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+def normalize_terms_list(terms_raw):
+    if terms_raw is None:
+        return []
+    if isinstance(terms_raw, str):
+        try:
+            terms = json.loads(terms_raw)
+        except Exception:
+            terms = [terms_raw]
+    else:
+        terms = terms_raw
+    return sorted([str(t).strip().lower() for t in terms if t is not None])
+
 def sync_events(conn, config_path):
     with open(config_path, 'r') as f:
         data = yaml.safe_load(f)
@@ -52,6 +75,7 @@ def sync_events(conn, config_path):
         occurred_at = event['occurred_at']
         rationale = event.get('inclusion_rationale')
         event_terms = event.get('event_terms', [])
+        baseline_terms = event.get('baseline_terms', [])
         
         cursor.execute("SELECT event_key FROM CORE.DIM_EVENT WHERE external_event_id = %s", (ext_id,))
         row = cursor.fetchone()
@@ -62,21 +86,63 @@ def sync_events(conn, config_path):
             cursor.execute("INSERT INTO CORE.DIM_EVENT (event_key, external_event_id, event_type) VALUES (%s, %s, %s)",
                            (event_key, ext_id, event_type))
             
-        # Get or create version
-        cursor.execute("SELECT event_version_key FROM CORE.DIM_EVENT_VERSION WHERE event_key = %s AND is_current = TRUE", (event_key,))
+        # Type 2 SCD: Query current event version
+        cursor.execute('''
+            SELECT event_version_key, event_name, occurred_at, inclusion_rationale, event_terms, baseline_terms
+            FROM CORE.DIM_EVENT_VERSION
+            WHERE event_key = %s AND is_current = TRUE
+        ''', (event_key,))
         v_row = cursor.fetchone()
         terms_json = json.dumps(event_terms)
+        b_terms_json = json.dumps(baseline_terms)
+        
         if v_row:
-            version_key = v_row[0]
-            # Simple update for now instead of full SCD2
-            cursor.execute('''UPDATE CORE.DIM_EVENT_VERSION SET event_name=%s, occurred_at=%s, inclusion_rationale=%s, event_terms=PARSE_JSON(%s)
-                              WHERE event_version_key=%s''', (event_name, occurred_at, rationale, terms_json, version_key))
+            curr_version_key, curr_name, curr_occurred_at, curr_rationale, curr_terms_raw, curr_baseline_raw = v_row
+            
+            # Deterministic comparison of versioned fields
+            name_changed = (str(curr_name or '').strip() != str(event_name or '').strip())
+            
+            curr_dt = normalize_datetime_utc(curr_occurred_at)
+            in_dt = normalize_datetime_utc(occurred_at)
+            time_changed = (curr_dt != in_dt)
+            
+            rationale_changed = (str(curr_rationale or '').strip() != str(rationale or '').strip())
+            terms_changed = (normalize_terms_list(curr_terms_raw) != normalize_terms_list(event_terms))
+            baseline_changed = (normalize_terms_list(curr_baseline_raw) != normalize_terms_list(baseline_terms))
+            
+            if name_changed or time_changed or rationale_changed or terms_changed or baseline_changed:
+                # Type 2 SCD: Close the current version
+                cursor.execute('''
+                    UPDATE CORE.DIM_EVENT_VERSION
+                    SET is_current = FALSE,
+                        valid_to = %s
+                    WHERE event_version_key = %s
+                ''', (now, curr_version_key))
+                
+                # Insert new version
+                version_key = str(uuid.uuid4())
+                cursor.execute('''
+                    INSERT INTO CORE.DIM_EVENT_VERSION (
+                        event_version_key, event_key, event_name, occurred_at,
+                        inclusion_rationale, event_terms, baseline_terms,
+                        valid_from, valid_to, is_current
+                    ) SELECT %s, %s, %s, %s, %s, PARSE_JSON(%s), PARSE_JSON(%s), %s, NULL, TRUE
+                ''', (version_key, event_key, event_name, occurred_at, rationale, terms_json, b_terms_json, now))
+            else:
+                # Unchanged: reuse existing version_key
+                version_key = curr_version_key
         else:
+            # Initial version
             version_key = str(uuid.uuid4())
-            cursor.execute('''INSERT INTO CORE.DIM_EVENT_VERSION (event_version_key, event_key, event_name, occurred_at, inclusion_rationale, event_terms, valid_from, is_current)
-                              SELECT %s, %s, %s, %s, %s, PARSE_JSON(%s), %s, TRUE''', (version_key, event_key, event_name, occurred_at, rationale, terms_json, now))
+            cursor.execute('''
+                INSERT INTO CORE.DIM_EVENT_VERSION (
+                    event_version_key, event_key, event_name, occurred_at,
+                    inclusion_rationale, event_terms, baseline_terms,
+                    valid_from, valid_to, is_current
+                ) SELECT %s, %s, %s, %s, %s, PARSE_JSON(%s), PARSE_JSON(%s), %s, NULL, TRUE
+            ''', (version_key, event_key, event_name, occurred_at, rationale, terms_json, b_terms_json, now))
                               
-        # Sync windows
+        # Sync windows against version_key
         occurred_dt = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))
         
         for w in event.get('windows', []):

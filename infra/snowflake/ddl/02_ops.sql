@@ -152,4 +152,23 @@ CREATE TABLE IF NOT EXISTS DISCOVERY_UNIT_STATE (
     CONSTRAINT uq_discovery_unit_state UNIQUE (frame_version_key, channel_key, window_key, discovery_policy_version, query_hash)
 );
 
+CREATE TABLE IF NOT EXISTS VIDEO_METADATA_RESOLUTION_STATE (
+    resolution_state_key VARCHAR(36) NOT NULL PRIMARY KEY,
+    source_system VARCHAR(128) NOT NULL,
+    source_id VARCHAR(128) NOT NULL,
+    -- Approved states: PENDING, RESOLVED, UNAVAILABLE, RETRYABLE_ERROR, PARSE_ERROR, FATAL_ERROR
+    resolution_status VARCHAR(32) NOT NULL,
+    first_discovered_at TIMESTAMP_NTZ NOT NULL,
+    resolved_at TIMESTAMP_NTZ,
+    updated_at TIMESTAMP_NTZ NOT NULL,
+    api_request_id VARCHAR(36),
+    raw_response_id VARCHAR(36),
+    first_ingestion_run_id VARCHAR(36) NOT NULL,
+    latest_ingestion_run_id VARCHAR(36) NOT NULL,
+    last_error_code VARCHAR(128),
+    last_error_message VARCHAR(1024),
+    retry_count NUMBER(38,0) DEFAULT 0,
+    CONSTRAINT uq_video_metadata_resolution_state UNIQUE (source_system, source_id)
+);
+
 

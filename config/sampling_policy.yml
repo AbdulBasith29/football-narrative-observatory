@@ -1,0 +1,36 @@
+# config/sampling_policy.yml
+# Methodology Version: 1.2
+# Phase 1D Sampling Policy Specification
+
+sampling_policy_version: "1.2"
+policy_name: "Methodology v1.2 Sampling Policy"
+
+# Stratum Video Cohort Capacity (K)
+# NOTE: K is NOT approved yet. Cohort selection must fail closed if executed without an approved K.
+k_capacity: null
+k_capacity_status: "UNAPPROVED_PENDING_STRATA_INSPECTION"
+
+# YouTube Shorts Classification Policy
+# Methodology requires Shorts exclusion under a versioned rule.
+# Under Decision A.1, status cannot be inferred from duration alone.
+# Ambiguous/unverified status is preserved as UNKNOWN (is_short = NULL) and fails closed (gated from selection).
+shorts_classification:
+  rule_version: "frozen_v1.2_unresolved_shorts"
+  fail_closed_on_unknown: true
+
+# Video-Level Language Policy
+# Under Decision A.3, UNKNOWN source-level language metadata does not disqualify the video during cohort selection.
+# Final language filtering is deferred downstream to comment NLP (target-opinion analytical subset).
+language_policy:
+  allow_unknown_source_language: true
+  disqualify_on_explicit_non_english: true
+
+# Deterministic Ranking Algorithm (Five Frozen Criteria)
+ranking_algorithm:
+  version: "frozen_v1.2_binary_relevance_five_criteria"
+  criteria:
+    - "1_explicit_event_relevance"
+    - "2_target_player_relevance"
+    - "3_publication_time_proximity"
+    - "4_tracked_channel_eligibility"
+    - "5_deterministic_tie_break"
