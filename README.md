@@ -42,8 +42,8 @@ For the full list of our research questions, see [Research Questions](docs/01-re
 
 ## Current Project Status
 
-**Phase 1B — Snowflake Warehouse Bootstrap**
-Phase 1B currently contains temporary live integration-test data. No Version 1.0 research sample has been ingested yet.
+**Phase 1C — Research Universe & Video Discovery Pipeline**
+Phase 1C establishes the channel selection protocol, warehouse schema migrations (V001–V006), and a resumable video discovery service supporting channel uploads and search fallback with deterministic query hashing and quota budgeting. Temporary integration-test data has been verified in `FOOTBALL_NARRATIVE_TEST`. No Version 1.0 research comment sample has been ingested yet.
 
 ## Repository Navigation
 
@@ -76,5 +76,22 @@ Phase 1B currently contains temporary live integration-test data. No Version 1.0
 - For a comprehensive list, see [Limitations and Ethics](docs/10-limitations-and-ethics.md).
 
 ## Reproducibility Instructions
-
-*(To be added during Phase 2/3 when the ingestion pipeline and physical warehouse are defined.)*
+ 
+1. **Environment Setup**:
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate  # Or on Windows: .venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
+2. **Configuration**:
+   Copy `.env.example` to `.env` and configure credentials (`SNOWFLAKE_USER`, `SNOWFLAKE_PASSWORD`, `SNOWFLAKE_ACCOUNT`, `YOUTUBE_API_KEY`).
+3. **Database Bootstrap**:
+   Bootstrap database objects, migrations V001–V006, and sync config dimensions:
+   ```bash
+   python scripts/setup_snowflake.py [optional-6-digit-totp-passcode]
+   ```
+4. **Run Test Suite**:
+   Execute the full automated offline test suite:
+   ```bash
+   pytest tests/
+   ```

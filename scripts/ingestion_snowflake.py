@@ -21,6 +21,17 @@ def get_snowflake_connection(bootstrap=False, target_db="FOOTBALL_NARRATIVE_DEV"
     wh = os.getenv("SNOWFLAKE_WAREHOUSE")
     if wh:
         conn_params["warehouse"] = wh
+    role = os.getenv("SNOWFLAKE_ROLE")
+    if role:
+        conn_params["role"] = role
+    auth = os.getenv("SNOWFLAKE_AUTHENTICATOR", "").strip()
+    if auth and auth.lower() not in ("snowflake", "default"):
+        conn_params["authenticator"] = auth
+    passcode = os.getenv("SNOWFLAKE_PASSCODE")
+    if passcode:
+        conn_params["passcode"] = passcode
+    if os.getenv("SNOWFLAKE_PASSCODE_IN_PASSWORD", "").lower() in ("true", "1"):
+        conn_params["passcode_in_password"] = True
         
     if not bootstrap:
         conn_params["database"] = target_db
@@ -43,6 +54,15 @@ def setup_snowflake_ddl(conn, target_db="FOOTBALL_NARRATIVE_DEV"):
         with open(path, 'r') as f:
             sql_script = f.read().replace('FOOTBALL_NARRATIVE_DEV', target_db)
             conn.execute_string(sql_script)
+
+    migrations_dir = "infra/snowflake/migrations"
+    if os.path.exists(migrations_dir):
+        mig_files = sorted([f for f in os.listdir(migrations_dir) if f.endswith('.sql')])
+        for file in mig_files:
+            path = os.path.join(migrations_dir, file)
+            with open(path, 'r') as f:
+                sql_script = f.read().replace('FOOTBALL_NARRATIVE_DEV', target_db)
+                conn.execute_string(sql_script)
 
 def hash_author_id(author_id: str, hmac_secret: str) -> str:
     h = hmac.new(hmac_secret.encode('utf-8'), author_id.encode('utf-8'), hashlib.sha256)
@@ -386,6 +406,7 @@ def ingest_video(video_id: str, hmac_secret: str, youtube, run_type: str = "HOT_
 
 def clean_database(conn):
     c = conn.cursor()
+    c.execute("DELETE FROM OPS.DISCOVERY_UNIT_STATE")
     c.execute("DELETE FROM OPS.CHECKPOINT_WATERMARK_COMMENT_HISTORY")
     c.execute("DELETE FROM OPS.CHECKPOINT_WATERMARK_COMMENT")
     c.execute("DELETE FROM OPS.CHECKPOINT_HISTORY")

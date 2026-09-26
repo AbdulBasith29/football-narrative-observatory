@@ -1,0 +1,43 @@
+# config/tracked_channels.yml
+# Methodology Version: 1.2
+# Note: This file defines the PIPELINE_PILOT frame membership. 
+# Event-relative classification (Channel Type x Player Focus) is derived later via event-channel assessment snapshots.
+
+frame_name: "Pilot Pipeline Frame"
+frame_purpose: "PIPELINE_PILOT"
+
+channels:
+  - channel_id: "UCNAf1k0yIjyGu3k9BwAg3lg"
+    channel_name: "Sky Sports Premier League"
+    discovery_source: "manual_bootstrap"
+    discovery_source_version: "pilot_v1"
+
+  - channel_id: "UC_5kL-3t0fUzi8kHwRTY-zQ"
+    channel_name: "Mark Goldbridge That's Football"
+    discovery_source: "manual_bootstrap"
+    discovery_source_version: "pilot_v1"
+
+  - channel_id: "UCqGqA2hV9e95F9Cj3k2M0gQ"
+    channel_name: "TalkFCB"
+    discovery_source: "manual_bootstrap"
+    discovery_source_version: "pilot_v1"
+
+  - channel_id: "UCMmVPVb0BwSIOWVeDwlPocQ"
+    channel_name: "The United Stand"
+    discovery_source: "manual_bootstrap"
+    discovery_source_version: "pilot_v1"
+
+  - channel_id: "UC-lHJZR3Gqxm24_Vd_AJ5Yw"
+    channel_name: "IShowSpeed"
+    discovery_source: "manual_bootstrap"
+    discovery_source_version: "pilot_v1"
+
+  - channel_id: "UCbX6M_6E0iMzi1Z7H2Bv9KA"
+    channel_name: "Statman Dave"
+    discovery_source: "manual_bootstrap"
+    discovery_source_version: "pilot_v1"
+
+  - channel_id: "UCiWLfSweyRNmLpgEHekhoAg"
+    channel_name: "ESPN FC"
+    discovery_source: "manual_bootstrap"
+    discovery_source_version: "pilot_v1"

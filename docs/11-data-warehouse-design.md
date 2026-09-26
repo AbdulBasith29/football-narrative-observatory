@@ -103,6 +103,14 @@ Standard calendar dimensions for temporal aggregation.
 - **Natural Key**: `source_system`, `source_id`
 - **Fields**: `source_system`, `source_id`, `channel_name`.
 
+### `core.dim_channel_frame_version`
+- **Purpose**: Defines immutable versioned snapshots of the Constructed Panel research frame.
+- **Mutation Policy**: Append only.
+- **Grain**: One immutable definition of a research frame.
+- **Primary Key**: `frame_version_key` (Surrogate)
+- **Natural Key**: `frame_name`, `configuration_hash`
+- **Fields**: `frame_name`, `frame_purpose`, `methodology_version`, `configuration_version`, `configuration_hash`, `git_commit_sha`, `constructed_at`, `configuration_provenance`.
+
 ### `core.dim_video`
 - **Purpose**: Identity mapping and stable sampling traits for videos.
 - **Mutation Policy**: Append only.
@@ -230,6 +238,24 @@ Standard calendar dimensions for temporal aggregation.
 ---
 
 ## 7. Core Bridges
+
+### `core.bridge_frame_channel`
+- **Purpose**: Represents membership of a channel in a specific versioned frame.
+- **Mutation Policy**: Append only.
+- **Grain**: One frame version × one channel.
+- **Primary Key**: `frame_channel_key` (Surrogate)
+- **Natural Key**: `frame_version_key`, `channel_key`
+- **Fields**: `evaluated_at`, `eligibility_rule_version`, `frame_inclusion_status`, `general_exclusion_reason`.
+- **Constraints**: `UNIQUE(frame_version_key, channel_key)`
+
+### `core.frame_channel_source_observation`
+- **Purpose**: Captures provenance connecting a frame member to a specific external source registry.
+- **Mutation Policy**: Append only.
+- **Grain**: One frame membership × one external source observation.
+- **Primary Key**: `frame_channel_source_observation_key` (Surrogate)
+- **Natural Key**: `frame_channel_key`, `discovery_source`, `discovery_source_version`
+- **Fields**: `source_record_identifier`, `source_retrieved_at`.
+- **Constraints**: `UNIQUE(frame_channel_key, discovery_source, discovery_source_version)`
 
 ### `core.bridge_event_entity`
 - **Purpose**: Resolves exactly which entities are central to an event version.

@@ -6,7 +6,7 @@ Can YouTube actually provide the data required to answer each research question,
 - **Source name**: YouTube Data API v3
 - **API or access method**: REST API (`https://www.googleapis.com/youtube/v3/`)
 - **Authentication requirements**: API Key (Server-to-Server)
-- **Quota model**: Separate daily limits: 10,000 general queries (for comment/video endpoints), 100 search queries, and 10,000 video batch statistics queries.
+- **Quota model**: Separate daily limits: 10,000 general queries (for comment/video endpoints), 100 search queries (`search.list` quota bucket), and 10,000 video batch statistics queries. Note that `run_search_call_budget` is a process guardrail limiting maximum Search API calls per run, distinct from provider-side remaining quota.
 - **Historical availability**: Generally exhaustive for active videos, but subject to deletion, privacy changes, and missing historical context if a video is removed or comments are disabled.
 - **Terms and policy constraints**: Strict rules against deriving personally identifiable information (PII), storing raw author identifiers indefinitely without pseudonymisation, or exposing API data in ways that violate YouTube's Developer Policies.
 
@@ -55,20 +55,20 @@ The API cannot reliably provide:
 
 The project currently receives separate API quota buckets:
 - **General API queries**: 10,000 per day
-- **Search queries**: 100 per day
+- **Search queries**: 100 search calls per day (1 Search Query call per API request, including pagination calls)
 - **Video batch statistics queries**: 10,000 per day
 
-`commentThreads.list`, `comments.list`, and `videos.list` generally consume one query per request from the general bucket. `search.list` is governed by the separate limit of 100 calls per day.
+`commentThreads.list`, `comments.list`, and `videos.list` generally consume one query per request from the general bucket. `search.list` uses a separate YouTube Search Queries quota bucket: 1 Search Query call per request, default 100 calls/day. Each pagination page (`nextPageToken`) counts as an additional search query call against the budget.
 
 Because search capacity is substantially more constrained than ordinary read capacity, video discovery is performed periodically and discovered video identifiers are persisted for later ingestion.
 
 - **Expected top-level comment cost per video per run**: Up to five general queries for the configured 500-comment cap.
 - **Metadata cost**: Normally one or a small number of batched `videos.list` or `channels.list` requests.
-- **Discovery cost**: Search capacity is limited to 100 `search.list` requests per day and is therefore treated as a separately budgeted, non-continuous workflow.
+- **Discovery cost**: Search capacity is governed by a dedicated Search Query call bucket (default 100 search calls per day), managed via page-level token checkpointing and configurable process call budgets (`run_search_call_budget`).
 - **Worst-case uncapped comment scan**: A video containing 100,000 top-level comments could require roughly 1,000 paginated comment-thread requests, excluding retries and replies.
 
 ### Operational Budgets
-**Search Budget (100 calls/day)**
+**Search Budget (default 100 calls/day)**
 - New event discovery: 50 calls/day
 - Tracked-query refresh: 25 calls/day
 - Validation/manual research: 15 calls/day
