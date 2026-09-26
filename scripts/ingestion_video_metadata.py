@@ -68,7 +68,7 @@ def is_quota_or_rate_limit_error(err) -> bool:
 
 def log_fact_api_request(conn, api_request_id: str, ingestion_run_id: str, endpoint: str,
                          requested_at: str, completed_at: str, http_status: int = None,
-                         retry_number: int = 0, error_code: str = None, estimated_quota_cost: int = 0):
+                         retry_number: int = 0, error_code: str = None, estimated_quota_cost: int = 1):
     """
     Persists FACT_API_REQUEST telemetry for an attempted API call (whether successful or failed).
     """
@@ -495,6 +495,10 @@ def ingest_video_metadata(
         req_end = None
 
         while retry_num < max_retries:
+            if calls_attempted >= run_video_call_budget:
+                run_outcome = "PARTIAL_QUOTA_LIMIT"
+                break
+
             api_request_id = str(uuid.uuid4())
             req_start = datetime.now(timezone.utc).isoformat()
             calls_attempted += 1
@@ -518,7 +522,7 @@ def ingest_video_metadata(
                     log_fact_api_request(
                         conn, api_request_id, ingestion_run_id, 'videos.list',
                         req_start, req_end, http_status=status_code or 429,
-                        retry_number=retry_num, error_code=err_code, estimated_quota_cost=0
+                        retry_number=retry_num, error_code=err_code, estimated_quota_cost=1
                     )
                     run_outcome = "PARTIAL_QUOTA_LIMIT"
                     update_batch_resolution_state(
@@ -531,11 +535,11 @@ def ingest_video_metadata(
                     log_fact_api_request(
                         conn, api_request_id, ingestion_run_id, 'videos.list',
                         req_start, req_end, http_status=status_code,
-                        retry_number=retry_num, error_code=err_code, estimated_quota_cost=0
+                        retry_number=retry_num, error_code=err_code, estimated_quota_cost=1
                     )
                     run_outcome = "PARTIAL_ERROR"
                     update_batch_resolution_state(
-                        conn, batch, "RETRYABLE_ERROR", api_request_id, None,
+                        conn, batch, "FATAL_ERROR", api_request_id, None,
                         ingestion_run_id, err_code, str(err)[:500], retry_num + 1
                     )
                     break
@@ -544,9 +548,16 @@ def ingest_video_metadata(
                     log_fact_api_request(
                         conn, api_request_id, ingestion_run_id, 'videos.list',
                         req_start, req_end, http_status=status_code or 500,
-                        retry_number=retry_num, error_code=err_code, estimated_quota_cost=0
+                        retry_number=retry_num, error_code=err_code, estimated_quota_cost=1
                     )
                     retry_num += 1
+                    if calls_attempted >= run_video_call_budget:
+                        run_outcome = "PARTIAL_QUOTA_LIMIT"
+                        update_batch_resolution_state(
+                            conn, batch, "RETRYABLE_ERROR", api_request_id, None,
+                            ingestion_run_id, err_code, str(err)[:500], retry_num
+                        )
+                        break
                     if retry_num >= max_retries:
                         run_outcome = "PARTIAL_ERROR"
                         update_batch_resolution_state(
@@ -596,7 +607,7 @@ def ingest_video_metadata(
         ) VALUES (%s, 'YOUTUBE', 'videos.list', 'FRAME', %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ''', (
         ingestion_run_id, frame_version_key, started_at, completed_at,
-        calls_attempted, calls_succeeded, calls_succeeded,
+        calls_attempted, calls_succeeded, calls_attempted,
         run_outcome, 'METADATA_COMPLETE' if run_outcome == 'COMPLETE' else 'METADATA_PARTIAL',
         run_purpose
     ))

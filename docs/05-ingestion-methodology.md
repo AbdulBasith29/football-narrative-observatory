@@ -282,5 +282,16 @@ At minimum, the pipeline monitors:
 - `quota_consumption_rate`
 - `run_duration_seconds`
 
-## 21. Methodological Boundary
+## 21. Video Metadata Resolution States and Lifecycle
+Video metadata ingestion for candidate videos is managed through `OPS.VIDEO_METADATA_RESOLUTION_STATE` with the following approved state vocabulary:
+- `PENDING`: Video ID discovered, awaiting metadata retrieval.
+- `RESOLVED`: Video metadata successfully retrieved and loaded into `CORE.DIM_VIDEO` and `CORE.FACT_VIDEO_SNAPSHOT`.
+- `UNAVAILABLE`: Video ID omitted from YouTube API `videos.list` response; neutral rationale recorded in `CORE.BRIDGE_VIDEO_EVENT`.
+- `RETRYABLE_ERROR`: Transient network failure, HTTP 5xx, or quota/rate-limit error. Subject to bounded retry (max 3 attempts per batch) and eligible for retry on subsequent runs.
+- `PARSE_ERROR`: Verbatim RAW payload successfully persisted in `RAW.YOUTUBE_API_RESPONSE`, but downstream normalization raised an exception. Logged to `OPS.DEAD_LETTER_RECORD` and eligible for offline RAW replay without consuming YouTube API quota.
+- `FATAL_ERROR`: Terminal operational configuration or authentication failure (e.g., HTTP 401, non-quota 403). Fails closed; not automatically re-selected for external API attempts on subsequent runs.
+
+For `videos.list`, every attempted HTTP request incurs an estimated quota cost of 1, including failed attempts. Total run call budgets cap all external attempts (including retries). Offline RAW replay incurs zero external API quota.
+
+## 22. Methodological Boundary
 This document governs API pagination, retries, checkpointing, quota execution, and raw-response persistence. Observation selection and analytical inclusion are defined separately in the sampling methodology. Metric formulas and uncertainty calculations are defined in the metric dictionary.

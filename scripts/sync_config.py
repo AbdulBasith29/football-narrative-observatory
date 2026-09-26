@@ -52,6 +52,7 @@ def sync_events(conn, config_path):
         occurred_at = event['occurred_at']
         rationale = event.get('inclusion_rationale')
         event_terms = event.get('event_terms', [])
+        baseline_terms = event.get('baseline_terms', [])
         
         cursor.execute("SELECT event_key FROM CORE.DIM_EVENT WHERE external_event_id = %s", (ext_id,))
         row = cursor.fetchone()
@@ -66,15 +67,16 @@ def sync_events(conn, config_path):
         cursor.execute("SELECT event_version_key FROM CORE.DIM_EVENT_VERSION WHERE event_key = %s AND is_current = TRUE", (event_key,))
         v_row = cursor.fetchone()
         terms_json = json.dumps(event_terms)
+        b_terms_json = json.dumps(baseline_terms)
         if v_row:
             version_key = v_row[0]
             # Simple update for now instead of full SCD2
-            cursor.execute('''UPDATE CORE.DIM_EVENT_VERSION SET event_name=%s, occurred_at=%s, inclusion_rationale=%s, event_terms=PARSE_JSON(%s)
-                              WHERE event_version_key=%s''', (event_name, occurred_at, rationale, terms_json, version_key))
+            cursor.execute('''UPDATE CORE.DIM_EVENT_VERSION SET event_name=%s, occurred_at=%s, inclusion_rationale=%s, event_terms=PARSE_JSON(%s), baseline_terms=PARSE_JSON(%s)
+                              WHERE event_version_key=%s''', (event_name, occurred_at, rationale, terms_json, b_terms_json, version_key))
         else:
             version_key = str(uuid.uuid4())
-            cursor.execute('''INSERT INTO CORE.DIM_EVENT_VERSION (event_version_key, event_key, event_name, occurred_at, inclusion_rationale, event_terms, valid_from, is_current)
-                              SELECT %s, %s, %s, %s, %s, PARSE_JSON(%s), %s, TRUE''', (version_key, event_key, event_name, occurred_at, rationale, terms_json, now))
+            cursor.execute('''INSERT INTO CORE.DIM_EVENT_VERSION (event_version_key, event_key, event_name, occurred_at, inclusion_rationale, event_terms, baseline_terms, valid_from, is_current)
+                              SELECT %s, %s, %s, %s, %s, PARSE_JSON(%s), PARSE_JSON(%s), %s, TRUE''', (version_key, event_key, event_name, occurred_at, rationale, terms_json, b_terms_json, now))
                               
         # Sync windows
         occurred_dt = datetime.fromisoformat(occurred_at.replace("Z", "+00:00"))

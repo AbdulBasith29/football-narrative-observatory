@@ -85,11 +85,12 @@ def evaluate_video_eligibility(
       - Outside [T-14d, T+72h] -> OUT_OF_WINDOW.
     """
     res_status = video.get("resolution_status")
-    if res_status == "UNAVAILABLE":
+    if res_status != "RESOLVED":
+        exclusion_reason = "VIDEO_UNAVAILABLE" if res_status == "UNAVAILABLE" else "METADATA_UNRESOLVED"
         return {
             "is_eligible": False,
             "cohort_type": None,
-            "reason": "VIDEO_UNAVAILABLE",
+            "reason": exclusion_reason,
             "proximity_seconds": None,
             "event_matched": False,
             "player_matched": False
@@ -331,9 +332,9 @@ def rank_and_select_cohorts(
                     f"(found {len(sp_rows)} matches). Explicit sampling_policy_version_key is required."
                 )
             
-    # Fetch event occurred_at and terms
+    # Fetch event occurred_at, event terms, and baseline terms
     cursor.execute('''
-        SELECT occurred_at, event_terms 
+        SELECT occurred_at, event_terms, baseline_terms 
         FROM CORE.DIM_EVENT_VERSION 
         WHERE event_version_key = %s
     ''', (event_version_key,))
@@ -344,6 +345,10 @@ def rank_and_select_cohorts(
     occurred_at = ev_row[0].replace(tzinfo=timezone.utc) if ev_row[0] else None
     terms_raw = ev_row[1]
     event_terms = json.loads(terms_raw) if isinstance(terms_raw, str) else (terms_raw or [])
+    baseline_terms = []
+    if len(ev_row) > 2 and ev_row[2] is not None:
+        b_raw = ev_row[2]
+        baseline_terms = json.loads(b_raw) if isinstance(b_raw, str) else (b_raw or [])
     
     # Fetch aliases scoped to THIS event via BRIDGE_EVENT_ENTITY
     cursor.execute('''
@@ -441,7 +446,9 @@ def rank_and_select_cohorts(
             "description": desc
         }
         
-        eval_res = evaluate_video_eligibility(v_dict, aliases, event_terms, occurred_at, windows)
+        eval_res = evaluate_video_eligibility(
+            v_dict, aliases, event_terms, occurred_at, windows, baseline_terms=baseline_terms
+        )
         stratum_info = channel_to_stratum[ch_key]
         bucket_key = (stratum_info["snapshot_key"], stratum_info["stratum_name"], eval_res["cohort_type"])
         

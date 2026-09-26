@@ -8,6 +8,7 @@ events:
     occurred_at: "2022-12-18T15:00:00Z"
     inclusion_rationale: "Pipeline validation pilot event to test massive volume discovery."
     event_terms: ["world cup", "final", "argentina vs france"]
+    baseline_terms: ["world cup", "fifa", "fifa world cup", "qatar 2022"]
     windows:
       - window_type: "PRE_EVENT"
         relative_offset_start_hours: -336
@@ -31,6 +32,7 @@ events:
     occurred_at: "2023-01-03T16:00:00Z"
     inclusion_rationale: "Pipeline validation pilot event for specific Ronaldo-only transfer window."
     event_terms: ["al nassr", "transfer", "unveiling"]
+    baseline_terms: ["saudi pro league", "al nassr", "saudi football"]
     windows:
       - window_type: "PRE_EVENT"
         relative_offset_start_hours: -336
@@ -54,6 +56,7 @@ events:
     occurred_at: "2023-10-30T19:45:00Z"
     inclusion_rationale: "Pipeline validation pilot event for explicit comparative debate."
     event_terms: ["ballon d'or", "ballon dor", "ceremony", "award"]
+    baseline_terms: ["ballon d'or", "france football", "champions league"]
     windows:
       - window_type: "PRE_EVENT"
         relative_offset_start_hours: -336

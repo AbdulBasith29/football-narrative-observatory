@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS DIM_EVENT_VERSION (
     occurred_at TIMESTAMP_NTZ,
     inclusion_rationale VARCHAR(512),
     event_terms VARIANT,
+    baseline_terms VARIANT,
     valid_from TIMESTAMP_NTZ NOT NULL,
     valid_to TIMESTAMP_NTZ,
     is_current BOOLEAN NOT NULL
