@@ -1,0 +1,11 @@
+{
+  "stop-verifier": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python -c \"import os, subprocess, sys; s = os.path.abspath('scripts/stop_hook.py') if os.path.exists('scripts/stop_hook.py') else os.path.abspath('../scripts/stop_hook.py'); sys.exit(subprocess.call([sys.executable, s]))\"",
+        "timeout": 30
+      }
+    ]
+  }
+}
