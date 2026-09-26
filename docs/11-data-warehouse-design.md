@@ -86,6 +86,8 @@ Tracks ingestion grain matching the methodology.
 - **`ops.dead_letter_record`**: Failed parsing or validation records.
 - **`ops.manual_override`**: Documented analyst interventions, tracked via `override_id`.
 - **`ops.unmapped_entity_audit`**: High-frequency unresolved phrases/nicknames.
+- **`ops.discovery_unit_state`**: Checkpointing for candidate discovery units at grain `(frame_version_key, channel_key, window_key, discovery_policy_version, query_hash)`.
+- **`ops.video_metadata_resolution_state`**: Durable operational tracking of physical video metadata resolution at grain `(source_system, source_id)` with status values `PENDING`, `RESOLVED`, `UNAVAILABLE`, `PARSE_ERROR`, and `RETRYABLE_ERROR`, directly linking to `api_request_id` and `raw_response_id`.
 
 ---
 
@@ -113,7 +115,7 @@ Standard calendar dimensions for temporal aggregation.
 
 ### `core.dim_video`
 - **Purpose**: Identity mapping and stable sampling traits for videos.
-- **Mutation Policy**: Append only.
+- **Mutation Policy**: Managed Lifecycle Enrichment / Append Only (Entity rows are append-only with respect to primary/natural keys and are never deleted; documented pipeline-owned NULL attributes may be populated in-place during their lifecycle stage; stable attributes are frozen once populated).
 - **Grain**: One video per system.
 - **Primary Key**: `video_key`
 - **Natural Key**: `source_system`, `source_id`
@@ -230,10 +232,10 @@ Standard calendar dimensions for temporal aggregation.
 
 ### `core.fact_video_snapshot`
 - **Mutation Policy**: Append only.
-- **Grain**: One video × one observation timestamp.
+- **Grain**: One video × one observation timestamp (natural idempotency key: `video_key, api_request_id`).
 - **Primary Key**: `video_snapshot_key` (Surrogate)
 - **Natural Key**: `video_key`, `observed_at`
-- **Fields**: `title`, `description`, `views`, `likes`, `observed_at`, `ingestion_run_id`.
+- **Fields**: `title`, `description`, `views`, `likes`, `observed_at`, `ingestion_run_id`, `api_request_id`, `raw_response_id`.
 
 ---
 
@@ -267,11 +269,11 @@ Standard calendar dimensions for temporal aggregation.
 
 ### `core.bridge_video_event`
 - **Purpose**: Determines if a video is included in the analytical universe of an event.
-- **Mutation Policy**: Append only.
+- **Mutation Policy**: Managed Lifecycle Enrichment / Append Only (Entity rows are append-only with respect to primary/natural keys and are never deleted; discovery provenance, cohort assignment, and deterministic ranking attributes are populated during ingestion and cohort selection lifecycles).
 - **Grain**: One video × one event version × one sampling policy version.
 - **Primary Key**: `video_event_key` (Surrogate)
 - **Natural Key**: `video_key`, `event_version_key`, `sampling_policy_version_key`
-- **Fields**: `cohort_type`, `selection_rank`, `inclusion_status`, `inclusion_rationale`, `candidate_list_lineage`, `override_id`.
+- **Fields**: `cohort_type`, `selection_rank`, `inclusion_status`, `inclusion_rationale`, `primary_exclusion_reason`, `discovery_method`, `discovery_provenance`, `candidate_list_lineage`, `override_id`.
 
 ### `core.bridge_comment_event`
 - **Purpose**: Predicts if a comment specifically relates to an event.
