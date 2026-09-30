@@ -25,6 +25,45 @@ class SnapshotMutationViolationError(ClassificationError):
     pass
 
 
+DEDUPLICATION_RULE_REGISTRY = {}
+
+
+def register_deduplication_rule(rule_version: str):
+    """
+    Registers an approved cross-video deduplication rule implementation.
+    The rule function accepts a list of evidence item dicts and returns
+    the modified list with is_deduplicated_duplicate, deduplication_cluster_id,
+    and included_in_prevalence updated.
+    """
+    def decorator(fn):
+        DEDUPLICATION_RULE_REGISTRY[rule_version] = fn
+        return fn
+    return decorator
+
+
+def normalize_ntz_timestamp(val) -> str:
+    """
+    Normalizes a timestamp (datetime, string, etc.) to a naive UTC ISO string
+    (YYYY-MM-DDTHH:MM:SS) matching Snowflake TIMESTAMP_NTZ round-trip semantics.
+    """
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        val_clean = val.replace(" ", "T")
+        if val_clean.endswith("Z"):
+            val_clean = val_clean[:-1]
+        elif "+" in val_clean:
+            val_clean = val_clean.split("+")[0]
+        elif val_clean.count("-") > 2:
+            val_clean = val_clean.rsplit("-", 1)[0]
+        return val_clean.split(".")[0]
+    if hasattr(val, "astimezone") and getattr(val, "tzinfo", None) is not None:
+        val = val.astimezone(timezone.utc).replace(tzinfo=None)
+    if hasattr(val, "strftime"):
+        return val.strftime("%Y-%m-%dT%H:%M:%S")
+    return str(val).split(".")[0]
+
+
 def load_stratification_config(config_path="config/channel_stratification.yml"):
     with open(config_path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
@@ -230,18 +269,6 @@ def classify_player_focus(
     Fails closed if combined_focus_threshold is unapproved.
     """
     num_videos = len(eligible_videos)
-    if num_videos < 10:
-        return {
-            "player_focus": "UNCLASSIFIED",
-            "confidence": "LOW",
-            "messi_count": 0,
-            "ronaldo_count": 0,
-            "messi_prevalence": 0.0,
-            "ronaldo_prevalence": 0.0,
-            "focus_ratio": 1.0,
-            "evidence": {"video_count": num_videos, "reason": "LESS_THAN_10_VIDEOS"}
-        }
-
     alpha = strat_cfg.get("frozen_parameters", {}).get("smoothing_alpha", 1.0)
     ratio_thresh = strat_cfg.get("frozen_parameters", {}).get("player_focus_ratio_threshold", 4.0)
     prev_floor = strat_cfg.get("frozen_parameters", {}).get("player_prevalence_floor", 0.15)
@@ -250,12 +277,32 @@ def classify_player_focus(
     v_m = sum(1 for v in eligible_videos if v.get("messi_matched"))
     v_r = sum(1 for v in eligible_videos if v.get("ronaldo_matched"))
     
-    p_m = v_m / num_videos
-    p_r = v_r / num_videos
+    p_m = (v_m / num_videos) if num_videos > 0 else 0.0
+    p_r = (v_r / num_videos) if num_videos > 0 else 0.0
     
     r_m_r = (v_m + alpha) / (v_r + alpha)
     r_r_m = (v_r + alpha) / (v_m + alpha)
     primary_ratio = r_m_r if v_m >= v_r else r_r_m
+
+    if num_videos < 10:
+        return {
+            "player_focus": "UNCLASSIFIED",
+            "confidence": "LOW",
+            "messi_count": v_m,
+            "ronaldo_count": v_r,
+            "messi_prevalence": p_m,
+            "ronaldo_prevalence": p_r,
+            "focus_ratio": primary_ratio,
+            "evidence": {
+                "video_count": num_videos,
+                "reason": "LESS_THAN_10_VIDEOS",
+                "messi_count": v_m,
+                "ronaldo_count": v_r,
+                "messi_prevalence": p_m,
+                "ronaldo_prevalence": p_r,
+                "focus_ratio": primary_ratio
+            }
+        }
 
     # Decision tree
     if r_m_r > ratio_thresh and p_m > prev_floor:
@@ -358,17 +405,25 @@ def classify_channel_assessment(
     # Frozen methodology requires deduplication before prevalence calculation.
     # When no approved rule exists, raise DeduplicationRuleMissingError on the relevant classification path.
     # Only proceed when:
-    # - an approved versioned deduplication rule exists; OR
-    # - humans explicitly approve EXPLICIT_NONE.
-    is_rule_approved = bool(dedup_rule_ver and dedup_rule_ver != "HUMAN_APPROVAL_REQUIRED")
-    is_explicit_none = (dedup_rule_ver == "EXPLICIT_NONE" or dedup_status == "APPROVED_EXPLICIT_NONE")
+    # - an approved versioned deduplication rule exists (dedup_status == "APPROVED"); OR
+    # - human decision has explicitly approved EXPLICIT_NONE (dedup_status in ("APPROVED", "APPROVED_EXPLICIT_NONE")).
+    is_explicit_none = (
+        (dedup_rule_ver == "EXPLICIT_NONE" and dedup_status in ("APPROVED", "APPROVED_EXPLICIT_NONE"))
+        or dedup_status == "APPROVED_EXPLICIT_NONE"
+    )
+    is_rule_approved = (
+        dedup_status == "APPROVED"
+        and bool(dedup_rule_ver)
+        and dedup_rule_ver not in ("HUMAN_APPROVAL_REQUIRED", "EXPLICIT_NONE")
+    )
 
     if not (is_rule_approved or is_explicit_none):
         raise DeduplicationRuleMissingError(
             "Cross-video deduplication methodology is required before prevalence calculation, "
             f"but deduplication_rule_version is '{dedup_rule_ver}' and status is '{dedup_status}'. "
             "Prevalence calculation cannot proceed with raw distinct video IDs without explicit approval. "
-            "Either an approved versioned deduplication rule or an explicit human approval of 'EXPLICIT_NONE' is required."
+            "Either an approved versioned deduplication rule with status 'APPROVED' "
+            "or explicit human approval of 'APPROVED_EXPLICIT_NONE' is required."
         )
 
     cursor = conn.cursor()
@@ -465,14 +520,25 @@ def classify_channel_assessment(
             "matched_messi_aliases": mention_res["matched_messi_aliases"],
             "matched_ronaldo_aliases": mention_res["matched_ronaldo_aliases"],
             "is_deduplicated_duplicate": is_exact_dup,
+            "deduplication_cluster_id": src_id if is_exact_dup else None,
             "included_in_prevalence": (not is_exact_dup and is_short is False)
         }
         
         manifest_evidence_items.append(v_dict)
-        
-        if not is_exact_dup and is_short is False:
+
+    # Apply cross-video deduplication rule if an approved versioned rule is configured
+    if is_rule_approved:
+        if dedup_rule_ver not in DEDUPLICATION_RULE_REGISTRY:
+            raise DeduplicationRuleMissingError(
+                f"Approved deduplication rule '{dedup_rule_ver}' has no registered execution logic. Fails closed."
+            )
+        rule_fn = DEDUPLICATION_RULE_REGISTRY[dedup_rule_ver]
+        manifest_evidence_items = rule_fn(manifest_evidence_items)
+
+    for v_dict in manifest_evidence_items:
+        if v_dict.get("included_in_prevalence"):
             videos_180.append(v_dict)
-            if pub_dt >= w90_start:
+            if v_dict["published_at_dt"] >= w90_start:
                 videos_90.append(v_dict)
 
     # Minimum evidence resolution: 90d vs 180d fallback
@@ -552,14 +618,14 @@ def classify_channel_assessment(
                 api_request_id, messi_alias_matched, ronaldo_alias_matched,
                 matched_player_aliases, matched_club_entities, matched_analysis_topics,
                 is_deduplicated_duplicate, deduplication_cluster_id, included_in_prevalence
-            ) SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), NULL, NULL, %s, NULL, %s
+            ) SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, PARSE_JSON(%s), NULL, NULL, %s, %s, %s
         ''', (
             str(uuid.uuid4()), assessment_id, channel_key, item["video_key"],
             item["source_video_id"], item["published_at"], item["duration_seconds"],
             item["is_short"], item["raw_response_id"], item["api_request_id"],
             item["messi_matched"], item["ronaldo_matched"],
             json.dumps(item["matched_messi_aliases"] + item["matched_ronaldo_aliases"]),
-            item["is_deduplicated_duplicate"], item["included_in_prevalence"]
+            item["is_deduplicated_duplicate"], item.get("deduplication_cluster_id"), item["included_in_prevalence"]
         ))
 
     # Resolve composite stratum key from CORE.DIM_CHANNEL_STRATUM
@@ -670,8 +736,8 @@ def create_or_verify_event_channel_snapshot(
         "player_focus_value": pl_focus,
         "channel_type_confidence": assessment_result["channel_type_confidence"],
         "player_focus_confidence": assessment_result["player_focus_confidence"],
-        "reference_period_start": reference_period_start.isoformat(),
-        "reference_period_end": reference_period_end.isoformat(),
+        "reference_period_start": normalize_ntz_timestamp(reference_period_start),
+        "reference_period_end": normalize_ntz_timestamp(reference_period_end),
         "effective_window_days": int(assessment_result["effective_window_days"]),
         "eligible_video_count": int(assessment_result["eligible_video_count"]),
         "messi_video_count": int(assessment_result["messi_video_count"]),
@@ -690,7 +756,7 @@ def create_or_verify_event_channel_snapshot(
                reference_period_end, effective_window_days, eligible_video_count,
                messi_video_count, ronaldo_video_count, messi_prevalence, ronaldo_prevalence,
                focus_ratio, fallback_used, headline_decomposition_eligible, override_id
-        FROM CORE.BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT
+            FROM CORE.BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT
         WHERE event_version_key = %s
           AND channel_key = %s
           AND classification_protocol_version = %s
@@ -698,8 +764,8 @@ def create_or_verify_event_channel_snapshot(
     existing = cursor.fetchone()
 
     if existing:
-        ref_start_existing = existing[5].isoformat() if hasattr(existing[5], 'isoformat') else str(existing[5])
-        ref_end_existing = existing[6].isoformat() if hasattr(existing[6], 'isoformat') else str(existing[6])
+        ref_start_existing = normalize_ntz_timestamp(existing[5])
+        ref_end_existing = normalize_ntz_timestamp(existing[6])
         existing_payload = {
             "channel_type_value": existing[1],
             "player_focus_value": existing[2],
@@ -743,8 +809,8 @@ def create_or_verify_event_channel_snapshot(
     ''', (
         snapshot_key, event_version_key, channel_key, classification_protocol_version,
         ch_type, pl_focus, assessment_result["channel_type_confidence"],
-        assessment_result["player_focus_confidence"], reference_period_start.isoformat(),
-        reference_period_end.isoformat(), assessment_result["effective_window_days"],
+        assessment_result["player_focus_confidence"], normalize_ntz_timestamp(reference_period_start),
+        normalize_ntz_timestamp(reference_period_end), assessment_result["effective_window_days"],
         assessment_result["eligible_video_count"], assessment_result["messi_video_count"],
         assessment_result["ronaldo_video_count"], round(float(assessment_result["messi_prevalence"]), 5),
         round(float(assessment_result["ronaldo_prevalence"]), 5), round(float(assessment_result["focus_ratio"]), 5),

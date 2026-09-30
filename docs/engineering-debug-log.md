@@ -156,3 +156,31 @@ During external review of Phase 1E implementation (HEAD `767e9ce`):
 - **Automatic Fallback Progression**: Implemented automatic initialization of `180D_FALLBACK` acquisition state when 90D primary units complete with < 10 eligible videos.
 - **Test Coverage**: Added 6 dedicated regression tests in [`tests/test_channel_stratification.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/tests/test_channel_stratification.py) (68/68 tests passing).
 
+---
+
+## Incident 9: Phase 1E Review Hardening — Deduplication Status Gating, Sparse Statistics Ground-Truth, Snapshot NTZ Normalization, Numeric Column Range & Migration Replay Idempotency
+
+### Context
+During exact-SHA inspection of HEAD `edc3f3a` (Actions run 36675202548):
+1. **Deduplication Gate Bypass & Execution**: `scripts/channel_classifier.py` accepted any non-empty rule version even when `deduplication_rule_status` was `HUMAN_APPROVAL_REQUIRED`. Furthermore, accepted versions only executed exact source-ID deduplication rather than executing the approved cross-video deduplication algorithm.
+2. **Sparse Evidence Fabricated Statistics**: In `classify_player_focus`, evidence with fewer than 10 videos fabricated `messi_count = 0`, `ronaldo_count = 0`, prevalences `0.0`, and ratio `1.0`. While the classification label must remain `UNCLASSIFIED` and confidence `LOW`, assessments and snapshots must preserve actual ground-truth statistics.
+3. **Snapshot TIMESTAMP_NTZ Comparison Mismatch**: `create_or_verify_event_channel_snapshot` compared timezone-aware candidate strings (e.g. `+00:00`) against naive `datetime` or strings returned by the Snowflake Python connector for `TIMESTAMP_NTZ` columns, triggering false `SnapshotMutationViolationError` on identical snapshot replays.
+4. **focus_ratio Column Range Overflow**: A channel with 10 Messi videos and 0 Ronaldo videos produces smoothed ratio `(10 + 1) / (0 + 1) = 11.0`. Persistent columns in `02_ops.sql`, `05_core_bridges.sql`, and `V009` migration were typed as `NUMBER(6,5)`, whose maximum representable positive value is `9.99999`, causing insertion failures.
+5. **Constraint Replay Error in V009 Migration**: `V009` line 61 unconditionally added `uq_event_channel_stratum_snapshot`, which is already declared in bootstrap DDL `05_core_bridges.sql`. When `setup_snowflake.py` runs bootstrap followed by migrations, Snowflake raised duplicate constraint errors because Snowflake SQL lacks `ADD CONSTRAINT IF NOT EXISTS`.
+
+### Root Cause Analysis
+- **Approval Gating**: Evaluated `is_rule_approved` solely on version string truthiness rather than checking `deduplication_rule_status in ("APPROVED", "APPROVED_EXPLICIT_NONE")`.
+- **Methodology Metric Integrity**: Conflated unclassified categorical assignments with zeroed numerical statistics. Frozen methodology requires maintaining true observed counts and smoothed ratios even when sample size is insufficient for confident classification.
+- **Warehouse Type Mapping**: Snowflake `TIMESTAMP_NTZ` is naive; Python connector returns naive `datetime`. Comparing with `.isoformat()` from timezone-aware candidate strings caused string inequality.
+- **Column Precision**: `NUMBER(6,5)` allocates 1 integer digit ($6 - 5 = 1$), capping values at $9.99999$.
+- **Migration Idempotency**: Snowflake Scripting requires exception handling (`EXCEPTION WHEN OTHER THEN NULL;`) inside single-statement anonymous blocks (`EXECUTE IMMEDIATE '...';`) to handle pre-existing constraints across bootstrap and replay runs.
+
+### Resolution
+- **Strict Deduplication Gating & Execution**: Enforced `dedup_status in ("APPROVED", "APPROVED_EXPLICIT_NONE")` in `classify_channel_assessment`. Introduced `DEDUPLICATION_RULE_REGISTRY` and `@register_deduplication_rule` decorator; when an approved rule version is configured, its registered logic is executed across video IDs, populating `deduplication_cluster_id` and excluding duplicates from prevalence. Unregistered or unapproved rules fail closed to `DeduplicationRuleMissingError`.
+- **Ground-Truth Preservation in Sparse Regimes**: Computed actual `v_m`, `v_r`, `p_m`, `p_r`, and `primary_ratio` prior to sample size evaluation in `classify_player_focus`, returning actual statistics while setting label `UNCLASSIFIED` and confidence `LOW`.
+- **Timestamp Normalization**: Implemented `normalize_ntz_timestamp` converting aware datetimes, naive datetimes, and ISO strings to naive UTC ISO strings (`YYYY-MM-DDTHH:MM:SS`) on both candidate and existing payloads.
+- **Column Range Expansion**: Widened `focus_ratio` from `NUMBER(6,5)` to `NUMBER(10,5)` in `02_ops.sql`, `05_core_bridges.sql`, and `V009` (including `MODIFY COLUMN` clauses).
+- **Idempotent Migration Constraint**: Wrapped `ADD CONSTRAINT uq_event_channel_stratum_snapshot` in an `EXECUTE IMMEDIATE 'BEGIN ... EXCEPTION WHEN OTHER THEN NULL; END;';` block in `V009`.
+- **Test Coverage**: Added 6 targeted regression tests in [`tests/test_channel_stratification.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/tests/test_channel_stratification.py) (74/74 passing offline).
+
+

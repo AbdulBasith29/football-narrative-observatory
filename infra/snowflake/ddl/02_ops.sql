@@ -106,7 +106,7 @@ CREATE TABLE IF NOT EXISTS FACT_CHANNEL_CLASSIFICATION_ASSESSMENT (
     ronaldo_video_count NUMBER(38,0),
     messi_prevalence NUMBER(6,5),
     ronaldo_prevalence NUMBER(6,5),
-    focus_ratio NUMBER(6,5),
+    focus_ratio NUMBER(10,5),
     fallback_used BOOLEAN,
     deduplication_rule_version VARCHAR(64),
     channel_type_evidence VARIANT,

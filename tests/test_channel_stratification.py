@@ -12,7 +12,9 @@ from channel_classifier import (
     compute_canonical_manifest_hash,
     UnapprovedParameterError,
     SnapshotMutationViolationError,
-    DeduplicationRuleMissingError
+    DeduplicationRuleMissingError,
+    register_deduplication_rule,
+    normalize_ntz_timestamp
 )
 from channel_evidence_acquisition import (
     get_or_create_acquisition_state,
@@ -1068,3 +1070,263 @@ def test_exclusion_buffer_human_approval_required():
     assert cfg.get("exclusion_buffer_hours") is None
     assert cfg.get("exclusion_buffer_hours_status") == "HUMAN_APPROVAL_REQUIRED"
     assert "exclusion_buffer_hours" not in cfg.get("frozen_parameters", {})
+
+
+def test_unapproved_draft_dedup_version_fails_closed(tmp_path):
+    """
+    Blocker 1A: Validates that an unapproved draft deduplication rule version
+    (e.g., deduplication_rule_version: 'draft_v1', deduplication_rule_status: 'HUMAN_APPROVAL_REQUIRED')
+    cannot bypass fail-closed gating and raises DeduplicationRuleMissingError.
+    """
+    import yaml
+    cfg_path = tmp_path / "unapproved_draft_config.yml"
+    with open("config/channel_stratification.yml", "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    data["deduplication_rule_version"] = "draft_v1"
+    data["deduplication_rule_status"] = "HUMAN_APPROVAL_REQUIRED"
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        yaml.dump(data, f)
+
+    db = MockSnowflakeDatabase()
+    conn = db.get_connection()
+    now = datetime(2022, 12, 17, 15, 0, 0, tzinfo=timezone.utc)
+    db.dim_channels["ch-1"] = {"source_id": "UC1", "channel_name": "Test Draft Dedup"}
+
+    with pytest.raises(DeduplicationRuleMissingError) as exc_info:
+        classify_channel_assessment(
+            conn, "frame-1", "ch-1", now,
+            config_path=str(cfg_path),
+            about_description="Football Channel"
+        )
+    assert "Cross-video deduplication methodology is required" in str(exc_info.value)
+    assert "draft_v1" in str(exc_info.value)
+    assert "HUMAN_APPROVAL_REQUIRED" in str(exc_info.value)
+
+
+def test_approved_dedup_rule_execution(tmp_path):
+    """
+    Blocker 1B: Validates that when an approved versioned deduplication rule is configured,
+    the registered rule algorithm executes cross-video deduplication across different video IDs,
+    marking duplicate items with is_deduplicated_duplicate = True and deduplication_cluster_id,
+    and excluding them from prevalence calculation.
+    """
+    import yaml
+    rule_ver = "test_title_prefix_dedup_v1"
+
+    @register_deduplication_rule(rule_ver)
+    def title_prefix_dedup(items):
+        seen_titles = {}
+        for it in items:
+            title_norm = it["title"].strip().lower()
+            if title_norm in seen_titles:
+                it["is_deduplicated_duplicate"] = True
+                it["deduplication_cluster_id"] = seen_titles[title_norm]
+                it["included_in_prevalence"] = False
+            else:
+                seen_titles[title_norm] = it["source_video_id"]
+                it["deduplication_cluster_id"] = it["source_video_id"]
+        return items
+
+    cfg_path = tmp_path / "approved_rule_config.yml"
+    with open("config/channel_stratification.yml", "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    data["deduplication_rule_version"] = rule_ver
+    data["deduplication_rule_status"] = "APPROVED"
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        yaml.dump(data, f)
+
+    db = MockSnowflakeDatabase()
+    conn = db.get_connection()
+    sync_strata(conn)
+    db.dim_channels["ch-1"] = {"source_id": "UC1", "channel_name": "Test Dedup Execution"}
+    now = datetime(2022, 12, 17, 15, 0, 0, tzinfo=timezone.utc)
+
+    # 12 videos, two have DIFFERENT source IDs but identical title (cross-video re-upload)
+    for i in range(12):
+        v_key = f"vid-{i}"
+        title = "Identical Re-upload Title" if i in (0, 1) else f"Lionel Messi unique match {i}"
+        db.dim_videos[v_key] = {
+            "channel_key": "ch-1",
+            "source_id": f"src-{i}",
+            "published_at": (now - timedelta(days=i + 1)).isoformat(),
+            "is_short": False
+        }
+        db.fact_video_snapshots.append({
+            "video_key": v_key,
+            "title": title,
+            "description": "Footy"
+        })
+
+    res = classify_channel_assessment(
+        conn, "frame-1", "ch-1", now,
+        config_path=str(cfg_path),
+        about_description="Football Channel"
+    )
+    # Total evaluated was 12, 1 was cross-video deduplicated -> eligible count should be 11
+    assert res["eligible_video_count"] == 11
+    # Verify evidence items in DB received deduplication_cluster_id
+    dedup_items = [it for it in db.evidence_manifest_items if it[13] is True]  # is_deduplicated_duplicate is index 13
+    assert len(dedup_items) == 1
+    assert dedup_items[0][4] == "src-1"  # second video was flagged
+    assert dedup_items[0][14] == "src-0"  # clustered to src-0
+
+
+def test_sparse_evidence_retains_actual_statistics():
+    """
+    Blocker 2: Validates that when eligible videos < 10 (e.g. 9 Messi videos),
+    classify_player_focus retains actual ground-truth statistics in the return dict
+    and evidence payload rather than overwriting with fabricated zeros and ratio 1.0,
+    while keeping the classification label safely UNCLASSIFIED and confidence LOW.
+    """
+    strat_cfg = {
+        "frozen_parameters": {
+            "smoothing_alpha": 1.0,
+            "player_focus_ratio_threshold": 4.0,
+            "player_prevalence_floor": 0.15
+        }
+    }
+    now = datetime(2022, 12, 17, 15, 0, 0, tzinfo=timezone.utc)
+    # 9 Messi videos, 0 Ronaldo videos
+    videos = [
+        {
+            "video_key": f"v-{i}",
+            "source_video_id": f"s-{i}",
+            "messi_matched": True,
+            "ronaldo_matched": False,
+            "published_at_dt": now - timedelta(days=i + 1)
+        }
+        for i in range(9)
+    ]
+
+    res = classify_player_focus(
+        eligible_videos=videos,
+        reference_period_end=now,
+        effective_window_days=90,
+        strat_cfg=strat_cfg
+    )
+
+    assert res["player_focus"] == "UNCLASSIFIED"
+    assert res["confidence"] == "LOW"
+    # Ground-truth statistics MUST NOT be fabricated to 0
+    assert res["messi_count"] == 9
+    assert res["ronaldo_count"] == 0
+    assert res["messi_prevalence"] == 1.0
+    assert res["ronaldo_prevalence"] == 0.0
+    assert res["focus_ratio"] == 10.0  # (9 + 1) / (0 + 1) = 10.0
+    assert res["evidence"]["video_count"] == 9
+    assert res["evidence"]["reason"] == "LESS_THAN_10_VIDEOS"
+    assert res["evidence"]["messi_count"] == 9
+    assert res["evidence"]["focus_ratio"] == 10.0
+
+
+def test_event_channel_snapshot_roundtrip_ntz_timestamp_normalization():
+    """
+    Blocker 3: Validates that timezone-aware candidate timestamps and naive
+    TIMESTAMP_NTZ returned by Snowflake connector are normalized consistently,
+    preventing spurious SnapshotMutationViolationError on identical retries.
+    """
+    db = MockSnowflakeDatabase()
+    conn = db.get_connection()
+    now_aware = datetime(2022, 12, 17, 15, 0, 0, tzinfo=timezone.utc)
+    start_aware = now_aware - timedelta(days=90)
+
+    # Unit verification of normalizer helper
+    assert normalize_ntz_timestamp(now_aware) == "2022-12-17T15:00:00"
+    assert normalize_ntz_timestamp(datetime(2022, 12, 17, 15, 0, 0)) == "2022-12-17T15:00:00"
+    assert normalize_ntz_timestamp("2022-12-17T15:00:00+00:00") == "2022-12-17T15:00:00"
+    assert normalize_ntz_timestamp("2022-12-17 15:00:00") == "2022-12-17T15:00:00"
+
+    assessment = {
+        "channel_type_value": "BROAD_REACH_PUBLISHER",
+        "player_focus_value": "MESSI_FOCUSED",
+        "channel_type_confidence": "HIGH",
+        "player_focus_confidence": "HIGH",
+        "effective_window_days": 90,
+        "eligible_video_count": 25,
+        "messi_video_count": 20,
+        "ronaldo_video_count": 1,
+        "messi_prevalence": 0.80,
+        "ronaldo_prevalence": 0.04,
+        "focus_ratio": 10.5,
+        "fallback_used": False
+    }
+
+    # Initial insertion with timezone-aware datetimes
+    res1 = create_or_verify_event_channel_snapshot(
+        conn, "ev-1", "ch-1", "1.1", assessment, start_aware, now_aware
+    )
+    assert res1["status"] == "INSERTED"
+
+    # Simulate Snowflake connector returning naive TIMESTAMP_NTZ datetime
+    snapshot_key = ("ev-1", "ch-1", "1.1")
+    stored = db.event_snapshots[snapshot_key]
+    stored["reference_period_start"] = datetime(2022, 9, 18, 15, 0, 0)  # naive datetime from DB
+    stored["reference_period_end"] = datetime(2022, 12, 17, 15, 0, 0)    # naive datetime from DB
+
+    # Second call with timezone-aware candidate datetimes should succeed idempotently
+    res2 = create_or_verify_event_channel_snapshot(
+        conn, "ev-1", "ch-1", "1.1", assessment, start_aware, now_aware
+    )
+    assert res2["status"] == "IDEMPOTENT_NOOP"
+    assert res2["snapshot_key"] == res1["snapshot_key"]
+
+
+def test_focus_ratio_supports_values_exceeding_ten():
+    """
+    Blocker 4: Validates that focus ratios > 9.99999 (e.g. 10 Messi, 0 Ronaldo -> 11.0)
+    are supported by the classifier, snapshot logic, and persisted column definitions (NUMBER(10,5)).
+    """
+    strat_cfg = {
+        "frozen_parameters": {
+            "smoothing_alpha": 1.0,
+            "player_focus_ratio_threshold": 4.0,
+            "player_prevalence_floor": 0.15
+        }
+    }
+    now = datetime(2022, 12, 17, 15, 0, 0, tzinfo=timezone.utc)
+    # 10 Messi videos, 0 Ronaldo videos -> ratio = (10 + 1) / (0 + 1) = 11.0
+    videos = [
+        {
+            "video_key": f"v-{i}",
+            "source_video_id": f"s-{i}",
+            "messi_matched": True,
+            "ronaldo_matched": False,
+            "published_at_dt": now - timedelta(days=i + 1)
+        }
+        for i in range(10)
+    ]
+    res = classify_player_focus(
+        eligible_videos=videos,
+        reference_period_end=now,
+        effective_window_days=90,
+        strat_cfg=strat_cfg
+    )
+    assert res["focus_ratio"] == 11.0
+    assert res["player_focus"] == "MESSI_FOCUSED"
+
+    # Verify DDL column specifications use NUMBER(10,5)
+    with open("infra/snowflake/ddl/02_ops.sql", "r", encoding="utf-8") as f:
+        ops_ddl = f.read()
+    assert "focus_ratio NUMBER(10,5)" in ops_ddl
+
+    with open("infra/snowflake/ddl/05_core_bridges.sql", "r", encoding="utf-8") as f:
+        core_ddl = f.read()
+    assert "focus_ratio NUMBER(10,5)" in core_ddl
+
+    with open("infra/snowflake/migrations/V009__channel_stratification_and_overrides.sql", "r", encoding="utf-8") as f:
+        v009 = f.read()
+    assert "focus_ratio NUMBER(10,5)" in v009
+
+
+def test_v009_idempotent_constraint_replay():
+    """
+    Blocker 5: Validates that V009 migration handles uq_event_channel_stratum_snapshot
+    idempotently so replay after fresh bootstrap DDL does not raise duplicate constraint errors.
+    """
+    with open("infra/snowflake/migrations/V009__channel_stratification_and_overrides.sql", "r", encoding="utf-8") as f:
+        v009 = f.read()
+
+    assert "EXECUTE IMMEDIATE '" in v009
+    assert "uq_event_channel_stratum_snapshot" in v009
+    assert "EXCEPTION" in v009
+    assert "WHEN OTHER THEN" in v009

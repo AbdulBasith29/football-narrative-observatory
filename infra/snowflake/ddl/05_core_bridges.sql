@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT (
     ronaldo_video_count NUMBER(38,0),
     messi_prevalence NUMBER(6,5),
     ronaldo_prevalence NUMBER(6,5),
-    focus_ratio NUMBER(6,5),
+    focus_ratio NUMBER(10,5),
     fallback_used BOOLEAN,
     headline_decomposition_eligible BOOLEAN,
     override_id VARCHAR(36),
