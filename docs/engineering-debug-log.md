@@ -133,3 +133,26 @@ During offline unit test suite development for Phase 1E (`tests/test_channel_str
 - **Canonical Datetime Normalization**: In `scripts/channel_classifier.py`, stripped runtime-parsed datetime fields before manifest hashing, relying strictly on ISO-8601 string timestamps (`published_at`), and added `default=str` to `json.dumps`, ensuring deterministic hash calculation across platforms.
 - **Test Coverage**: Added `test_evidence_manifest_exact_reproducibility` and `test_type_2_scd_grain_and_lifecycle` to [`tests/test_channel_stratification.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/tests/test_channel_stratification.py).
 
+---
+
+## Incident 8: Phase 1E Review Hardening — RAW Persistence Schema, Dedup Fail-Closed & Snapshot Payload Immutability
+
+### Context
+During external review of Phase 1E implementation (HEAD `767e9ce`):
+1. `channel_evidence_acquisition.py` inserted into `RAW.YOUTUBE_API_RESPONSE` using an ad-hoc column set rather than the canonical 16-column schema defined in `01_raw.sql`.
+2. Cross-video deduplication was bypassing fail-closed behavior when the rule was unapproved (`deduplication_rule_version: null`), continuing prevalence calculations using raw distinct video IDs.
+3. Event snapshot creation in `BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT` was comparing only subset classification labels rather than the full canonical payload (dates, video counts, prevalences, ratios, fallback status, override lineage), and defaulted missing values to 0/0.0.
+4. Acquisition state machine did not progress completed 90D units with < 10 videos into the 180D fallback state.
+
+### Root Cause Analysis
+- **Schema Parity**: Ad-hoc insert syntax drifted from `RAW.YOUTUBE_API_RESPONSE` table DDL.
+- **Fail-Closed Methodology**: Incomplete configuration must raise `DeduplicationRuleMissingError` and prevent prevalence estimation rather than silently substituting raw video counts.
+- **Immutability Grain**: Snapshots represent historical epistemic anchors; any change in underlying statistics (even with unchanged classification labels) must trigger `SnapshotMutationViolationError`.
+
+### Resolution
+- **Canonical RAW Persistence**: Implemented `persist_raw_youtube_response` enforcing all 16 canonical columns before parsing downstream.
+- **Fail-Closed Gate**: Enforced `DeduplicationRuleMissingError` in `classify_channel_assessment` unless an approved versioned rule exists or `EXPLICIT_NONE` is human-approved.
+- **Full Payload Idempotency**: Verified all 17 snapshot fields; any mutation in counts, dates, or ratios raises `SnapshotMutationViolationError`.
+- **Automatic Fallback Progression**: Implemented automatic initialization of `180D_FALLBACK` acquisition state when 90D primary units complete with < 10 eligible videos.
+- **Test Coverage**: Added 6 dedicated regression tests in [`tests/test_channel_stratification.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/tests/test_channel_stratification.py) (68/68 tests passing).
+

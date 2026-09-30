@@ -44,6 +44,11 @@ temporal_stability_large_margin_status: "HUMAN_APPROVAL_REQUIRED"
 subwindow_min_video_count: null
 subwindow_min_video_count_status: "HUMAN_APPROVAL_REQUIRED"
 
+# Pre-Event Exclusion Buffer Duration
+# Illustrative 24 hours in protocol is not frozen; operational buffer requires human decision.
+exclusion_buffer_hours: null
+exclusion_buffer_hours_status: "HUMAN_APPROVAL_REQUIRED"
+
 
 # --- FROZEN METHODOLOGY INVARIANTS (Frozen for Version 1.1/1.2) ---
 frozen_parameters:
@@ -65,6 +70,3 @@ frozen_parameters:
 
   # Temporal subwindow duration for stability evaluation
   subwindow_duration_days: 30
-
-  # Standard pre-event exclusion buffer
-  exclusion_buffer_hours: 24

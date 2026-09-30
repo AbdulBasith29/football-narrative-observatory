@@ -115,7 +115,11 @@ class MockSnowflakeDatabase:
             else:
                 self._last_result = []
 
-        # 3. DIM_VIDEO and FACT_VIDEO_SNAPSHOT pre-event retrieval
+        # 3. DIM_VIDEO count and pre-event retrieval
+        elif "SELECT COUNT(DISTINCT v.video_key)" in sql_clean:
+            count_val = getattr(self, "eligible_count_override", 15)
+            self._last_result = [(count_val,)]
+
         elif "FROM CORE.DIM_VIDEO v" in sql_clean and "LEFT JOIN" in sql_clean and "WHERE v.channel_key =" in sql_clean:
             ch_k, w_start, w_end = params[0], params[1], params[2]
             results = []
@@ -167,7 +171,12 @@ class MockSnowflakeDatabase:
                 self._last_result = [(
                     sn["snapshot_key"], sn["channel_type_value"], sn["player_focus_value"],
                     sn["channel_type_confidence"], sn["player_focus_confidence"],
-                    sn["fallback_used"], sn["headline_decomposition_eligible"]
+                    sn.get("reference_period_start"), sn.get("reference_period_end"),
+                    sn.get("effective_window_days"), sn.get("eligible_video_count"),
+                    sn.get("messi_video_count"), sn.get("ronaldo_video_count"),
+                    sn.get("messi_prevalence"), sn.get("ronaldo_prevalence"),
+                    sn.get("focus_ratio"), sn["fallback_used"],
+                    sn["headline_decomposition_eligible"], sn.get("override_id")
                 )]
             else:
                 self._last_result = []
@@ -180,8 +189,18 @@ class MockSnowflakeDatabase:
                 "player_focus_value": pf,
                 "channel_type_confidence": ct_c,
                 "player_focus_confidence": pf_c,
+                "reference_period_start": ref_s,
+                "reference_period_end": ref_e,
+                "effective_window_days": eff_d,
+                "eligible_video_count": elig_c,
+                "messi_video_count": vm,
+                "ronaldo_video_count": vr,
+                "messi_prevalence": pm,
+                "ronaldo_prevalence": pr,
+                "focus_ratio": fr,
                 "fallback_used": fb,
-                "headline_decomposition_eligible": h_elig
+                "headline_decomposition_eligible": h_elig,
+                "override_id": ov_id
             }
 
         # 8. CHANNEL_EVIDENCE_ACQUISITION_STATE
@@ -217,7 +236,8 @@ class MockSnowflakeDatabase:
             pass
 
         elif "SELECT COUNT(DISTINCT v.video_key) FROM CORE.DIM_VIDEO" in sql_clean:
-            self._last_result = [(15,)]
+            count_val = getattr(self, "eligible_count_override", 15)
+            self._last_result = [(count_val,)]
 
         # 9. MANUAL_OVERRIDE
         elif "INSERT INTO OPS.MANUAL_OVERRIDE" in sql_clean:
@@ -235,7 +255,26 @@ class MockSnowflakeDatabase:
         elif "INSERT INTO OPS.FACT_API_REQUEST" in sql_clean:
             self.fact_api_requests.append(params)
         elif "INSERT INTO RAW.YOUTUBE_API_RESPONSE" in sql_clean:
+            canonical_raw_cols = [
+                "raw_response_id", "api_request_id", "ingestion_run_id", "source_system", "endpoint",
+                "resource_scope_type", "resource_scope_id", "request_parameters", "http_status",
+                "page_token_used", "next_page_token_returned", "retrieved_at", "raw_json_payload",
+                "payload_hash", "parser_version", "source_schema_version"
+            ]
+            import re
+            cols_match = re.search(r'INSERT INTO RAW\.YOUTUBE_API_RESPONSE \((.*?)\)', sql_clean, re.IGNORECASE)
+            if cols_match:
+                cols = [c.strip().lower() for c in cols_match.group(1).split(',')]
+                assert cols == canonical_raw_cols, f"RAW SQL columns {cols} do not match canonical {canonical_raw_cols}"
             self.raw_responses.append(params)
+        elif "FROM RAW.YOUTUBE_API_RESPONSE" in sql_clean and "channels.list" in sql_clean:
+            src_ch_id = params[0]
+            matches = [r for r in self.raw_responses if len(r) >= 14 and r[5] == src_ch_id and r[3] == 'channels.list']
+            if matches:
+                m = matches[-1]
+                self._last_result = [(m[11], m[0])]
+            else:
+                self._last_result = []
 
     def fetchone(self):
         if self._last_result is not None:
@@ -427,6 +466,19 @@ def test_player_focus_minimum_evidence_and_subwindow_stability():
     assert all(sw == "MESSI_FOCUSED" for sw in res_stable["evidence"]["subwindow_evaluations"])
 
 
+@pytest.fixture
+def approved_test_config(tmp_path):
+    import yaml
+    cfg_path = tmp_path / "approved_channel_stratification.yml"
+    with open("config/channel_stratification.yml", "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    data["deduplication_rule_version"] = "EXPLICIT_NONE"
+    data["deduplication_rule_status"] = "APPROVED_EXPLICIT_NONE"
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        yaml.dump(data, f)
+    return str(cfg_path)
+
+
 def test_static_vs_event_analytical_eligibility():
     """
     Verifies that when fallback_used = TRUE (180d fallback), headline_decomposition_eligible is FALSE,
@@ -442,7 +494,12 @@ def test_static_vs_event_analytical_eligibility():
         "player_focus_confidence": "LOW",
         "fallback_used": True,
         "effective_window_days": 180,
-        "eligible_video_count": 12
+        "eligible_video_count": 12,
+        "messi_video_count": 10,
+        "ronaldo_video_count": 0,
+        "messi_prevalence": 0.83333,
+        "ronaldo_prevalence": 0.0,
+        "focus_ratio": 11.0
     }
     ref_start = datetime(2022, 6, 20, 15, 0, 0, tzinfo=timezone.utc)
     ref_end = datetime(2022, 12, 17, 15, 0, 0, tzinfo=timezone.utc)
@@ -472,7 +529,12 @@ def test_snapshot_immutability_fail_closed():
         "player_focus_confidence": "MEDIUM",
         "fallback_used": False,
         "effective_window_days": 90,
-        "eligible_video_count": 15
+        "eligible_video_count": 15,
+        "messi_video_count": 12,
+        "ronaldo_video_count": 1,
+        "messi_prevalence": 0.8,
+        "ronaldo_prevalence": 0.06667,
+        "focus_ratio": 6.5
     }
     ref_start = datetime(2022, 9, 18, 15, 0, 0, tzinfo=timezone.utc)
     ref_end = datetime(2022, 12, 17, 15, 0, 0, tzinfo=timezone.utc)
@@ -493,7 +555,7 @@ def test_snapshot_immutability_fail_closed():
     assert "Cannot mutate existing event snapshot" in str(exc_info.value)
 
 
-def test_type_2_scd_grain_and_lifecycle():
+def test_type_2_scd_grain_and_lifecycle(approved_test_config):
     """
     Verifies Type-2 SCD maintenance in CORE.DIM_CHANNEL_STRATUM_VERSION (channel x validity interval):
     - Initial insert opens version.
@@ -524,7 +586,11 @@ def test_type_2_scd_grain_and_lifecycle():
         })
 
     # Assessment 1: MESSI_FOCUSED
-    res1 = classify_channel_assessment(conn, "frame-1", "ch-1", now)
+    res1 = classify_channel_assessment(
+        conn, "frame-1", "ch-1", now,
+        config_path=approved_test_config,
+        about_description="Comprehensive football channel"
+    )
     assert res1["player_focus_value"] == "MESSI_FOCUSED"
     assert len(db.channel_stratum_versions) == 1
     v1 = db.channel_stratum_versions[0]
@@ -532,7 +598,11 @@ def test_type_2_scd_grain_and_lifecycle():
     assert v1["valid_to"] is None
 
     # Assessment 2: Re-assessment with identical stratum -> No new version opened
-    res2 = classify_channel_assessment(conn, "frame-1", "ch-1", now)
+    res2 = classify_channel_assessment(
+        conn, "frame-1", "ch-1", now,
+        config_path=approved_test_config,
+        about_description="Comprehensive football channel"
+    )
     assert len(db.channel_stratum_versions) == 1
 
     # Assessment 3: Channel shifts orientation to RONALDO_FOCUSED
@@ -553,7 +623,11 @@ def test_type_2_scd_grain_and_lifecycle():
             "description": "CR7 highlights"
         })
 
-    res3 = classify_channel_assessment(conn, "frame-1", "ch-1", now)
+    res3 = classify_channel_assessment(
+        conn, "frame-1", "ch-1", now,
+        config_path=approved_test_config,
+        about_description="Comprehensive football channel"
+    )
     assert res3["player_focus_value"] == "RONALDO_FOCUSED"
     assert len(db.channel_stratum_versions) == 2
     assert db.channel_stratum_versions[0]["is_current"] is False
@@ -562,7 +636,7 @@ def test_type_2_scd_grain_and_lifecycle():
     assert db.channel_stratum_versions[1]["valid_to"] is None
 
 
-def test_evidence_manifest_exact_lineage():
+def test_evidence_manifest_exact_lineage(approved_test_config):
     """
     Verifies that every evaluated video observation is recorded in OPS.FACT_CHANNEL_ASSESSMENT_EVIDENCE_ITEM
     with alias matches, exact deduplication flags, and canonical hash alignment.
@@ -587,12 +661,16 @@ def test_evidence_manifest_exact_lineage():
             "description": "Leo Messi skills"
         })
 
-    res = classify_channel_assessment(conn, "frame-1", "ch-1", now)
+    res = classify_channel_assessment(
+        conn, "frame-1", "ch-1", now,
+        config_path=approved_test_config,
+        about_description="Football highlights channel"
+    )
     assert len(db.evidence_manifest_items) == 10
     assert len(res["evidence_manifest_hash"]) == 64  # Valid SHA-256
 
 
-def test_exact_video_id_deduplication():
+def test_exact_video_id_deduplication(approved_test_config):
     """
     Verifies that identical source_video_id observations in the window are collapsed to 1 observation.
     """
@@ -619,7 +697,11 @@ def test_exact_video_id_deduplication():
             "description": "Leo Messi"
         })
 
-    res = classify_channel_assessment(conn, "frame-1", "ch-1", now)
+    res = classify_channel_assessment(
+        conn, "frame-1", "ch-1", now,
+        config_path=approved_test_config,
+        about_description="Football channel about"
+    )
     # Total distinct videos should be 9
     assert res["eligible_video_count"] == 9
     # Exactly one item marked as deduplicated duplicate in manifest
@@ -727,3 +809,262 @@ def test_manual_override_audit():
     assert len(db.channel_stratum_versions) == 2
     assert db.channel_stratum_versions[0]["is_current"] is False
     assert db.channel_stratum_versions[1]["is_current"] is True
+
+
+def test_canonical_raw_youtube_response_persistence():
+    """
+    Blocker 1: Validates that RAW response persistence strictly conforms to the canonical
+    RAW.YOUTUBE_API_RESPONSE schema (16 exact columns) prior to any parsing operations.
+    """
+    from channel_evidence_acquisition import persist_raw_youtube_response, persist_raw_playlist_response
+
+    db = MockSnowflakeDatabase()
+    conn = db.get_connection()
+
+    sample_payload = {"kind": "youtube#playlistItemListResponse", "items": [{"id": "v1"}]}
+    raw_id = persist_raw_playlist_response(
+        conn=conn,
+        raw_payload=sample_payload,
+        playlist_id="UU12345",
+        ingestion_run_id="run-test",
+        api_request_id="req-test",
+        page_token_used="token-prev",
+        next_page_token_returned="token-next"
+    )
+
+    assert len(db.raw_responses) == 1
+    inserted_params = db.raw_responses[0]
+    # Parameter order: raw_response_id, api_request_id, ingestion_run_id, endpoint,
+    # resource_scope_type, resource_scope_id, req_params_str, http_status,
+    # page_token_used, next_page_token_returned, retrieved_at, raw_payload_str,
+    # payload_hash, parser_version, source_schema_version
+    assert inserted_params[0] == raw_id
+    assert inserted_params[1] == "req-test"
+    assert inserted_params[2] == "run-test"
+    assert inserted_params[3] == "playlistItems.list"
+    assert inserted_params[4] == "PLAYLIST"
+    assert inserted_params[5] == "UU12345"
+    assert inserted_params[7] == 200
+    assert inserted_params[8] == "token-prev"
+    assert inserted_params[9] == "token-next"
+    assert inserted_params[13] == "1.0"
+    assert inserted_params[14] == "v3"
+
+
+def test_cross_video_dedup_fail_closed_in_classify_channel_assessment():
+    """
+    Blocker 2: Validates that when cross-video deduplication methodology remains unapproved,
+    classify_channel_assessment raises DeduplicationRuleMissingError and strictly fails closed,
+    preventing prevalence calculation with raw distinct video IDs.
+    """
+    db = MockSnowflakeDatabase()
+    conn = db.get_connection()
+    sync_strata(conn)
+
+    db.dim_channels["ch-1"] = {"source_id": "UC123", "channel_name": "Test Dedup Fail-Closed"}
+    now = datetime(2022, 12, 17, 15, 0, 0, tzinfo=timezone.utc)
+    for i in range(12):
+        v_key = f"vid-{i}"
+        db.dim_videos[v_key] = {
+            "channel_key": "ch-1",
+            "source_id": f"src-{i}",
+            "published_at": (now - timedelta(days=i + 1)).isoformat(),
+            "is_short": False
+        }
+        db.fact_video_snapshots.append({
+            "video_key": v_key,
+            "title": "Lionel Messi best goals",
+            "description": "Skills"
+        })
+
+    # Call with production config (deduplication_rule_version: null)
+    with pytest.raises(DeduplicationRuleMissingError) as exc_info:
+        classify_channel_assessment(
+            conn, "frame-1", "ch-1", now,
+            config_path="config/channel_stratification.yml",
+            about_description="Football channel"
+        )
+    assert "Cross-video deduplication methodology is required" in str(exc_info.value)
+
+
+def test_reliable_channel_identity_evidence_enforcement(approved_test_config):
+    """
+    Blocker 3: Validates that channel_name alone does NOT satisfy reliable identity requirements.
+    Without an About description or third-party categorisation, Channel Type is UNCLASSIFIED.
+    When About description is present, Channel Type resolves.
+    Player Focus evaluates independently on both runs.
+    """
+    db = MockSnowflakeDatabase()
+    conn = db.get_connection()
+    sync_strata(conn)
+
+    db.dim_channels["ch-1"] = {"source_id": "UC_IDENTITY_TEST", "channel_name": "Famous Football Hub"}
+    now = datetime(2022, 12, 17, 15, 0, 0, tzinfo=timezone.utc)
+    for i in range(12):
+        v_key = f"vid-{i}"
+        db.dim_videos[v_key] = {
+            "channel_key": "ch-1",
+            "source_id": f"src-{i}",
+            "published_at": (now - timedelta(days=i + 1)).isoformat(),
+            "is_short": False
+        }
+        db.fact_video_snapshots.append({
+            "video_key": v_key,
+            "title": "Lionel Messi goal",
+            "description": "Match highlights"
+        })
+
+    # Case A: Missing About description (empty string) -> Channel Type must be UNCLASSIFIED
+    res_no_identity = classify_channel_assessment(
+        conn, "frame-1", "ch-1", now,
+        config_path=approved_test_config,
+        about_description=""
+    )
+    assert res_no_identity["channel_type_value"] == "UNCLASSIFIED"
+    assert res_no_identity["channel_type_confidence"] == "LOW"
+    # Player focus evaluates independently!
+    assert res_no_identity["player_focus_value"] == "MESSI_FOCUSED"
+
+    # Case B: With reliable About description -> Channel Type resolves
+    res_with_identity = classify_channel_assessment(
+        conn, "frame-1", "ch-1", now,
+        config_path=approved_test_config,
+        about_description="Comprehensive football tactical analysis and creator channel."
+    )
+    assert res_with_identity["channel_type_value"] == "INDEPENDENT_CREATOR"
+    assert res_with_identity["player_focus_value"] == "MESSI_FOCUSED"
+
+
+def test_event_snapshot_immutability_and_full_payload_mutation_detection():
+    """
+    Blocker 4: Validates complete canonical snapshot payload comparison and fail-closed immutability:
+    - Missing required statistics -> ValueError
+    - Changed counts / prevalences with UNCHANGED labels -> SnapshotMutationViolationError
+    - Changed reference period with UNCHANGED labels -> SnapshotMutationViolationError
+    - Exact complete payload match -> IDEMPOTENT_NOOP
+    """
+    db = MockSnowflakeDatabase()
+    conn = db.get_connection()
+
+    base_assessment = {
+        "channel_type_value": "INDEPENDENT_CREATOR",
+        "player_focus_value": "MESSI_FOCUSED",
+        "channel_type_confidence": "LOW",
+        "player_focus_confidence": "HIGH",
+        "fallback_used": False,
+        "effective_window_days": 90,
+        "eligible_video_count": 15,
+        "messi_video_count": 12,
+        "ronaldo_video_count": 0,
+        "messi_prevalence": 0.8,
+        "ronaldo_prevalence": 0.0,
+        "focus_ratio": 13.0
+    }
+    ref_start = datetime(2022, 9, 18, 15, 0, 0, tzinfo=timezone.utc)
+    ref_end = datetime(2022, 12, 17, 15, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Missing statistic raises ValueError
+    incomplete_assessment = dict(base_assessment)
+    del incomplete_assessment["messi_video_count"]
+    with pytest.raises(ValueError) as val_err:
+        create_or_verify_event_channel_snapshot(conn, "ev-1", "ch-1", "1.1", incomplete_assessment, ref_start, ref_end)
+    assert "Missing required assessment statistic 'messi_video_count'" in str(val_err.value)
+
+    # 2. Initial insert succeeds
+    res_insert = create_or_verify_event_channel_snapshot(conn, "ev-1", "ch-1", "1.1", base_assessment, ref_start, ref_end)
+    assert res_insert["status"] == "INSERTED"
+
+    # 3. Exact match is IDEMPOTENT_NOOP
+    res_noop = create_or_verify_event_channel_snapshot(conn, "ev-1", "ch-1", "1.1", base_assessment, ref_start, ref_end)
+    assert res_noop["status"] == "IDEMPOTENT_NOOP"
+
+    # 4. Changed statistics with UNCHANGED labels -> SnapshotMutationViolationError
+    mutated_stats = dict(base_assessment)
+    mutated_stats["messi_video_count"] = 14  # Count changed from 12 to 14
+    mutated_stats["messi_prevalence"] = 0.93333
+    with pytest.raises(SnapshotMutationViolationError) as exc_mut_stats:
+        create_or_verify_event_channel_snapshot(conn, "ev-1", "ch-1", "1.1", mutated_stats, ref_start, ref_end)
+    assert "Cannot mutate existing event snapshot" in str(exc_mut_stats.value)
+
+    # 5. Changed reference period with UNCHANGED labels -> SnapshotMutationViolationError
+    mutated_ref = ref_start - timedelta(days=1)
+    with pytest.raises(SnapshotMutationViolationError) as exc_mut_ref:
+        create_or_verify_event_channel_snapshot(conn, "ev-1", "ch-1", "1.1", base_assessment, mutated_ref, ref_end)
+    assert "Cannot mutate existing event snapshot" in str(exc_mut_ref.value)
+
+
+def test_acquisition_fallback_progression_lifecycle():
+    """
+    Blocker 5: Validates 90D -> 180D fallback progression:
+    - completed 90D >= 10 videos -> no fallback initialized
+    - completed 90D < 10 videos -> 180D fallback initialized
+    - partial 90D < 10 videos -> no fallback yet
+    """
+    from channel_evidence_acquisition import execute_channel_evidence_harvest
+
+    db = MockSnowflakeDatabase()
+    conn = db.get_connection()
+
+    now = datetime(2022, 12, 17, 15, 0, 0, tzinfo=timezone.utc)
+    mock_yt = MagicMock()
+    # Mock playlistItems returning empty list (stops immediately as COMPLETED)
+    mock_yt.playlistItems().list().execute.return_value = {
+        "items": [],
+        "nextPageToken": None
+    }
+    mock_yt.channels().list().execute.return_value = {
+        "items": [{"contentDetails": {"relatedPlaylists": {"uploads": "UU123"}}}]
+    }
+
+    # Case 1: Completed 90D with >= 10 videos (override returns 15) -> No fallback initialized
+    db.eligible_count_override = 15
+    res1 = execute_channel_evidence_harvest(
+        conn, mock_yt, "frame-1", "ch-1", "UC123", now, scan_scope="90D_PRIMARY"
+    )
+    assert res1["status"] == "COMPLETED"
+    assert res1["eligible_videos_observed"] == 15
+    assert res1["fallback_initialized"] is False
+    assert res1["fallback_state_key"] is None
+
+    # Case 2: Completed 90D with < 10 videos (override returns 6) -> 180D fallback initialized
+    db.eligible_count_override = 6
+    res2 = execute_channel_evidence_harvest(
+        conn, mock_yt, "frame-1", "ch-2", "UC456", now, scan_scope="90D_PRIMARY"
+    )
+    assert res2["status"] == "COMPLETED"
+    assert res2["eligible_videos_observed"] == 6
+    assert res2["fallback_initialized"] is True
+    assert res2["fallback_state_key"] is not None
+    # Confirm 180D_FALLBACK state exists in DB with PENDING
+    assert ("frame-1", "ch-2", now.isoformat(), "180D_FALLBACK") in db.acquisition_states
+
+    # Case 3: Partial 90D with < 10 videos (quota exception) -> No fallback yet
+    mock_yt_err = MagicMock()
+    mock_yt_err.channels().list().execute.return_value = {
+        "items": [{"contentDetails": {"relatedPlaylists": {"uploads": "UU789"}}}]
+    }
+    from googleapiclient.errors import HttpError
+    mock_resp = MagicMock(status=403, reason="Quota Exceeded")
+    mock_yt_err.playlistItems().list().execute.side_effect = HttpError(
+        resp=mock_resp, content=b'{"error": {"errors": [{"reason": "quotaExceeded"}]}}'
+    )
+    db.eligible_count_override = 3
+    res3 = execute_channel_evidence_harvest(
+        conn, mock_yt_err, "frame-1", "ch-3", "UC789", now, scan_scope="90D_PRIMARY"
+    )
+    assert res3["status"] == "PARTIAL_QUOTA_LIMIT"
+    assert res3["fallback_initialized"] is False
+    assert ("frame-1", "ch-3", now.isoformat(), "180D_FALLBACK") not in db.acquisition_states
+
+
+def test_exclusion_buffer_human_approval_required():
+    """
+    Blocker 6: Validates that exclusion_buffer_hours is not silently frozen and requires human decision.
+    """
+    import yaml
+    with open("config/channel_stratification.yml", "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    assert cfg.get("exclusion_buffer_hours") is None
+    assert cfg.get("exclusion_buffer_hours_status") == "HUMAN_APPROVAL_REQUIRED"
+    assert "exclusion_buffer_hours" not in cfg.get("frozen_parameters", {})

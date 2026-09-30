@@ -58,6 +58,7 @@ WHEN NOT MATCHED THEN
 
 -- 2. Alter CORE.BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT
 ALTER TABLE CORE.BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT ADD COLUMN IF NOT EXISTS headline_decomposition_eligible BOOLEAN;
+ALTER TABLE CORE.BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT ADD CONSTRAINT uq_event_channel_stratum_snapshot UNIQUE (event_version_key, channel_key, classification_protocol_version);
 
 -- 3. Operations schema tables
 USE SCHEMA OPS;

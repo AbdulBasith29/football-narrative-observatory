@@ -10,46 +10,98 @@ from ingestion_video_metadata import (
     ingest_video_metadata
 )
 
-def get_channel_uploads_playlist_id(youtube_client, channel_source_id: str, conn=None, ingestion_run_id: str = None) -> str:
+def persist_raw_youtube_response(
+    conn,
+    raw_payload: dict,
+    endpoint: str,
+    resource_scope_type: str,
+    resource_scope_id: str,
+    request_parameters: dict,
+    ingestion_run_id: str,
+    api_request_id: str,
+    retrieved_at: str,
+    http_status: int = 200,
+    page_token_used: str = None,
+    next_page_token_returned: str = None,
+    parser_version: str = "1.0",
+    source_schema_version: str = "v3"
+) -> str:
     """
-    Resolves the uploads playlist ID for a channel.
-    Standard YouTube convention derives uploads playlist ID by replacing 'UC' prefix with 'UU'.
-    If client is provided and channel ID does not follow convention, calls channels.list.
+    Persists verbatim JSON API response into RAW.YOUTUBE_API_RESPONSE following the
+    canonical RAW schema exactly, preserving complete request, lineage, and pagination fields.
+    Execution must occur BEFORE parsing downstream (raw-before-parse).
     """
-    if channel_source_id.startswith("UC"):
-        return "UU" + channel_source_id[2:]
-        
+    raw_payload_str = json.dumps(raw_payload)
+    payload_hash = hashlib.sha256(raw_payload_str.encode("utf-8")).hexdigest()
+    raw_response_id = str(uuid.uuid4())
+    req_params_str = json.dumps(request_parameters)
+
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO RAW.YOUTUBE_API_RESPONSE (
+            raw_response_id, api_request_id, ingestion_run_id, source_system, endpoint,
+            resource_scope_type, resource_scope_id, request_parameters, http_status,
+            page_token_used, next_page_token_returned, retrieved_at, raw_json_payload,
+            payload_hash, parser_version, source_schema_version
+        ) SELECT %s, %s, %s, 'YOUTUBE', %s, %s, %s, PARSE_JSON(%s), %s, %s, %s, %s,
+                 PARSE_JSON(%s), %s, %s, %s
+    ''', (
+        raw_response_id, api_request_id, ingestion_run_id, endpoint,
+        resource_scope_type, resource_scope_id, req_params_str, http_status,
+        page_token_used, next_page_token_returned, retrieved_at, raw_payload_str,
+        payload_hash, parser_version, source_schema_version
+    ))
+    conn.commit()
+    return raw_response_id
+
+
+def acquire_channel_identity_and_uploads(
+    youtube_client,
+    channel_source_id: str,
+    conn=None,
+    ingestion_run_id: str = None
+) -> tuple:
+    """
+    Fetches channel snippet and contentDetails via channels.list.
+    Returns (uploads_playlist_id, about_description, raw_response_id).
+    Persists raw response into RAW.YOUTUBE_API_RESPONSE before parsing.
+    """
+    default_uploads = "UU" + channel_source_id[2:] if channel_source_id.startswith("UC") else "UU" + channel_source_id
     if not youtube_client:
-        return "UU" + channel_source_id
-        
+        return default_uploads, "", None
+
     api_request_id = str(uuid.uuid4())
     req_at = datetime.now(timezone.utc).isoformat()
+    req_params = {"part": "snippet,contentDetails", "id": channel_source_id}
     try:
-        resp = youtube_client.channels().list(
-            part="contentDetails",
-            id=channel_source_id
-        ).execute()
+        req = youtube_client.channels().list(part="snippet,contentDetails", id=channel_source_id)
+        resp = req.execute()
         comp_at = datetime.now(timezone.utc).isoformat()
-        
+
+        raw_id = None
         if conn and ingestion_run_id:
             log_fact_api_request(
                 conn, api_request_id, ingestion_run_id, "channels.list",
                 req_at, comp_at, http_status=200, retry_number=0, error_code=None, estimated_quota_cost=1
             )
-            raw_id = str(uuid.uuid4())
-            payload_str = json.dumps(resp)
-            payload_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO RAW.YOUTUBE_API_RESPONSE (
-                    raw_response_id, ingestion_run_id, endpoint, payload, payload_hash, observed_at
-                ) SELECT %s, %s, 'channels.list', PARSE_JSON(%s), %s, %s
-            ''', (raw_id, ingestion_run_id, payload_str, payload_hash, comp_at))
-            conn.commit()
-            
+            raw_id = persist_raw_youtube_response(
+                conn=conn,
+                raw_payload=resp,
+                endpoint="channels.list",
+                resource_scope_type="CHANNEL",
+                resource_scope_id=channel_source_id,
+                request_parameters=req_params,
+                ingestion_run_id=ingestion_run_id,
+                api_request_id=api_request_id,
+                retrieved_at=comp_at,
+                http_status=200
+            )
+
         items = resp.get("items", [])
         if items:
-            return items[0].get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads", f"UU{channel_source_id}")
+            uploads_id = items[0].get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads", default_uploads)
+            about_desc = items[0].get("snippet", {}).get("description", "")
+            return uploads_id, about_desc, raw_id
     except Exception as e:
         if conn and ingestion_run_id:
             comp_at = datetime.now(timezone.utc).isoformat()
@@ -57,26 +109,45 @@ def get_channel_uploads_playlist_id(youtube_client, channel_source_id: str, conn
                 conn, api_request_id, ingestion_run_id, "channels.list",
                 req_at, comp_at, http_status=500, retry_number=0, error_code=str(e)[:128], estimated_quota_cost=1
             )
-            
-    return "UU" + channel_source_id
+
+    return default_uploads, "", None
 
 
-def persist_raw_playlist_response(conn, raw_payload: dict, playlist_id: str, ingestion_run_id: str, api_request_id: str) -> str:
+def get_channel_uploads_playlist_id(youtube_client, channel_source_id: str, conn=None, ingestion_run_id: str = None) -> str:
+    """
+    Resolves the uploads playlist ID for a channel.
+    Standard YouTube convention derives uploads playlist ID by replacing 'UC' prefix with 'UU'.
+    If client is provided, queries channels.list acquiring both identity and playlist ID.
+    """
+    uploads_id, _, _ = acquire_channel_identity_and_uploads(youtube_client, channel_source_id, conn=conn, ingestion_run_id=ingestion_run_id)
+    return uploads_id
+
+
+def persist_raw_playlist_response(conn, raw_payload: dict, playlist_id: str, ingestion_run_id: str, api_request_id: str, page_token_used: str = None, next_page_token_returned: str = None) -> str:
     """
     Persists raw playlistItems.list API responses in RAW.YOUTUBE_API_RESPONSE prior to parsing.
     """
-    raw_id = str(uuid.uuid4())
-    payload_str = json.dumps(raw_payload)
-    payload_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
     now_iso = datetime.now(timezone.utc).isoformat()
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO RAW.YOUTUBE_API_RESPONSE (
-            raw_response_id, ingestion_run_id, endpoint, payload, payload_hash, observed_at
-        ) SELECT %s, %s, 'playlistItems.list', PARSE_JSON(%s), %s, %s
-    ''', (raw_id, ingestion_run_id, payload_str, payload_hash, now_iso))
-    conn.commit()
-    return raw_id
+    req_params = {
+        "part": "snippet,contentDetails",
+        "playlistId": playlist_id,
+        "maxResults": 50,
+        "pageToken": page_token_used
+    }
+    return persist_raw_youtube_response(
+        conn=conn,
+        raw_payload=raw_payload,
+        endpoint="playlistItems.list",
+        resource_scope_type="PLAYLIST",
+        resource_scope_id=playlist_id,
+        request_parameters=req_params,
+        ingestion_run_id=ingestion_run_id,
+        api_request_id=api_request_id,
+        retrieved_at=now_iso,
+        http_status=200,
+        page_token_used=page_token_used,
+        next_page_token_returned=next_page_token_returned
+    )
 
 
 def get_or_create_acquisition_state(
@@ -181,7 +252,7 @@ def execute_channel_evidence_harvest(
         window_end_at = window_end_at.replace(tzinfo=timezone.utc)
     window_start_at = window_end_at - timedelta(days=window_days)
 
-    uploads_playlist_id = get_channel_uploads_playlist_id(
+    uploads_playlist_id, about_description, channel_raw_id = acquire_channel_identity_and_uploads(
         youtube_client, source_channel_id, conn=conn, ingestion_run_id=ingestion_run_id
     )
 
@@ -194,7 +265,10 @@ def execute_channel_evidence_harvest(
         return {
             "status": "ALREADY_COMPLETED",
             "acquisition_state_key": state["acquisition_state_key"],
-            "eligible_videos_observed": state["eligible_videos_observed"]
+            "eligible_videos_observed": state["eligible_videos_observed"],
+            "fallback_initialized": False,
+            "fallback_state_key": None,
+            "about_description": about_description
         }
 
     # Transition to IN_PROGRESS
@@ -240,7 +314,16 @@ def execute_channel_evidence_harvest(
                 conn, api_request_id, ingestion_run_id, "playlistItems.list",
                 req_at, comp_at, http_status=200, retry_number=0, error_code=None, estimated_quota_cost=1
             )
-            persist_raw_playlist_response(conn, resp, uploads_playlist_id, ingestion_run_id, api_request_id)
+            returned_next_token = resp.get("nextPageToken")
+            persist_raw_playlist_response(
+                conn=conn,
+                raw_payload=resp,
+                playlist_id=uploads_playlist_id,
+                ingestion_run_id=ingestion_run_id,
+                api_request_id=api_request_id,
+                page_token_used=next_page_token,
+                next_page_token_returned=returned_next_token
+            )
 
             items = resp.get("items", [])
             items_observed += len(items)
@@ -264,7 +347,7 @@ def execute_channel_evidence_harvest(
                 elif pub_dt < window_start_at:
                     reached_window_start = True
 
-            next_page_token = resp.get("nextPageToken")
+            next_page_token = returned_next_token
 
             # Check completion conditions
             if reached_window_start or not next_page_token:
@@ -335,6 +418,21 @@ def execute_channel_evidence_harvest(
         now_iso, final_status, now_iso, state["acquisition_state_key"]
     ))
 
+    # 90D -> 180D Fallback Progression
+    # When a 90D_PRIMARY evidence-acquisition unit reaches COMPLETED with fewer than 10 eligible videos,
+    # deterministically initialize the corresponding 180D_FALLBACK acquisition state.
+    # Incomplete/quota-limited/error 90D units are NOT eligible for fallback progression.
+    fallback_initialized = False
+    fallback_state_key = None
+    if scan_scope == "90D_PRIMARY" and final_status == "COMPLETED" and eligible_count < 10:
+        w180_start = window_end_at - timedelta(days=180)
+        fallback_state = get_or_create_acquisition_state(
+            conn, frame_version_key, channel_key, source_channel_id,
+            uploads_playlist_id, "180D_FALLBACK", w180_start, window_end_at, ingestion_run_id
+        )
+        fallback_initialized = True
+        fallback_state_key = fallback_state["acquisition_state_key"]
+
     # Close fact_ingestion_run
     cursor.execute('''
         UPDATE OPS.FACT_INGESTION_RUN
@@ -359,5 +457,8 @@ def execute_channel_evidence_harvest(
         "pages_completed": pages_completed,
         "eligible_videos_observed": eligible_count,
         "oldest_observed_published_at": oldest_str,
-        "next_page_token": next_page_token
+        "next_page_token": next_page_token,
+        "fallback_initialized": fallback_initialized,
+        "fallback_state_key": fallback_state_key,
+        "about_description": about_description
     }

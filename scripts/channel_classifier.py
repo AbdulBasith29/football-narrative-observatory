@@ -89,6 +89,8 @@ def classify_channel_type(
     """
     Evaluates Channel Type hierarchically per frozen protocol Section 6:
     1. Minimum evidence check: reliable identity signal AND >= 10 eligible videos.
+       Reliable identity signal requires an About description or an approved versioned third-party categorisation.
+       channel_name alone does NOT satisfy the reliable identity requirement.
     2. Curated Broadcaster Registry match -> BROAD_REACH_PUBLISHER
     3. Club Media Proportion (P_club > 0.70 and winning margin) -> CLUB_MEDIA
     4. Curated Analysis Registry match or tag share -> ANALYSIS_PUBLISHER
@@ -96,17 +98,24 @@ def classify_channel_type(
     Fails closed if an unapproved threshold/registry is required.
     """
     num_videos = len(eligible_videos)
-    identity_present = bool((about_description and about_description.strip()) or channel_name)
+    has_about = bool(about_description and about_description.strip())
+    third_party_reg = strat_cfg.get("third_party_categorisation_registry") or {}
+    has_third_party = bool(third_party_reg.get(channel_id))
+    identity_present = has_about or has_third_party
     
-    # Minimum evidence gating
+    # Minimum evidence gating: channel_name alone is NOT sufficient.
     if not identity_present or num_videos < 10:
+        reason = "MISSING_RELIABLE_IDENTITY_SIGNAL" if not identity_present else "LESS_THAN_10_VIDEOS"
         return {
             "channel_type": "UNCLASSIFIED",
             "confidence": "LOW",
             "evidence": {
                 "identity_present": identity_present,
+                "has_about_description": has_about,
+                "has_third_party_categorisation": has_third_party,
+                "about_snippet_preview": (about_description[:100] if about_description else None),
                 "video_count": num_videos,
-                "reason": "INSUFFICIENT_EVIDENCE_OR_IDENTITY"
+                "reason": reason
             }
         }
 
@@ -330,7 +339,8 @@ def classify_channel_assessment(
     event_version_key: str = None,
     config_path: str = "config/channel_stratification.yml",
     alias_config_path: str = "config/player_aliases.yml",
-    ingestion_run_id: str = None
+    ingestion_run_id: str = None,
+    about_description: str = None
 ):
     """
     Main deterministic classification routine for a single channel assessment.
@@ -342,7 +352,25 @@ def classify_channel_assessment(
     
     protocol_version = strat_cfg.get("classification_protocol_version", "1.1")
     dedup_rule_ver = strat_cfg.get("deduplication_rule_version")
+    dedup_status = strat_cfg.get("deduplication_rule_status")
     
+    # Cross-video-ID deduplication fail-closed gate
+    # Frozen methodology requires deduplication before prevalence calculation.
+    # When no approved rule exists, raise DeduplicationRuleMissingError on the relevant classification path.
+    # Only proceed when:
+    # - an approved versioned deduplication rule exists; OR
+    # - humans explicitly approve EXPLICIT_NONE.
+    is_rule_approved = bool(dedup_rule_ver and dedup_rule_ver != "HUMAN_APPROVAL_REQUIRED")
+    is_explicit_none = (dedup_rule_ver == "EXPLICIT_NONE" or dedup_status == "APPROVED_EXPLICIT_NONE")
+
+    if not (is_rule_approved or is_explicit_none):
+        raise DeduplicationRuleMissingError(
+            "Cross-video deduplication methodology is required before prevalence calculation, "
+            f"but deduplication_rule_version is '{dedup_rule_ver}' and status is '{dedup_status}'. "
+            "Prevalence calculation cannot proceed with raw distinct video IDs without explicit approval. "
+            "Either an approved versioned deduplication rule or an explicit human approval of 'EXPLICIT_NONE' is required."
+        )
+
     cursor = conn.cursor()
     if not ingestion_run_id:
         ingestion_run_id = str(uuid.uuid4())
@@ -358,6 +386,28 @@ def classify_channel_assessment(
     if not ch_row:
         raise ValueError(f"Channel {channel_key} not found in CORE.DIM_CHANNEL.")
     source_channel_id, channel_name = ch_row
+
+    # Resolve reliable channel-identity signal (About description) from RAW if not explicitly supplied
+    about_raw_response_id = None
+    if about_description is None:
+        cursor.execute('''
+            SELECT raw_json_payload, raw_response_id
+            FROM RAW.YOUTUBE_API_RESPONSE
+            WHERE endpoint = 'channels.list' AND resource_scope_id = %s
+            ORDER BY retrieved_at DESC
+        ''', (source_channel_id,))
+        about_row = cursor.fetchone()
+        if about_row:
+            try:
+                payload = json.loads(about_row[0]) if isinstance(about_row[0], str) else about_row[0]
+                items = payload.get("items", [])
+                if items:
+                    about_description = items[0].get("snippet", {}).get("description", "")
+                    about_raw_response_id = about_row[1]
+            except Exception:
+                about_description = ""
+        else:
+            about_description = ""
 
     # Define 90d and 180d boundaries
     if reference_period_end.tzinfo is None:
@@ -425,11 +475,6 @@ def classify_channel_assessment(
             if pub_dt >= w90_start:
                 videos_90.append(v_dict)
 
-    # Cross-video-ID deduplication fail-closed gate
-    # If the research team specifies a rule version, execute it. If null, fail closed if cross-video dedup is required.
-    if dedup_rule_ver is None and strat_cfg.get("deduplication_rule_status") == "HUMAN_APPROVAL_REQUIRED":
-        pass # Explicit fail-closed logic: no cross-video heuristic is applied; raw unique source_video_ids used.
-
     # Minimum evidence resolution: 90d vs 180d fallback
     if len(videos_90) >= 10:
         effective_videos = videos_90
@@ -447,14 +492,17 @@ def classify_channel_assessment(
         fallback_used = False
         ref_start = w90_start
 
-    # Evaluate classifiers
+    # Evaluate classifiers independently
     type_res = classify_channel_type(
         channel_id=source_channel_id,
         channel_name=channel_name,
-        about_description="", # Reliable identity signal check
+        about_description=about_description,
         eligible_videos=effective_videos,
         strat_cfg=strat_cfg
     )
+    if about_raw_response_id and "evidence" in type_res:
+        type_res["evidence"]["about_raw_response_id"] = about_raw_response_id
+
     focus_res = classify_player_focus(
         eligible_videos=effective_videos,
         reference_period_end=reference_period_end,
@@ -563,11 +611,19 @@ def classify_channel_assessment(
         "player_focus_value": player_focus_val,
         "channel_type_confidence": type_conf,
         "player_focus_confidence": focus_conf,
+        "reference_period_start": ref_start,
+        "reference_period_end": reference_period_end,
         "effective_window_days": effective_days,
+        "eligible_video_count": len(effective_videos),
+        "messi_video_count": focus_res["messi_count"],
+        "ronaldo_video_count": focus_res["ronaldo_count"],
+        "messi_prevalence": focus_res["messi_prevalence"],
+        "ronaldo_prevalence": focus_res["ronaldo_prevalence"],
+        "focus_ratio": focus_res["focus_ratio"],
         "fallback_used": fallback_used,
         "evidence_manifest_hash": manifest_hash,
         "stratum_key": new_stratum_key,
-        "eligible_video_count": len(effective_videos)
+        "about_description": about_description
     }
 
 
@@ -586,22 +642,22 @@ def create_or_verify_event_channel_snapshot(
     CORE.BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT.
     
     Idempotency & Immutability Protocol:
-    - If snapshot does not exist -> INSERT.
-    - If snapshot exists and payload matches -> Idempotent NO-OP.
-    - If snapshot exists and payload differs -> Fail closed with SnapshotMutationViolationError!
+    - If snapshot does not exist -> INSERT complete canonical payload.
+    - If snapshot exists and complete payload matches -> Idempotent NO-OP.
+    - If snapshot exists and any field differs -> Fail closed with SnapshotMutationViolationError!
     """
     cursor = conn.cursor()
     
-    cursor.execute('''
-        SELECT event_channel_stratum_snapshot_key, channel_type_value, player_focus_value,
-               channel_type_confidence, player_focus_confidence, fallback_used,
-               headline_decomposition_eligible
-        FROM CORE.BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT
-        WHERE event_version_key = %s
-          AND channel_key = %s
-          AND classification_protocol_version = %s
-    ''', (event_version_key, channel_key, classification_protocol_version))
-    existing = cursor.fetchone()
+    # Validate required statistical fields - do not silently default missing values
+    required_stat_keys = [
+        "channel_type_value", "player_focus_value", "channel_type_confidence",
+        "player_focus_confidence", "effective_window_days", "eligible_video_count",
+        "messi_video_count", "ronaldo_video_count", "messi_prevalence",
+        "ronaldo_prevalence", "focus_ratio", "fallback_used"
+    ]
+    for k in required_stat_keys:
+        if k not in assessment_result or assessment_result[k] is None:
+            raise ValueError(f"Missing required assessment statistic '{k}' for snapshot creation.")
 
     # Rule: headline_decomposition_eligible = fully_resolved_axes AND fallback_used = FALSE
     ch_type = assessment_result["channel_type_value"]
@@ -614,18 +670,53 @@ def create_or_verify_event_channel_snapshot(
         "player_focus_value": pl_focus,
         "channel_type_confidence": assessment_result["channel_type_confidence"],
         "player_focus_confidence": assessment_result["player_focus_confidence"],
-        "fallback_used": fallback,
-        "headline_decomposition_eligible": headline_eligible
+        "reference_period_start": reference_period_start.isoformat(),
+        "reference_period_end": reference_period_end.isoformat(),
+        "effective_window_days": int(assessment_result["effective_window_days"]),
+        "eligible_video_count": int(assessment_result["eligible_video_count"]),
+        "messi_video_count": int(assessment_result["messi_video_count"]),
+        "ronaldo_video_count": int(assessment_result["ronaldo_video_count"]),
+        "messi_prevalence": round(float(assessment_result["messi_prevalence"]), 5),
+        "ronaldo_prevalence": round(float(assessment_result["ronaldo_prevalence"]), 5),
+        "focus_ratio": round(float(assessment_result["focus_ratio"]), 5),
+        "fallback_used": bool(fallback),
+        "headline_decomposition_eligible": bool(headline_eligible),
+        "override_id": override_id
     }
 
+    cursor.execute('''
+        SELECT event_channel_stratum_snapshot_key, channel_type_value, player_focus_value,
+               channel_type_confidence, player_focus_confidence, reference_period_start,
+               reference_period_end, effective_window_days, eligible_video_count,
+               messi_video_count, ronaldo_video_count, messi_prevalence, ronaldo_prevalence,
+               focus_ratio, fallback_used, headline_decomposition_eligible, override_id
+        FROM CORE.BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT
+        WHERE event_version_key = %s
+          AND channel_key = %s
+          AND classification_protocol_version = %s
+    ''', (event_version_key, channel_key, classification_protocol_version))
+    existing = cursor.fetchone()
+
     if existing:
+        ref_start_existing = existing[5].isoformat() if hasattr(existing[5], 'isoformat') else str(existing[5])
+        ref_end_existing = existing[6].isoformat() if hasattr(existing[6], 'isoformat') else str(existing[6])
         existing_payload = {
             "channel_type_value": existing[1],
             "player_focus_value": existing[2],
             "channel_type_confidence": existing[3],
             "player_focus_confidence": existing[4],
-            "fallback_used": bool(existing[5]),
-            "headline_decomposition_eligible": bool(existing[6])
+            "reference_period_start": ref_start_existing,
+            "reference_period_end": ref_end_existing,
+            "effective_window_days": int(existing[7]) if existing[7] is not None else None,
+            "eligible_video_count": int(existing[8]) if existing[8] is not None else None,
+            "messi_video_count": int(existing[9]) if existing[9] is not None else None,
+            "ronaldo_video_count": int(existing[10]) if existing[10] is not None else None,
+            "messi_prevalence": round(float(existing[11]), 5) if existing[11] is not None else None,
+            "ronaldo_prevalence": round(float(existing[12]), 5) if existing[12] is not None else None,
+            "focus_ratio": round(float(existing[13]), 5) if existing[13] is not None else None,
+            "fallback_used": bool(existing[14]),
+            "headline_decomposition_eligible": bool(existing[15]),
+            "override_id": existing[16]
         }
         if existing_payload == candidate_payload:
             return {
@@ -654,9 +745,9 @@ def create_or_verify_event_channel_snapshot(
         ch_type, pl_focus, assessment_result["channel_type_confidence"],
         assessment_result["player_focus_confidence"], reference_period_start.isoformat(),
         reference_period_end.isoformat(), assessment_result["effective_window_days"],
-        assessment_result["eligible_video_count"], assessment_result.get("messi_count", 0),
-        assessment_result.get("ronaldo_count", 0), assessment_result.get("messi_prevalence", 0.0),
-        assessment_result.get("ronaldo_prevalence", 0.0), assessment_result.get("focus_ratio", 1.0),
+        assessment_result["eligible_video_count"], assessment_result["messi_video_count"],
+        assessment_result["ronaldo_video_count"], round(float(assessment_result["messi_prevalence"]), 5),
+        round(float(assessment_result["ronaldo_prevalence"]), 5), round(float(assessment_result["focus_ratio"]), 5),
         fallback, headline_eligible, override_id
     ))
     conn.commit()
