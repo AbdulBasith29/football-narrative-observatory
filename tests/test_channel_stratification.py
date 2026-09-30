@@ -1230,11 +1230,40 @@ def test_event_channel_snapshot_roundtrip_ntz_timestamp_normalization():
     now_aware = datetime(2022, 12, 17, 15, 0, 0, tzinfo=timezone.utc)
     start_aware = now_aware - timedelta(days=90)
 
-    # Unit verification of normalizer helper
+    # Unit verification of normalizer helper across equivalent representations and offsets
     assert normalize_ntz_timestamp(now_aware) == "2022-12-17T15:00:00"
     assert normalize_ntz_timestamp(datetime(2022, 12, 17, 15, 0, 0)) == "2022-12-17T15:00:00"
     assert normalize_ntz_timestamp("2022-12-17T15:00:00+00:00") == "2022-12-17T15:00:00"
     assert normalize_ntz_timestamp("2022-12-17 15:00:00") == "2022-12-17T15:00:00"
+    assert normalize_ntz_timestamp("2022-12-17T15:00:00Z") == "2022-12-17T15:00:00"
+
+    # Equivalent offset strings and aware datetimes normalize consistently to UTC
+    aware_plus_3 = datetime(2022, 12, 17, 18, 0, 0, tzinfo=timezone(timedelta(hours=3)))
+    str_plus_3 = "2022-12-17T18:00:00+03:00"
+    aware_minus_5 = datetime(2022, 12, 17, 10, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
+    str_minus_5 = "2022-12-17T10:00:00-05:00"
+    assert normalize_ntz_timestamp(aware_plus_3) == "2022-12-17T15:00:00"
+    assert normalize_ntz_timestamp(str_plus_3) == "2022-12-17T15:00:00"
+    assert normalize_ntz_timestamp(aware_minus_5) == "2022-12-17T15:00:00"
+    assert normalize_ntz_timestamp(str_minus_5) == "2022-12-17T15:00:00"
+
+    # Fractional-second precision preservation (microseconds)
+    aware_500ms = datetime(2022, 12, 17, 15, 0, 0, 500000, tzinfo=timezone.utc)
+    naive_500ms = datetime(2022, 12, 17, 15, 0, 0, 500000)
+    aware_plus_3_500ms = datetime(2022, 12, 17, 18, 0, 0, 500000, tzinfo=timezone(timedelta(hours=3)))
+    str_500ms_z = "2022-12-17T15:00:00.500Z"
+    str_500ms_offset = "2022-12-17T18:00:00.500+03:00"
+    str_500ms_space = "2022-12-17 15:00:00.500"
+    str_500000ms = "2022-12-17T15:00:00.500000"
+
+    expected_500ms = "2022-12-17T15:00:00.500000"
+    assert normalize_ntz_timestamp(aware_500ms) == expected_500ms
+    assert normalize_ntz_timestamp(naive_500ms) == expected_500ms
+    assert normalize_ntz_timestamp(aware_plus_3_500ms) == expected_500ms
+    assert normalize_ntz_timestamp(str_500ms_z) == expected_500ms
+    assert normalize_ntz_timestamp(str_500ms_offset) == expected_500ms
+    assert normalize_ntz_timestamp(str_500ms_space) == expected_500ms
+    assert normalize_ntz_timestamp(str_500000ms) == expected_500ms
 
     assessment = {
         "channel_type_value": "BROAD_REACH_PUBLISHER",
@@ -1269,6 +1298,61 @@ def test_event_channel_snapshot_roundtrip_ntz_timestamp_normalization():
     )
     assert res2["status"] == "IDEMPOTENT_NOOP"
     assert res2["snapshot_key"] == res1["snapshot_key"]
+
+    # Third call with equivalent offset string (+03:00) should also succeed idempotently
+    res3 = create_or_verify_event_channel_snapshot(
+        conn, "ev-1", "ch-1", "1.1", assessment, "2022-09-18T18:00:00+03:00", "2022-12-17T18:00:00+03:00"
+    )
+    assert res3["status"] == "IDEMPOTENT_NOOP"
+
+
+def test_snapshot_immutability_violates_on_subsecond_drift():
+    """
+    Validates that changing candidate reference period end by 500 milliseconds
+    triggers SnapshotMutationViolationError instead of returning IDEMPOTENT_NOOP,
+    protecting snapshot immutability against subsecond drift.
+    """
+    db = MockSnowflakeDatabase()
+    conn = db.get_connection()
+    now_aware = datetime(2022, 12, 17, 15, 0, 0, tzinfo=timezone.utc)
+    start_aware = now_aware - timedelta(days=90)
+
+    assessment = {
+        "channel_type_value": "BROAD_REACH_PUBLISHER",
+        "player_focus_value": "MESSI_FOCUSED",
+        "channel_type_confidence": "HIGH",
+        "player_focus_confidence": "HIGH",
+        "effective_window_days": 90,
+        "eligible_video_count": 25,
+        "messi_video_count": 20,
+        "ronaldo_video_count": 1,
+        "messi_prevalence": 0.80,
+        "ronaldo_prevalence": 0.04,
+        "focus_ratio": 10.5,
+        "fallback_used": False
+    }
+
+    # Initial insert with 0 microseconds
+    res1 = create_or_verify_event_channel_snapshot(
+        conn, "ev-sub", "ch-sub", "1.1", assessment, start_aware, now_aware
+    )
+    assert res1["status"] == "INSERTED"
+
+    # Attempt re-verification with reference-period end drifted by 500ms
+    drifted_end_aware = now_aware + timedelta(milliseconds=500)
+    with pytest.raises(SnapshotMutationViolationError) as exc_info:
+        create_or_verify_event_channel_snapshot(
+            conn, "ev-sub", "ch-sub", "1.1", assessment, start_aware, drifted_end_aware
+        )
+    assert "Cannot mutate existing event snapshot" in str(exc_info.value)
+    assert "2022-12-17T15:00:00.500000" in str(exc_info.value)
+
+    # Attempt re-verification with string containing 500ms fraction
+    with pytest.raises(SnapshotMutationViolationError) as exc_info2:
+        create_or_verify_event_channel_snapshot(
+            conn, "ev-sub", "ch-sub", "1.1", assessment, start_aware, "2022-12-17T15:00:00.500Z"
+        )
+    assert "Cannot mutate existing event snapshot" in str(exc_info2.value)
 
 
 def test_focus_ratio_supports_values_exceeding_ten():
@@ -1320,8 +1404,9 @@ def test_focus_ratio_supports_values_exceeding_ten():
 
 def test_v009_idempotent_constraint_replay():
     """
-    Blocker 5: Validates that V009 migration handles uq_event_channel_stratum_snapshot
-    idempotently so replay after fresh bootstrap DDL does not raise duplicate constraint errors.
+    Validates that V009 migration handles uq_event_channel_stratum_snapshot
+    idempotently, suppressing only expected duplicate constraint errors (SQLSTATE 42710 / SQLCODE 2002 / already exists)
+    and re-raising all other failures via Snowflake exception semantics.
     """
     with open("infra/snowflake/migrations/V009__channel_stratification_and_overrides.sql", "r", encoding="utf-8") as f:
         v009 = f.read()
@@ -1330,3 +1415,7 @@ def test_v009_idempotent_constraint_replay():
     assert "uq_event_channel_stratum_snapshot" in v009
     assert "EXCEPTION" in v009
     assert "WHEN OTHER THEN" in v009
+    assert "RAISE;" in v009
+    assert "already exists" in v009
+    assert "SQLSTATE = ''42710''" in v009
+    assert "WHEN OTHER THEN\n        NULL;" not in v009

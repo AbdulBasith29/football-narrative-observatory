@@ -183,4 +183,23 @@ During exact-SHA inspection of HEAD `edc3f3a` (Actions run 36675202548):
 - **Idempotent Migration Constraint**: Wrapped `ADD CONSTRAINT uq_event_channel_stratum_snapshot` in an `EXECUTE IMMEDIATE 'BEGIN ... EXCEPTION WHEN OTHER THEN NULL; END;';` block in `V009`.
 - **Test Coverage**: Added 6 targeted regression tests in [`tests/test_channel_stratification.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/tests/test_channel_stratification.py) (74/74 passing offline).
 
+---
+
+## Incident 10: Timestamp Normalization Precision & Snowflake Exception Semantics Hardening
+
+### Context
+During exact-SHA inspection of HEAD `d34cd23` (Actions run 36697399828):
+1. **Weakened Snapshot Immutability via Timestamp Truncation**: `normalize_ntz_timestamp` in [`scripts/channel_classifier.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/scripts/channel_classifier.py) stripped fractional seconds via `.split(".")[0]` and string formatting. An exact-code probe drifting reference-period end by 500 milliseconds received `IDEMPOTENT_NOOP` instead of triggering `SnapshotMutationViolationError`. Furthermore, string timezone offsets (e.g. `+03:00`, `-05:00`) were stripped without converting to UTC, causing equivalent offset strings and timezone-aware datetimes to normalize to different values.
+2. **Silent Failure Suppression in V009 Migration**: Lines 61–70 of [`infra/snowflake/migrations/V009__channel_stratification_and_overrides.sql`](file:///c:/Users/abdul/Documents/football-narrative-observatory/infra/snowflake/migrations/V009__channel_stratification_and_overrides.sql) used `WHEN OTHER THEN NULL;`. This catch-all suppressed all errors indiscriminately (such as missing tables, permission denials, or malformed DDL), allowing a migration to falsely report success while `uq_event_channel_stratum_snapshot` remained unapplied.
+
+### Root Cause Analysis
+- **Subsecond Precision & Offset Handling**: The normalization helper assumed integer seconds was sufficient for `TIMESTAMP_NTZ` comparisons and used crude string splitting on `+` and `-`. Frozen snapshot immutability requires exact temporal boundaries; discarding fractional seconds allowed subsecond temporal mutations to evade validation. Offset strings must be parsed and converted to UTC using standard datetime conversion rather than stripped as substrings.
+- **Snowflake Exception Handling Semantics**: Snowflake Scripting allows specific inspection of `SQLSTATE`, `SQLCODE`, and `SQLERRM` within `WHEN OTHER` or `WHEN STATEMENT_ERROR` blocks. Catching all exceptions with a bare `NULL;` violates fail-closed database migration discipline. Unexpected failures must be rethrown via `RAISE;`.
+
+### Resolution
+- **Subsecond Precision & Consistent UTC Conversion**: Refactored `normalize_ntz_timestamp` to parse ISO strings, convert timezone-aware representations to UTC before casting to naive, and format using `.isoformat()`, preserving microseconds when non-zero. Confirmed that candidate payloads with 500ms drift raise `SnapshotMutationViolationError` and that equivalent aware datetimes and offset strings produce identical normalized representations.
+- **Selective Duplicate Constraint Handling in V009**: Replaced `WHEN OTHER THEN NULL;` in V009 with conditional error discrimination checking `(SQLSTATE = ''42710'' OR SQLCODE = 2002 OR SQLERRM ILIKE ''%already exists%'') THEN NULL; ELSE RAISE; END IF;`, ensuring unhandled errors immediately halt migration execution.
+- **Test Coverage**: Added tests in [`tests/test_channel_stratification.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/tests/test_channel_stratification.py) verifying fractional-second preservation, offset conversions, subsecond snapshot mutation violation, and V009 exception rethrow semantics (75/75 passing offline).
+
+
 

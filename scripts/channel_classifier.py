@@ -5,7 +5,8 @@ import hashlib
 import re
 import yaml
 import subprocess
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date, time
+from dateutil import parser as date_parser
 from ingestion_snowflake import get_snowflake_connection
 
 class ClassificationError(Exception):
@@ -43,25 +44,43 @@ def register_deduplication_rule(rule_version: str):
 
 def normalize_ntz_timestamp(val) -> str:
     """
-    Normalizes a timestamp (datetime, string, etc.) to a naive UTC ISO string
-    (YYYY-MM-DDTHH:MM:SS) matching Snowflake TIMESTAMP_NTZ round-trip semantics.
+    Normalizes a timestamp (datetime, date, ISO string, etc.) to a naive UTC ISO string
+    (YYYY-MM-DDTHH:MM:SS or YYYY-MM-DDTHH:MM:SS.ffffff) matching Snowflake TIMESTAMP_NTZ
+    semantics while preserving fractional-second precision and converting all timezones to UTC.
     """
     if val is None:
         return ""
     if isinstance(val, str):
-        val_clean = val.replace(" ", "T")
-        if val_clean.endswith("Z"):
-            val_clean = val_clean[:-1]
-        elif "+" in val_clean:
-            val_clean = val_clean.split("+")[0]
-        elif val_clean.count("-") > 2:
-            val_clean = val_clean.rsplit("-", 1)[0]
-        return val_clean.split(".")[0]
-    if hasattr(val, "astimezone") and getattr(val, "tzinfo", None) is not None:
-        val = val.astimezone(timezone.utc).replace(tzinfo=None)
-    if hasattr(val, "strftime"):
-        return val.strftime("%Y-%m-%dT%H:%M:%S")
-    return str(val).split(".")[0]
+        val_str = val.strip()
+        if not val_str:
+            return ""
+        if val_str.endswith("z") or val_str.endswith("Z"):
+            val_str = val_str[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(val_str)
+        except ValueError:
+            dt = date_parser.parse(val_str)
+    elif isinstance(val, datetime):
+        dt = val
+    elif isinstance(val, date):
+        dt = datetime.combine(val, time.min)
+    else:
+        val_str = str(val).strip()
+        if not val_str:
+            return ""
+        if val_str.endswith("z") or val_str.endswith("Z"):
+            val_str = val_str[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(val_str)
+        except Exception:
+            dt = date_parser.parse(val_str)
+
+    if dt.tzinfo is not None and dt.tzinfo.utcoffset(dt) is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    else:
+        dt = dt.replace(tzinfo=None)
+
+    return dt.isoformat()
 
 
 def load_stratification_config(config_path="config/channel_stratification.yml"):

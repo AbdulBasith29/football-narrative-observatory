@@ -65,7 +65,12 @@ BEGIN
     UNIQUE (event_version_key, channel_key, classification_protocol_version);
 EXCEPTION
     WHEN OTHER THEN
-        NULL;
+        -- Handle only expected duplicate constraint error and rethrow all other failures
+        IF (SQLSTATE = ''42710'' OR SQLCODE = 2002 OR SQLERRM ILIKE ''%already exists%'') THEN
+            NULL;
+        ELSE
+            RAISE;
+        END IF;
 END;
 ';
 ALTER TABLE CORE.BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT MODIFY COLUMN focus_ratio NUMBER(10,5);
