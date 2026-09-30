@@ -1,0 +1,70 @@
+# config/channel_stratification.yml
+# Methodology Version: 1.1 / 1.2
+# Channel Stratification & Governance Configuration
+
+configuration_status: "PENDING_HUMAN_PARAMETER_APPROVAL"
+classification_protocol_version: "1.1"
+
+# --- HUMAN DECISIONS REQUIRED (Explicitly Unapproved / Gated) ---
+
+# Re-Upload / Cross-Video-ID Content Deduplication
+# Frozen methodology requires deduplication before prevalence calculation.
+# However, the cross-video-ID detection rule is NOT frozen and requires explicit human approval.
+deduplication_rule_version: null
+deduplication_rule_status: "HUMAN_APPROVAL_REQUIRED"
+
+# Stratum Capacity (K) Application Grain
+# Option A: event x composite stratum x cohort_type (K videos total across all channels sharing the stratum)
+# Option B: event x channel x assigned composite stratum x cohort_type (up to K videos per channel in stratum)
+k_application_grain: null
+k_application_grain_status: "HUMAN_APPROVAL_REQUIRED"
+
+# External Curated Registries
+broadcaster_registry_version: null
+broadcaster_registry_status: "HUMAN_APPROVAL_REQUIRED"
+broadcasters_allowlist: []
+
+analysis_registry_version: null
+analysis_registry_status: "HUMAN_APPROVAL_REQUIRED"
+analysis_publishers_allowlist: []
+
+# Dynamic Thresholds Requiring Human Calibration
+club_dominance_winning_margin: null
+club_dominance_winning_margin_status: "HUMAN_APPROVAL_REQUIRED"
+
+analysis_topic_share_threshold: null
+analysis_topic_share_threshold_status: "HUMAN_APPROVAL_REQUIRED"
+
+combined_focus_threshold: null
+combined_focus_threshold_status: "HUMAN_APPROVAL_REQUIRED"
+
+temporal_stability_large_margin_rules: null
+temporal_stability_large_margin_status: "HUMAN_APPROVAL_REQUIRED"
+
+subwindow_min_video_count: null
+subwindow_min_video_count_status: "HUMAN_APPROVAL_REQUIRED"
+
+
+# --- FROZEN METHODOLOGY INVARIANTS (Frozen for Version 1.1/1.2) ---
+frozen_parameters:
+  # Player Focus smoothed ratio: (V_1 + alpha) / (V_2 + alpha)
+  smoothing_alpha: 1.0
+
+  # Player dominance ratio threshold
+  player_focus_ratio_threshold: 4.0
+
+  # Player prevalence floor for focus classification
+  player_prevalence_floor: 0.15
+
+  # Club dominance proportion threshold
+  club_dominance_threshold: 0.70
+
+  # Minimum distinct video evidence requirements
+  min_videos_primary_90d: 10
+  min_videos_fallback_180d: 10
+
+  # Temporal subwindow duration for stability evaluation
+  subwindow_duration_days: 30
+
+  # Standard pre-event exclusion buffer
+  exclusion_buffer_hours: 24

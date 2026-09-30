@@ -102,7 +102,8 @@ CREATE TABLE IF NOT EXISTS DIM_CHANNEL_STRATUM (
     channel_type_value VARCHAR(128) NOT NULL,
     player_focus_value VARCHAR(128) NOT NULL,
     stratum_name VARCHAR(256),
-    analytical_eligibility BOOLEAN
+    analytical_eligibility BOOLEAN,
+    CONSTRAINT uq_dim_channel_stratum UNIQUE (channel_type_value, player_focus_value)
 );
 
 CREATE TABLE IF NOT EXISTS DIM_CHANNEL_STRATUM_VERSION (

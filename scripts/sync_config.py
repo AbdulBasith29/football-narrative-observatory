@@ -250,12 +250,69 @@ def sync_channels(conn, config_path):
                               VALUES (%s, %s, %s, %s, %s)''',
                            (str(uuid.uuid4()), frame_channel_key, disc_source, disc_version, now))
 
+def sync_strata(conn):
+    """
+    Deterministically seeds and synchronizes the 30 composite strata in CORE.DIM_CHANNEL_STRATUM.
+    Analytical eligibility is TRUE only when both axes are fully resolved.
+    """
+    cursor = conn.cursor()
+    channel_types = [
+        'BROAD_REACH_PUBLISHER',
+        'CLUB_MEDIA',
+        'ANALYSIS_PUBLISHER',
+        'INDEPENDENT_CREATOR',
+        'OTHER',
+        'UNCLASSIFIED'
+    ]
+    player_foci = [
+        'MESSI_FOCUSED',
+        'RONALDO_FOCUSED',
+        'MIXED_FOCUS',
+        'NO_STRONG_DOMINANT_PLAYER_FOCUS',
+        'UNCLASSIFIED'
+    ]
+    for ct in channel_types:
+        for pf in player_foci:
+            hash_str = hashlib.md5(f"{ct}:{pf}".encode('utf-8')).hexdigest()
+            stratum_key = f"{hash_str[:8]}-{hash_str[8:12]}-{hash_str[12:16]}-{hash_str[16:20]}-{hash_str[20:32]}"
+            stratum_name = f"{ct} x {pf}"
+            analytical_eligibility = not (ct == 'UNCLASSIFIED' or pf == 'UNCLASSIFIED')
+
+            cursor.execute('''
+                SELECT stratum_key FROM CORE.DIM_CHANNEL_STRATUM
+                WHERE channel_type_value = %s AND player_focus_value = %s
+            ''', (ct, pf))
+            row = cursor.fetchone()
+            if row:
+                cursor.execute('''
+                    UPDATE CORE.DIM_CHANNEL_STRATUM
+                    SET stratum_name = %s, analytical_eligibility = %s
+                    WHERE stratum_key = %s
+                ''', (stratum_name, analytical_eligibility, row[0]))
+            else:
+                cursor.execute('''
+                    INSERT INTO CORE.DIM_CHANNEL_STRATUM
+                    (stratum_key, channel_type_value, player_focus_value, stratum_name, analytical_eligibility)
+                    VALUES (%s, %s, %s, %s, %s)
+                ''', (stratum_key, ct, pf, stratum_name, analytical_eligibility))
+
+
 if __name__ == "__main__":
+    import argparse
     from dotenv import load_dotenv
     load_dotenv()
-    conn = get_snowflake_connection(target_db=os.getenv("TARGET_DATABASE", "FOOTBALL_NARRATIVE_DEV"))
+    
+    parser = argparse.ArgumentParser(description="Synchronize Observatory configurations into Snowflake.")
+    parser.add_argument("--target-db", default=os.getenv("TARGET_DATABASE", "FOOTBALL_NARRATIVE_DEV"))
+    parser.add_argument("--frame-config", default="config/tracked_channels.yml")
+    args = parser.parse_args()
+
+    conn = get_snowflake_connection(target_db=args.target_db)
     sync_aliases(conn, "config/player_aliases.yml")
     sync_events(conn, "config/event_windows.yml")
-    sync_channels(conn, "config/tracked_channels.yml")
+    sync_channels(conn, args.frame_config)
+    sync_strata(conn)
     conn.commit()
-    print("Successfully synchronized configurations to Snowflake.")
+    conn.close()
+    print(f"Successfully synchronized configurations to {args.target_db} (frame: {args.frame_config}).")
+

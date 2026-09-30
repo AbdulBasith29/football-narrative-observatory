@@ -115,3 +115,21 @@ Replaced hardcoded hash strings in test fixtures with dynamic calls to `compute_
 - **Dynamic Pilot Frame Resolution**: Updated [`scripts/live_interruption_resume.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/scripts/live_interruption_resume.py) and [`scripts/run_test_discovery.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/scripts/run_test_discovery.py) to dynamically query `CORE.DIM_CHANNEL_FRAME_VERSION` with `WHERE frame_purpose = 'PIPELINE_PILOT' ORDER BY constructed_at DESC LIMIT 1`.
 - **Regression Test**: Added `test_unique_video_ids_observed_scoped_to_exact_discovery_unit` to [`tests/test_discovery.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/tests/test_discovery.py), asserting that for two discovery units sharing channel and event with different query hashes, Unit A's observed videos cannot increase Unit B's unique video count.
 
+---
+
+## Incident 7: Mock SQL Dispatch Collision and Manifest Evidence Serialization (Phase 1E)
+
+### Context
+During offline unit test suite development for Phase 1E (`tests/test_channel_stratification.py`):
+1. State machine transition tests intermittently fell back to raw table inserts when checking `DIM_CHANNEL_STRATUM_VERSION` because queries were misrouted to `DIM_CHANNEL_STRATUM`.
+2. Calculating the canonical SHA-256 evidence manifest hash raised `TypeError: Object of type datetime is not JSON serializable` when `published_at` datetime objects from database results were included directly in the item dictionary.
+
+### Root Cause Analysis
+- **Prefix Matching in In-Memory Mocks**: In `MockSnowflakeDatabase.execute`, simple substring checking (`if "FROM CORE.DIM_CHANNEL_STRATUM" in sql`) matched both `CORE.DIM_CHANNEL_STRATUM` and `CORE.DIM_CHANNEL_STRATUM_VERSION`, returning stratum definition records instead of version history records.
+- **JSON Serialization of Temporal Types**: Python `json.dumps(..., sort_keys=True)` does not natively serialize Python `datetime` instances without an explicit `default` serializer. Additionally, including raw Python datetime objects in canonical evidence items can cause non-deterministic formatting variations across environments.
+
+### Resolution
+- **Ordered Mock Query Dispatch**: In `MockSnowflakeDatabase`, placed more specific table name checks (`CORE.DIM_CHANNEL_STRATUM_VERSION`) before general table checks (`CORE.DIM_CHANNEL_STRATUM`), ensuring unambiguous routing.
+- **Canonical Datetime Normalization**: In `scripts/channel_classifier.py`, stripped runtime-parsed datetime fields before manifest hashing, relying strictly on ISO-8601 string timestamps (`published_at`), and added `default=str` to `json.dumps`, ensuring deterministic hash calculation across platforms.
+- **Test Coverage**: Added `test_evidence_manifest_exact_reproducibility` and `test_type_2_scd_grain_and_lifecycle` to [`tests/test_channel_stratification.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/tests/test_channel_stratification.py).
+

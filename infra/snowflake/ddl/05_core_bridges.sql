@@ -112,7 +112,9 @@ CREATE TABLE IF NOT EXISTS BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT (
     ronaldo_prevalence NUMBER(6,5),
     focus_ratio NUMBER(6,5),
     fallback_used BOOLEAN,
-    override_id VARCHAR(36)
+    headline_decomposition_eligible BOOLEAN,
+    override_id VARCHAR(36),
+    CONSTRAINT uq_event_channel_stratum_snapshot UNIQUE (event_version_key, channel_key, classification_protocol_version)
 );
 
 CREATE TABLE IF NOT EXISTS BRIDGE_COMMENT_TARGET (
