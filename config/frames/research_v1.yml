@@ -1,0 +1,16 @@
+# config/frames/research_v1.yml
+# Methodology Version: 1.2
+# Defines the RESEARCH_V1 Constructed Panel derived from approved external registries.
+# Status: PENDING_HUMAN_REGISTRY_APPROVAL
+# Invariant: No pilot channels may receive automatic membership.
+
+frame_name: "Research Panel V1"
+frame_purpose: "RESEARCH"
+methodology_version: "1.2"
+status: "PENDING_HUMAN_REGISTRY_APPROVAL"
+
+# Documented External Panel Registries (Awaiting formal human approval)
+external_registries: []
+
+# Channels belonging to the panel once approved
+channels: []
