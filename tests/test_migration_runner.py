@@ -18,12 +18,31 @@ import pytest
 from migration_runner import (
     BaselineAdoptionError,
     ConcurrentMigrationError,
+    InterruptedMigrationError,
     MigrationChecksumMismatchError,
     MigrationExecutionError,
     MigrationRunner,
     UnresolvedFailedMigrationError,
     compute_file_checksum,
 )
+
+ALL_BASELINE_OBJECTS = {
+    "DIM_CHANNEL",
+    "DIM_EVENT",
+    "DIM_VIDEO",
+    "FACT_API_REQUEST",
+    "FACT_INGESTION_RUN",
+    "BRIDGE_VIDEO_EVENT",
+    "DIM_CHANNEL_FRAME_VERSION",
+    "BRIDGE_FRAME_CHANNEL",
+    "DIM_EVENT_VERSION",
+    "DISCOVERY_UNIT_STATE",
+    "VIDEO_METADATA_RESOLUTION_STATE",
+    "FACT_VIDEO_SNAPSHOT",
+    "FACT_CHANNEL_ASSESSMENT_EVIDENCE_ITEM",
+    "CHANNEL_EVIDENCE_ACQUISITION_STATE",
+    "DIM_CHANNEL_STRATUM",
+}
 
 
 class MockSnowflakeDatabase:
@@ -36,7 +55,7 @@ class MockSnowflakeDatabase:
     ) -> None:
         self.target_db = target_db
         if existing_tables is None:
-            self.existing_tables = {"DIM_CHANNEL", "DIM_EVENT", "DIM_VIDEO"}
+            self.existing_tables = set(ALL_BASELINE_OBJECTS)
         else:
             self.existing_tables = set(existing_tables)
 
@@ -47,13 +66,19 @@ class MockSnowflakeDatabase:
         self.created_tables: Set[str] = set()
         self.execute_string_handler: Optional[Callable[[str], None]] = None
         self._last_result: List[tuple] = []
+        self.rowcount: int = 0
+
+    @property
+    def is_locked(self) -> bool:
+        return self.schema_lock is not None and self.schema_lock.get("locked_by") is not None
 
     def get_cursor(self) -> MagicMock:
         cursor = MagicMock()
-        cursor.execute.side_effect = self.execute
+        cursor.execute.side_effect = lambda sql, params=(): self.execute(sql, params, cursor)
         cursor.fetchone.side_effect = self.fetchone
         cursor.fetchall.side_effect = self.fetchall
         cursor.close.return_value = None
+        cursor.rowcount = 0
         return cursor
 
     def get_connection(self) -> MagicMock:
@@ -67,94 +92,118 @@ class MockSnowflakeDatabase:
         if self.execute_string_handler is not None:
             self.execute_string_handler(sql_content)
 
-    def execute(self, sql: str, params: tuple = ()) -> None:
+    def execute(self, sql: str, params: tuple = (), cursor: Optional[MagicMock] = None) -> None:
         self.executed_queries.append((sql, params))
         clean = " ".join(sql.strip().split())
+        clean_upper = clean.upper()
 
-        # 1. Lock check query (SELECT)
-        if (
-            clean.upper().startswith("SELECT")
-            and "OPS.SCHEMA_LOCK" in clean.upper()
-            and "WHERE LOCK_ID =" in clean.upper()
-        ):
-            if (
-                self.schema_lock
-                and self.schema_lock.get("lock_id") == params[0]
-            ):
+        # 1. Atomic UPDATE lock acquisition
+        if clean_upper.startswith("UPDATE") and "OPS.SCHEMA_LOCK" in clean_upper and "LOCKED_AT = CURRENT_TIMESTAMP()" in clean_upper:
+            user_id = params[0]
+            token = params[1]
+            lease_sec = params[2]
+            lock_id = params[3]
+
+            is_unlocked = self.schema_lock is None or self.schema_lock.get("locked_by") is None
+            is_expired = False
+            if self.schema_lock and self.schema_lock.get("locked_at"):
+                age = (datetime.datetime.now(datetime.timezone.utc) - self.schema_lock["locked_at"]).total_seconds()
+                if age >= self.schema_lock.get("lock_timeout_sec", 900):
+                    is_expired = True
+
+            if is_unlocked or is_expired:
+                self.schema_lock = {
+                    "lock_id": lock_id,
+                    "locked_at": datetime.datetime.now(datetime.timezone.utc),
+                    "locked_by": user_id,
+                    "lock_token": token,
+                    "lock_timeout_sec": lease_sec,
+                }
+                self.rowcount = 1
+            else:
+                self.rowcount = 0
+            self._last_result = []
+
+        # 2. Release lock with matching token (UPDATE SET locked_at = NULL ... WHERE lock_id = %s AND lock_token = %s)
+        elif clean_upper.startswith("UPDATE") and "OPS.SCHEMA_LOCK" in clean_upper and "LOCKED_AT = NULL" in clean_upper:
+            lock_id = params[0]
+            token = params[1]
+            if self.schema_lock and self.schema_lock.get("lock_id") == lock_id and self.schema_lock.get("lock_token") == token:
+                self.schema_lock["locked_by"] = None
+                self.schema_lock["lock_token"] = None
+                self.schema_lock["locked_at"] = None
+                self.rowcount = 1
+            else:
+                self.rowcount = 0
+            self._last_result = []
+
+        # 3. Query current lock holder (SELECT locked_by, lock_token, locked_at, lock_timeout_sec FROM ... OPS.SCHEMA_LOCK)
+        elif clean_upper.startswith("SELECT") and "OPS.SCHEMA_LOCK" in clean_upper and "WHERE LOCK_ID =" in clean_upper:
+            if self.schema_lock and self.schema_lock.get("lock_id") == params[0]:
                 self._last_result = [(
-                    self.schema_lock["lock_id"],
-                    self.schema_lock["locked_at"],
-                    self.schema_lock["locked_by"],
-                    self.schema_lock["lock_token"],
-                    self.schema_lock["lock_timeout_sec"],
+                    self.schema_lock.get("locked_by"),
+                    self.schema_lock.get("lock_token"),
+                    self.schema_lock.get("locked_at"),
+                    self.schema_lock.get("lock_timeout_sec", 900),
                 )]
             else:
                 self._last_result = []
+            self.rowcount = len(self._last_result)
 
-        # 2. Release lock with matching token (DELETE)
-        elif (
-            clean.upper().startswith("DELETE")
-            and "OPS.SCHEMA_LOCK" in clean.upper()
-            and "LOCK_TOKEN" in clean.upper()
-        ):
-            if (
-                self.schema_lock
-                and self.schema_lock.get("lock_id") == params[0]
-                and self.schema_lock.get("lock_token") == params[1]
-            ):
-                self.schema_lock = None
-            self._last_result = []
-
-        # 3. Delete lock without token (stale lease break)
-        elif (
-            clean.upper().startswith("DELETE")
-            and "OPS.SCHEMA_LOCK" in clean.upper()
-            and "WHERE LOCK_ID =" in clean.upper()
-        ):
-            if (
-                self.schema_lock
-                and self.schema_lock.get("lock_id") == params[0]
-            ):
-                self.schema_lock = None
-            self._last_result = []
-
-        # 4. Insert lock
-        elif "INSERT INTO" in clean and "OPS.SCHEMA_LOCK" in clean:
-            locked_at_val = params[1]
-            if isinstance(locked_at_val, str):
-                try:
-                    dt = datetime.datetime.fromisoformat(
-                        locked_at_val.replace("Z", "+00:00")
-                    )
-                except Exception:
-                    dt = locked_at_val
+        # 4. Information schema columns
+        elif "INFORMATION_SCHEMA.COLUMNS" in clean_upper:
+            if "PAGE_TOKEN_USED" in clean_upper:
+                has_col = any("FACT_API_REQUEST" in t for t in self.existing_tables)
+                self._last_result = [(1024,)] if has_col else []
+            elif "RUN_PURPOSE" in clean_upper:
+                count = 1 if any("FACT_INGESTION_RUN" in t for t in self.existing_tables) else 0
+                self._last_result = [(count,)]
+            elif "PRIMARY_EXCLUSION_REASON" in clean_upper:
+                count = 1 if any("BRIDGE_VIDEO_EVENT" in t for t in self.existing_tables) else 0
+                self._last_result = [(count,)]
+            elif "EVENT_TERMS" in clean_upper and "BASELINE_TERMS" not in clean_upper:
+                count = 1 if any("DIM_EVENT_VERSION" in t for t in self.existing_tables) else 0
+                self._last_result = [(count,)]
+            elif "LAST_ERROR_CODE" in clean_upper:
+                count = 1 if any("DISCOVERY_UNIT_STATE" in t for t in self.existing_tables) else 0
+                self._last_result = [(count,)]
+            elif "API_REQUEST_ID" in clean_upper:
+                count = 1 if any("FACT_VIDEO_SNAPSHOT" in t for t in self.existing_tables) else 0
+                self._last_result = [(count,)]
+            elif "BASELINE_TERMS" in clean_upper:
+                count = 1 if any("DIM_EVENT_VERSION" in t for t in self.existing_tables) else 0
+                self._last_result = [(count,)]
             else:
-                dt = locked_at_val
-            self.schema_lock = {
-                "lock_id": params[0],
-                "locked_at": dt,
-                "locked_by": params[2],
-                "lock_token": params[3],
-                "lock_timeout_sec": params[4],
-            }
-            self._last_result = []
+                self._last_result = [(1,)]
+            self.rowcount = len(self._last_result)
 
-        # 5. Information schema core table count
-        elif (
-            "information_schema.tables" in clean
-            and "table_schema = 'CORE'" in clean
-        ):
-            count = sum(
-                1 for t in ["DIM_CHANNEL", "DIM_EVENT", "DIM_VIDEO"]
-                if t in self.existing_tables
-            )
-            self._last_result = [(count,)]
+        # 5. Information schema tables
+        elif "INFORMATION_SCHEMA.TABLES" in clean_upper:
+            if "VIDEO_METADATA_RESOLUTION_STATE" in clean_upper and "FACT_CHANNEL_ASSESSMENT_EVIDENCE_ITEM" not in clean_upper:
+                count = 1 if any("VIDEO_METADATA_RESOLUTION_STATE" in t for t in self.existing_tables) else 0
+                self._last_result = [(count,)]
+            elif "FACT_CHANNEL_ASSESSMENT_EVIDENCE_ITEM" in clean_upper:
+                matched_count = sum(
+                    1 for t in ["FACT_CHANNEL_ASSESSMENT_EVIDENCE_ITEM", "CHANNEL_EVIDENCE_ACQUISITION_STATE", "DIM_CHANNEL_STRATUM"]
+                    if t in self.existing_tables
+                )
+                self._last_result = [(matched_count,)]
+            elif "DIM_CHANNEL_FRAME_VERSION" in clean_upper:
+                matched_count = sum(
+                    1 for t in ["DIM_CHANNEL_FRAME_VERSION", "BRIDGE_FRAME_CHANNEL"]
+                    if t in self.existing_tables
+                )
+                self._last_result = [(matched_count,)]
+            else:
+                matched_count = sum(1 for t in ["DIM_CHANNEL", "DIM_EVENT", "DIM_VIDEO"] if t in self.existing_tables)
+                self._last_result = [(matched_count,)]
+            self.rowcount = len(self._last_result)
 
         # 6. Retrieve ledger entries
         elif (
             "FROM" in clean
             and "OPS.SCHEMA_VERSION" in clean
-            and "ORDER BY installed_rank" in clean
+            and "ORDER BY INSTALLED_RANK" in clean_upper
         ):
             rows = []
             for e in sorted(
@@ -174,8 +223,9 @@ class MockSnowflakeDatabase:
                     e["error_message"],
                 ))
             self._last_result = rows
+            self.rowcount = len(rows)
 
-        # 7. Baseline adoption ledger insert
+        # 7. Ledger insert
         elif "INSERT INTO" in clean and "OPS.SCHEMA_VERSION" in clean:
             self.schema_version.append({
                 "installed_rank": params[0],
@@ -190,38 +240,12 @@ class MockSnowflakeDatabase:
                 "status": params[9],
                 "error_message": params[10],
             })
+            self.rowcount = 1
             self._last_result = []
 
-        # 8. Merge into ledger (IN_PROGRESS)
-        elif "MERGE INTO" in clean and "OPS.SCHEMA_VERSION" in clean:
-            ver = params[0]
-            matched = next(
-                (e for e in self.schema_version if e["version"] == ver),
-                None,
-            )
-            if matched:
-                matched["status"] = "IN_PROGRESS"
-                matched["installed_on"] = params[1]
-                matched["error_message"] = None
-            else:
-                self.schema_version.append({
-                    "installed_rank": params[2],
-                    "version": params[3],
-                    "description": params[4],
-                    "script_name": params[5],
-                    "checksum": params[6],
-                    "execution_type": params[7],
-                    "installed_by": params[8],
-                    "installed_on": params[9],
-                    "execution_time_ms": params[10],
-                    "status": params[11],
-                    "error_message": params[12],
-                })
-            self._last_result = []
-
-        # 9. Update ledger status
+        # 8. Update ledger status
         elif "UPDATE" in clean and "OPS.SCHEMA_VERSION" in clean:
-            if "status = 'SUCCESS'" in clean:
+            if "STATUS = 'SUCCESS'" in clean_upper:
                 ver = params[1]
                 matched = next(
                     (e for e in self.schema_version if e["version"] == ver),
@@ -231,7 +255,7 @@ class MockSnowflakeDatabase:
                     matched["status"] = "SUCCESS"
                     matched["execution_time_ms"] = params[0]
                     matched["error_message"] = None
-            elif "status = 'FAILED'" in clean:
+            elif "STATUS = 'FAILED'" in clean_upper:
                 ver = params[2]
                 matched = next(
                     (e for e in self.schema_version if e["version"] == ver),
@@ -241,10 +265,15 @@ class MockSnowflakeDatabase:
                     matched["status"] = "FAILED"
                     matched["execution_time_ms"] = params[0]
                     matched["error_message"] = params[1]
+            self.rowcount = 1
             self._last_result = []
 
         else:
+            self.rowcount = 0
             self._last_result = []
+
+        if cursor is not None:
+            cursor.rowcount = self.rowcount
 
     def fetchone(self) -> Optional[tuple]:
         if not self._last_result:
@@ -319,7 +348,7 @@ def test_fresh_database_execution(tmp_path: Any) -> None:
 
     mock_db = MockSnowflakeDatabase()
     assert len(mock_db.schema_version) == 0
-    assert mock_db.schema_lock is None
+    assert not mock_db.is_locked
 
     runner = MigrationRunner(
         mock_db.get_connection(),
@@ -347,7 +376,7 @@ def test_fresh_database_execution(tmp_path: Any) -> None:
     )
 
     # Verify lock lifecycle: lock acquired then released
-    assert mock_db.schema_lock is None
+    assert not mock_db.is_locked
 
     # Verify ledger rows in OPS.SCHEMA_VERSION
     assert len(mock_db.schema_version) == 3
@@ -383,13 +412,13 @@ def test_existing_database_baseline_adoption(tmp_path: Any) -> None:
     )
     with pytest.raises(BaselineAdoptionError) as exc_info:
         runner_missing.adopt_baseline(up_to_version_num=9)
-    assert "core tables do not exist" in str(exc_info.value)
+    assert "Cannot adopt baseline" in str(exc_info.value)
     assert len(mock_db_missing.schema_version) == 0
-    assert mock_db_missing.schema_lock is None
+    assert not mock_db_missing.is_locked
 
     # 2. Successful adoption when core tables exist
     mock_db = MockSnowflakeDatabase(
-        existing_tables={"DIM_CHANNEL", "DIM_EVENT", "DIM_VIDEO"}
+        existing_tables=ALL_BASELINE_OBJECTS
     )
     runner = MigrationRunner(
         mock_db.get_connection(),
@@ -405,7 +434,7 @@ def test_existing_database_baseline_adoption(tmp_path: Any) -> None:
     assert adopt_result["adopted_versions"] == [
         f"V{i:03d}" for i in range(1, 10)
     ]
-    assert mock_db.schema_lock is None
+    assert not mock_db.is_locked
 
     # Verify ledger records
     assert len(mock_db.schema_version) == 9
@@ -473,7 +502,7 @@ def test_checksum_mismatch_fails_closed(tmp_path: Any) -> None:
     executed_since = mock_db.executed_strings[executed_count_before:]
     assert not any("CREATE TABLE B" in s for s in executed_since)
     assert "V002" not in [e["version"] for e in mock_db.schema_version]
-    assert mock_db.schema_lock is None
+    assert not mock_db.is_locked
 
 
 def test_partially_applied_migration_records_failure(tmp_path: Any) -> None:
@@ -522,7 +551,7 @@ def test_partially_applied_migration_records_failure(tmp_path: Any) -> None:
 
     # V003 was never started or executed
     assert "V003" not in ledger
-    assert mock_db.schema_lock is None
+    assert not mock_db.is_locked
 
 
 def test_unresolved_failed_migration_blocks_execution(tmp_path: Any) -> None:
@@ -589,7 +618,7 @@ def test_unresolved_failed_migration_blocks_execution(tmp_path: Any) -> None:
         if "SELECT 1" in s or "SELECT 2" in s or "SELECT 3" in s
     ]
     assert len(migration_ddls) == 0
-    assert mock_db.schema_lock is None
+    assert not mock_db.is_locked
 
 
 def test_repeated_invocation_is_idempotent_noop(tmp_path: Any) -> None:
@@ -627,7 +656,7 @@ def test_repeated_invocation_is_idempotent_noop(tmp_path: Any) -> None:
         if any(f"CREATE TABLE F_{i}" in s for i in range(1, 4))
     ]
     assert len(migration_ddls) == 0
-    assert mock_db.schema_lock is None
+    assert not mock_db.is_locked
 
 
 def test_concurrent_invocation_lock_contention(tmp_path: Any) -> None:
@@ -713,7 +742,7 @@ def test_stale_lock_lease_expiration(tmp_path: Any) -> None:
     assert mock_db.schema_lock["locked_by"] == expected_user
 
     runner.release_lock(acquired_token)
-    assert mock_db.schema_lock is None
+    assert not mock_db.is_locked
 
     # 2. run_migrations breaks stale lease and runs successfully
     mock_db.schema_lock = {
@@ -726,7 +755,7 @@ def test_stale_lock_lease_expiration(tmp_path: Any) -> None:
     res = runner.run_migrations()
     assert res["status"] == "SUCCESS"
     assert res["applied_count"] == 1
-    assert mock_db.schema_lock is None
+    assert not mock_db.is_locked
 
 
 def test_ddl_auto_commit_independence(tmp_path: Any) -> None:
@@ -784,8 +813,189 @@ def test_ddl_auto_commit_independence(tmp_path: Any) -> None:
     assert ledger["V001"]["execution_time_ms"] >= 0
 
     # 3. Lock is cleanly released
-    assert mock_db.schema_lock is None
+    assert not mock_db.is_locked
 
     # 4. Subsequent run is immediately blocked by the unresolved failure
     with pytest.raises(UnresolvedFailedMigrationError):
         runner.run_migrations()
+
+
+def test_baseline_adoption_fails_if_v007_to_v009_missing(tmp_path: Any) -> None:
+    """Verifies baseline adoption fails closed if physical objects for V007..V009 are missing."""
+    migrations_dir = tmp_path / "baseline_gap_migrations"
+    migrations_dir.mkdir()
+    for i in range(1, 10):
+        (migrations_dir / f"V{i:03d}__feature_{i}.sql").write_text(
+            f"SELECT {i};", encoding="utf-8"
+        )
+
+    # Deployment has only V001..V006 objects, missing V007 (resolution state), V009 (stratification)
+    only_v001_to_v006 = {
+        "DIM_CHANNEL", "DIM_EVENT", "DIM_VIDEO",
+        "FACT_API_REQUEST", "FACT_INGESTION_RUN", "BRIDGE_VIDEO_EVENT",
+        "DIM_CHANNEL_FRAME_VERSION", "BRIDGE_FRAME_CHANNEL",
+        "DIM_EVENT_VERSION", "DISCOVERY_UNIT_STATE",
+    }
+    mock_db = MockSnowflakeDatabase(existing_tables=only_v001_to_v006)
+    runner = MigrationRunner(
+        mock_db.get_connection(),
+        migrations_dir=str(migrations_dir),
+    )
+
+    with pytest.raises(BaselineAdoptionError) as exc_info:
+        runner.adopt_baseline(up_to_version_num=9)
+
+    assert "Cannot adopt baseline V007" in str(exc_info.value)
+    # Zero records stamped in ledger
+    assert len(mock_db.schema_version) == 0
+
+
+def test_baseline_adoption_validates_existing_ledger_records(tmp_path: Any) -> None:
+    """Verifies baseline adoption checks checksum and status of pre-existing ledger rows."""
+    migrations_dir = tmp_path / "baseline_checksum_migrations"
+    migrations_dir.mkdir()
+    f1 = migrations_dir / "V001__init.sql"
+    f1.write_text("SELECT 1;", encoding="utf-8")
+    actual_hash = compute_file_checksum(str(f1))
+
+    # Case A: Checksum mismatch on pre-existing row
+    mock_db_tampered = MockSnowflakeDatabase(existing_tables=ALL_BASELINE_OBJECTS)
+    mock_db_tampered.schema_version.append({
+        "installed_rank": 1,
+        "version": "V001",
+        "description": "init",
+        "script_name": "V001__init.sql",
+        "checksum": "tampered_old_hash_12345",
+        "execution_type": "BASELINE_ADOPTION",
+        "installed_by": "SYSTEM",
+        "installed_on": "2026-10-01 00:00:00",
+        "execution_time_ms": 0,
+        "status": "SUCCESS",
+        "error_message": None,
+    })
+    runner_tampered = MigrationRunner(
+        mock_db_tampered.get_connection(),
+        migrations_dir=str(migrations_dir),
+    )
+    with pytest.raises(MigrationChecksumMismatchError) as exc_info:
+        runner_tampered.adopt_baseline(up_to_version_num=1)
+    assert "Checksum mismatch for migration V001" in str(exc_info.value)
+
+    # Case B: Pre-existing row in FAILED state
+    mock_db_failed = MockSnowflakeDatabase(existing_tables=ALL_BASELINE_OBJECTS)
+    mock_db_failed.schema_version.append({
+        "installed_rank": 1,
+        "version": "V001",
+        "description": "init",
+        "script_name": "V001__init.sql",
+        "checksum": actual_hash,
+        "execution_type": "BASELINE_ADOPTION",
+        "installed_by": "SYSTEM",
+        "installed_on": "2026-10-01 00:00:00",
+        "execution_time_ms": 0,
+        "status": "FAILED",
+        "error_message": "Prior error",
+    })
+    runner_failed = MigrationRunner(
+        mock_db_failed.get_connection(),
+        migrations_dir=str(migrations_dir),
+    )
+    with pytest.raises(UnresolvedFailedMigrationError):
+        runner_failed.adopt_baseline(up_to_version_num=1)
+
+    # Case C: Pre-existing row in IN_PROGRESS state
+    mock_db_inp = MockSnowflakeDatabase(existing_tables=ALL_BASELINE_OBJECTS)
+    mock_db_inp.schema_version.append({
+        "installed_rank": 1,
+        "version": "V001",
+        "description": "init",
+        "script_name": "V001__init.sql",
+        "checksum": actual_hash,
+        "execution_type": "MIGRATION",
+        "installed_by": "SYSTEM",
+        "installed_on": "2026-10-01 00:00:00",
+        "execution_time_ms": 0,
+        "status": "IN_PROGRESS",
+        "error_message": None,
+    })
+    runner_inp = MigrationRunner(
+        mock_db_inp.get_connection(),
+        migrations_dir=str(migrations_dir),
+    )
+    with pytest.raises(InterruptedMigrationError):
+        runner_inp.adopt_baseline(up_to_version_num=1)
+
+
+def test_interrupted_migration_in_progress_fails_closed(tmp_path: Any) -> None:
+    """Verifies that IN_PROGRESS ledger entries fail closed without automatic replay."""
+    migrations_dir = tmp_path / "interrupted_migrations"
+    migrations_dir.mkdir()
+    f1 = migrations_dir / "V001__create_table.sql"
+    f1.write_text("CREATE TABLE INT_TEST (id INT);", encoding="utf-8")
+    actual_hash = compute_file_checksum(str(f1))
+
+    mock_db = MockSnowflakeDatabase()
+    mock_db.schema_version.append({
+        "installed_rank": 1,
+        "version": "V001",
+        "description": "create_table",
+        "script_name": "V001__create_table.sql",
+        "checksum": actual_hash,
+        "execution_type": "MIGRATION",
+        "installed_by": "CRASHED_RUNNER",
+        "installed_on": "2026-10-01 00:00:00",
+        "execution_time_ms": 0,
+        "status": "IN_PROGRESS",
+        "error_message": None,
+    })
+    runner = MigrationRunner(
+        mock_db.get_connection(),
+        migrations_dir=str(migrations_dir),
+    )
+
+    # 1. When checksum matches: raises InterruptedMigrationError (never silently replayed)
+    with pytest.raises(InterruptedMigrationError) as exc_info:
+        runner.run_migrations()
+    assert "is in IN_PROGRESS state from an interrupted or crashed run" in str(exc_info.value)
+    # Status remains IN_PROGRESS; not converted to SUCCESS
+    assert mock_db.schema_version[0]["status"] == "IN_PROGRESS"
+    assert not any("INT_TEST" in s for s in mock_db.executed_strings)
+
+    # 2. When file on disk changed: raises MigrationChecksumMismatchError
+    f1.write_text("CREATE TABLE INT_TEST (id INT, tampered INT);", encoding="utf-8")
+    with pytest.raises(MigrationChecksumMismatchError) as exc_info2:
+        runner.run_migrations()
+    assert "Checksum mismatch for migration V001" in str(exc_info2.value)
+
+
+def test_migration_lock_atomic_race_and_ownership(tmp_path: Any) -> None:
+    """Verifies atomic UPDATE concurrency locking and strict token ownership on release."""
+    mock_db = MockSnowflakeDatabase()
+    runner1 = MigrationRunner(mock_db.get_connection(), target_db="FOOTBALL_NARRATIVE_DEV")
+    runner2 = MigrationRunner(mock_db.get_connection(), target_db="FOOTBALL_NARRATIVE_DEV")
+
+    # 1. Runner 1 acquires lock
+    token1 = runner1.acquire_lock(timeout_sec=900)
+    assert token1 is not None
+    assert mock_db.schema_lock["lock_token"] == token1
+
+    # 2. Runner 2 attempts acquire_lock concurrently -> fails with ConcurrentMigrationError
+    with pytest.raises(ConcurrentMigrationError) as exc_info:
+        runner2.acquire_lock(timeout_sec=900)
+    assert "is locked by" in str(exc_info.value)
+
+    # 3. Simulate Runner 1 lock expiry and Runner 2 claiming it
+    stale_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1000)
+    mock_db.schema_lock["locked_at"] = stale_time
+    token2 = runner2.acquire_lock(timeout_sec=900)
+    assert token2 != token1
+    assert mock_db.schema_lock["lock_token"] == token2
+
+    # 4. Runner 1 attempts to release with old token1 -> affects 0 rows, does NOT release Runner 2's lock
+    runner1.release_lock(token1)
+    assert mock_db.schema_lock["lock_token"] == token2
+    assert mock_db.schema_lock["locked_by"] is not None
+
+    # 5. Runner 2 releases with valid token2 -> successfully released
+    runner2.release_lock(token2)
+    assert mock_db.schema_lock["locked_by"] is None

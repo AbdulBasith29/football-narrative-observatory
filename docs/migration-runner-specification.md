@@ -48,15 +48,15 @@ CREATE TABLE IF NOT EXISTS OPS.SCHEMA_VERSION (
 ```
 
 ### 2.2 `OPS.SCHEMA_LOCK`
-Coordinates distributed concurrency to prevent simultaneous execution or statement interleaving.
+Coordinates distributed concurrency to prevent simultaneous execution or statement interleaving. Because Snowflake **does not enforce PRIMARY KEY or UNIQUE constraints** at write time on standard tables, concurrency cannot rely on constraint violation errors from concurrent `INSERT` statements. Instead, `OPS.SCHEMA_LOCK` is pre-seeded with a single persistent row (`GLOBAL_MIGRATION_LOCK`). Processes acquire the lock via an atomic conditional `UPDATE` checking `rowcount == 1`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS OPS.SCHEMA_LOCK (
-    lock_id             VARCHAR(32) NOT NULL, -- Constant: 'MIGRATION_RUNNER_LOCK'
-    locked_at           TIMESTAMP_NTZ NOT NULL,
-    locked_by           VARCHAR(128) NOT NULL,
-    lock_token          VARCHAR(36) NOT NULL, -- UUIDv4 unique to running process
-    lock_timeout_sec    NUMBER(38,0) NOT NULL DEFAULT 900, -- 15-minute lease
+    lock_id             VARCHAR(64) NOT NULL, -- Constant: 'GLOBAL_MIGRATION_LOCK'
+    locked_at           TIMESTAMP_NTZ,        -- NULL when lock is free
+    locked_by           VARCHAR(128),         -- NULL when lock is free
+    lock_token          VARCHAR(36),          -- UUIDv4 unique to running process, NULL when free
+    lock_timeout_sec    NUMBER(38,0) NOT NULL DEFAULT 900, -- 15-minute lease duration
     CONSTRAINT pk_schema_lock PRIMARY KEY (lock_id)
 );
 ```
@@ -75,41 +75,52 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
 ### Scenario 1: Fresh Database with No Ledger
 * **Initial State**: Empty or newly created database; `OPS.SCHEMA_VERSION` does not exist.
 * **Runner Action**:
-  1. Executes baseline bootstrap DDL scripts `00_database_and_schemas.sql` through `05_core_bridges.sql`.
-  2. Ensures `OPS.SCHEMA_VERSION` and `OPS.SCHEMA_LOCK` exist.
-  3. Acquires migration lock with unique UUID token.
-  4. Discovers all available migration scripts on disk (`V001` through `V010`+).
-  5. For each migration in ascending numerical order:
+  1. Ensures `OPS.SCHEMA_VERSION` and `OPS.SCHEMA_LOCK` exist (and seeds singleton `GLOBAL_MIGRATION_LOCK` row via idempotent `MERGE`).
+  2. Acquires migration lock with unique UUID token via atomic `UPDATE`.
+  3. Discovers all available migration scripts on disk (`V001` through `V010`+).
+  4. For each migration in ascending numerical order:
      - Calculates SHA-256 checksum of script file.
      - Inserts record into `OPS.SCHEMA_VERSION` with `status = 'IN_PROGRESS'`, `execution_type = 'MIGRATION'`.
      - Executes script SQL statements against the target database.
      - On completion: updates record to `status = 'SUCCESS'`, records elapsed time in milliseconds.
-  6. Releases migration lock.
+  5. Releases migration lock via atomic token-verified `UPDATE`.
 * **Outcome**: Database fully upgraded with complete ledger tracking every applied script.
 
 ---
 
 ### Scenario 2: Existing Database with No Ledger (Baseline Adoption)
 * **Initial State**: A database where Phase 1E objects already exist, but `OPS.SCHEMA_VERSION` was never created.
-* **Crucial Rule**: The runner **NEVER marks historical migrations successful merely because some expected objects exist**.
+* **Crucial Invariant**: The runner **NEVER marks historical migrations successful merely because some expected objects exist**.
 * **Runner Action**:
-  1. Creates `OPS.SCHEMA_VERSION` and `OPS.SCHEMA_LOCK`.
-  2. If invoked with standard `--migrate`:
-     - Discovers unapplied migrations starting at `V001`.
-     - Because `V001`–`V009` are idempotent (`IF NOT EXISTS`, `MERGE`, conditional constraints), they can be executed safely, or the database can be baselined explicitly.
+  1. Creates `OPS.SCHEMA_VERSION` and `OPS.SCHEMA_LOCK` (seeding singleton row).
+  2. Acquires lock with lease.
   3. If invoked with explicit baseline adoption (`--adopt-baseline V009`):
      - Validates that target migrations `V001` through `V009` exist on disk.
-     - Computes their exact SHA-256 checksums.
-     - Inserts ledger records for `V001` through `V009` with `execution_type = 'BASELINE_ADOPTION'`, `status = 'SUCCESS'`, and `execution_time_ms = 0`.
-     - **Verification Guard**: Baseline adoption verifies that core tables declared by the baseline exist before stamping the ledger. If expected core tables are missing, baseline adoption is rejected.
-     - Subsequent `--migrate` calls will resume sequentially from `V010`.
+     - **Physical Signature Verification**: For every version being adopted, inspects Snowflake metadata to verify that specific physical database objects and column contracts created by that migration exist in the target database:
+       * `V001`: `OPS.FACT_API_REQUEST.PAGE_TOKEN_USED` (length $\ge 1024$).
+       * `V002`: `OPS.FACT_INGESTION_RUN.RUN_PURPOSE`.
+       * `V003`: `CORE.BRIDGE_VIDEO_EVENT.PRIMARY_EXCLUSION_REASON`.
+       * `V004`: `CORE.DIM_EVENT_VERSION.EVENT_TERMS`.
+       * `V005`: `OPS.DISCOVERY_UNIT_STATE.LAST_ERROR_CODE`.
+       * `V006`: `OPS.VIDEO_METADATA_RESOLUTION_STATE` table.
+       * `V007`: `CORE.FACT_VIDEO_SNAPSHOT.API_REQUEST_ID`.
+       * `V008`: `CORE.DIM_EVENT_VERSION.BASELINE_TERMS`.
+       * `V009`: `OPS.FACT_CHANNEL_ASSESSMENT_EVIDENCE_ITEM`, `OPS.CHANNEL_EVIDENCE_ACQUISITION_STATE`, `CORE.DIM_CHANNEL_STRATUM`.
+       If any signature is missing, baseline adoption is rejected immediately (`BaselineAdoptionError`).
+     - **Existing Ledger Validation**: For any historical migration already present in `OPS.SCHEMA_VERSION`:
+       * Verifies disk SHA-256 matches recorded checksum (rejects with `MigrationChecksumMismatchError` on mismatch).
+       * Verifies recorded status is not `FAILED` (rejects with `UnresolvedFailedMigrationError`).
+       * Verifies recorded status is not `IN_PROGRESS` (rejects with `InterruptedMigrationError`).
+     - For unrecorded versions: inserts ledger records with `execution_type = 'BASELINE_ADOPTION'`, `status = 'SUCCESS'`, `execution_time_ms = 0`.
+     - Releases lock.
+     - Subsequent `--migrate` calls resume sequentially from `V010`.
 
 ---
 
 ### Scenario 3: Already-Applied Migrations and Checksum Changes
 * **Initial State**: Migrations `V001`–`V008` exist in `OPS.SCHEMA_VERSION` with `status = 'SUCCESS'`.
 * **Runner Action**:
-  1. For every migration already recorded as `SUCCESS` in the ledger:
+  1. For every migration already recorded in the ledger:
      - Reads the script file on disk.
      - Computes current SHA-256 checksum.
      - Compares disk checksum against the recorded `checksum` column.
@@ -118,10 +129,9 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
      - If disk checksum != recorded checksum: **FAIL CLOSED**.
        Raises `MigrationChecksumMismatchError`:
        ```text
-       FATAL: Migration V004 checksum mismatch!
-       Recorded: 3a9f...c120
-       On Disk:  8e1b...d944
-       Applied migration files are immutable and must never be altered after deployment.
+       FATAL: Checksum mismatch for migration V004 (V004__expand_event_terms.sql)!
+       Recorded in ledger (SUCCESS): 3a9f...c120, On Disk: 8e1b...d944.
+       Applied migrations are immutable.
        ```
        Execution terminates immediately. No further migrations are applied.
 
@@ -138,11 +148,12 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
      - `execution_time_ms = <elapsed>`
   3. Releases migration lock.
   4. Raises `MigrationExecutionError` and halts runner execution.
-* **Subsequent Invocations**:
-  - The runner detects a record in `OPS.SCHEMA_VERSION` with `status = 'FAILED'`.
-  - The runner **refuses to run subsequent migrations** while any migration is in `FAILED` state.
-  - Raises `UnresolvedFailedMigrationError`.
-  - Requires operator intervention: resolve the root cause, ensure idempotency, and re-run (or repair via explicit administrator intervention).
+* **Interrupted / Crashed Migrations (`IN_PROGRESS`)**:
+  - If a runner crashed or was killed midway through executing statements, `OPS.SCHEMA_VERSION` retains `status = 'IN_PROGRESS'`.
+  - On restart, the runner **never automatically replays or marks successful** an `IN_PROGRESS` migration.
+  - The runner validates the disk checksum against the `IN_PROGRESS` entry. If mismatched, raises `MigrationChecksumMismatchError`.
+  - If matched, raises `InterruptedMigrationError`.
+  - Because prior DDL committed autonomously, manual operator verification of the database state is required before resuming.
 
 ---
 
@@ -155,40 +166,48 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
   4. Releases lock.
   5. Returns clean status summary:
      ```json
-     {"status": "UP_TO_DATE", "applied_count": 0, "verified_count": 10}
+     {"status": "UP_TO_DATE", "applied_count": 0, "total_migrations": 10}
      ```
   6. Zero DDL statements are executed against Snowflake.
 
 ---
 
-### Scenario 6: Concurrent Invocation (Distributed Lock)
+### Scenario 6: Concurrent Invocation (Atomic Distributed Lock)
 * **Initial State**: Process A and Process B attempt to run migrations on the same target database simultaneously.
-* **Runner Action**:
-  1. Process A executes:
+* **Snowflake Lock Realities**: Because standard Snowflake tables do not enforce primary key uniqueness, two concurrent runners performing `INSERT` could both succeed, creating duplicate lock rows.
+* **Atomic UPDATE Pattern**:
+  1. Both processes execute an atomic `UPDATE` against the pre-seeded singleton row:
      ```sql
-     INSERT INTO OPS.SCHEMA_LOCK (lock_id, locked_at, locked_by, lock_token, lock_timeout_sec)
-     VALUES ('MIGRATION_RUNNER_LOCK', CURRENT_TIMESTAMP(), :user, :token_a, 900);
+     UPDATE OPS.SCHEMA_LOCK
+     SET locked_at = CURRENT_TIMESTAMP(),
+         locked_by = :user,
+         lock_token = :token,
+         lock_timeout_sec = 900
+     WHERE lock_id = 'GLOBAL_MIGRATION_LOCK'
+       AND (locked_by IS NULL OR DATEADD(second, lock_timeout_sec, locked_at) < CURRENT_TIMESTAMP());
      ```
-     Insert succeeds. Process A holds the lock.
-  2. Process B attempts the same insert:
-     - Primary key constraint on `lock_id = 'MIGRATION_RUNNER_LOCK'` causes insert collision error (`SQLSTATE 23505` / duplicate key).
+  2. In Snowflake, row-level updates are serialized.
+     - Process A updates the row: `cursor.rowcount == 1`. Process A acquired the lock.
+     - Process B attempts the update: `locked_by` is not NULL and lease has not expired. The condition evaluates to false: `cursor.rowcount == 0`. Process B did not acquire the lock.
   3. Process B inspects `OPS.SCHEMA_LOCK`:
-     - Reads `locked_at`, `locked_by`, `lock_timeout_sec`.
-     - Calculates elapsed time since `locked_at`.
-     - If elapsed time < `lock_timeout_sec`:
+     - Reads current `locked_by`, `lock_token`, `locked_at`, `lock_timeout_sec`.
+     - If the lease is active ($< 900$ seconds elapsed):
        Raises `ConcurrentMigrationError`:
        ```text
        Database FOOTBALL_NARRATIVE_DEV is currently locked by user 'ANALYST_A' (token: 5a2c...).
        Lock acquired at 2026-10-01T22:15:00. Lease active for 900 seconds.
        ```
        Process B terminates cleanly without executing statements.
-     - If elapsed time >= `lock_timeout_sec` (abandoned/crashed process):
-       Process B logs a stale lock warning, breaks the expired lease, takes ownership, and proceeds.
-  4. When Process A finishes, it executes:
+     - If lease has expired ($\ge 900$ seconds elapsed):
+       Process B breaks the stale lease and acquires the lock atomically.
+  4. **Strict Ownership Verification on Release**:
+     When Process A finishes, it releases the lock using:
      ```sql
-     DELETE FROM OPS.SCHEMA_LOCK WHERE lock_id = 'MIGRATION_RUNNER_LOCK' AND lock_token = :token_a;
+     UPDATE OPS.SCHEMA_LOCK
+     SET locked_at = NULL, locked_by = NULL, lock_token = NULL
+     WHERE lock_id = 'GLOBAL_MIGRATION_LOCK' AND lock_token = :token_a;
      ```
-     Lock is cleanly released in a `finally` block.
+     Verifying `lock_token = :token_a` ensures that a slow process whose lease expired cannot inadvertently release a lock that was subsequently acquired by another process.
 
 ---
 
@@ -197,8 +216,11 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
 | Invariant | Enforcement Mechanism | Failure Mode |
 | :--- | :--- | :--- |
 | **Script Immutability** | SHA-256 checksum comparison on every run | `MigrationChecksumMismatchError` (fail closed) |
-| **Concurrency Safety** | `OPS.SCHEMA_LOCK` atomic insert with 15-minute lease | `ConcurrentMigrationError` (fail closed) |
+| **Lock Atomicity** | `UPDATE OPS.SCHEMA_LOCK` singleton row condition (`rowcount == 1`) | `ConcurrentMigrationError` (fail closed; unenforced PK immune) |
+| **Lock Ownership** | `UPDATE ... WHERE lock_token = %s` on release | Prevents stale process from releasing active lock |
 | **Execution Order** | Integer version sorting (`V001` < `V002` < ... < `V010`) | Disallows out-of-order execution |
 | **Failure Halting** | Catches DDL error, updates `status = 'FAILED'`, halts runner | `MigrationExecutionError`, blocks subsequent scripts |
+| **Interrupted Safety** | Blocks replay on `IN_PROGRESS` ledger state | `InterruptedMigrationError` (fail closed on crash) |
 | **Baseline Distinction** | Explicit `execution_type`: `'MIGRATION'` vs `'BASELINE_ADOPTION'` | Never conflates inferred state with actual run |
+| **Signature Certification** | Physical table & column signature checks for V001–V009 | `BaselineAdoptionError` (rejects unverified baseline) |
 | **DDL Auto-Commit Decoupling** | Per-migration ledger accounting with elapsed time and failure reason | Accurately records partial execution state |

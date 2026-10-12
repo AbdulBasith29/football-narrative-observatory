@@ -26,12 +26,19 @@ CREATE TABLE IF NOT EXISTS OPS.SCHEMA_VERSION (
 
 CREATE TABLE IF NOT EXISTS OPS.SCHEMA_LOCK (
     lock_id             VARCHAR(32) NOT NULL,
-    locked_at           TIMESTAMP_NTZ NOT NULL,
-    locked_by           VARCHAR(128) NOT NULL,
-    lock_token          VARCHAR(36) NOT NULL,
+    locked_at           TIMESTAMP_NTZ,
+    locked_by           VARCHAR(128),
+    lock_token          VARCHAR(36),
     lock_timeout_sec    NUMBER(38,0) NOT NULL DEFAULT 900,
     CONSTRAINT pk_schema_lock PRIMARY KEY (lock_id)
 );
+
+MERGE INTO OPS.SCHEMA_LOCK AS target
+USING (SELECT 'GLOBAL_MIGRATION_LOCK' AS lock_id) AS src
+ON target.lock_id = src.lock_id
+WHEN NOT MATCHED THEN
+    INSERT (lock_id, locked_at, locked_by, lock_token, lock_timeout_sec)
+    VALUES (src.lock_id, NULL, NULL, NULL, 900);
 
 -- =============================================================================
 -- 2. OPS Schema: Primary Key Constraint Hardening

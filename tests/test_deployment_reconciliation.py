@@ -189,3 +189,117 @@ def test_constraint_column_composition_mismatch_detected():
     mismatches = [m for m in report["constraint_mismatches"] if m["constraint"] == "UQ_DISCOVERY_UNIT_STATE"]
     assert len(mismatches) == 1
     assert mismatches[0]["issue"] == "CONSTRAINT_NOT_FOUND_OR_COLUMNS_MISMATCH"
+
+
+def test_canonical_specs_covers_all_54_tables_without_phantom_columns():
+    """Verifies all 54 warehouse tables are dynamically parsed without phantom columns."""
+    specs = get_canonical_phase_1e_specs()
+    # 52 tables from DDL + 2 from V010 (OPS.SCHEMA_VERSION, OPS.SCHEMA_LOCK)
+    assert len(specs) == 54
+
+    bridge_key = "CORE.BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT"
+    assert bridge_key in specs
+    # Verify phantom columns reported in review do not exist in parsed specs
+    assert "SNAPSHOT_CREATED_AT" not in specs[bridge_key].columns
+    assert "ASSESSMENT_ID" not in specs[bridge_key].columns
+
+
+def test_reconcile_live_with_show_commands_success():
+    """Verifies reconcile_live issues native SHOW PRIMARY/UNIQUE KEYS commands."""
+    from unittest.mock import MagicMock
+
+    specs = get_canonical_phase_1e_specs()
+    tables_meta, columns_meta, constraints_meta = build_perfect_metadata(specs)
+
+    cursor = MagicMock()
+    # Mock return values for queries in reconcile_live:
+    # 1. tables query
+    # 2. columns query
+    # 3. SHOW PRIMARY KEYS
+    # 4. SHOW UNIQUE KEYS
+    tables_rows = [(r["table_schema"], r["table_name"], r["table_type"]) for r in tables_meta]
+    columns_rows = [
+        (
+            r["table_schema"],
+            r["table_name"],
+            r["column_name"],
+            r["data_type"],
+            r["is_nullable"],
+            r["character_maximum_length"],
+            r["numeric_precision"],
+            r["numeric_scale"],
+        )
+        for r in columns_meta
+    ]
+
+    pk_rows = [
+        ("FOOTBALL_NARRATIVE_DEV", r["table_schema"], r["table_name"], r["column_name"], 1, r["constraint_name"])
+        for r in constraints_meta
+        if r["constraint_type"] == "PRIMARY KEY"
+    ]
+    uq_rows = [
+        ("FOOTBALL_NARRATIVE_DEV", r["table_schema"], r["table_name"], r["column_name"], 1, r["constraint_name"])
+        for r in constraints_meta
+        if r["constraint_type"] == "UNIQUE"
+    ]
+
+    executed_queries = []
+
+    def mock_execute(sql, *args):
+        executed_queries.append(sql)
+        if "information_schema.tables" in sql:
+            cursor.description = [("table_schema",), ("table_name",), ("table_type",)]
+            cursor.fetchall.return_value = tables_rows
+        elif "information_schema.columns" in sql:
+            cursor.description = [
+                ("table_schema",), ("table_name",), ("column_name",), ("data_type",),
+                ("is_nullable",), ("character_maximum_length",), ("numeric_precision",), ("numeric_scale",)
+            ]
+            cursor.fetchall.return_value = columns_rows
+        elif "SHOW PRIMARY KEYS" in sql:
+            cursor.description = [
+                ("database_name",), ("schema_name",), ("table_name",), ("column_name",),
+                ("key_sequence",), ("constraint_name",)
+            ]
+            cursor.fetchall.return_value = pk_rows
+        elif "SHOW UNIQUE KEYS" in sql:
+            cursor.description = [
+                ("database_name",), ("schema_name",), ("table_name",), ("column_name",),
+                ("key_sequence",), ("constraint_name",)
+            ]
+            cursor.fetchall.return_value = uq_rows
+
+    cursor.execute.side_effect = mock_execute
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+
+    reconciler = DeploymentReconciler(canonical_specs=specs)
+    report = reconciler.reconcile_live(conn, target_db="FOOTBALL_NARRATIVE_DEV")
+
+    assert report["has_drift"] is False
+    assert any("SHOW PRIMARY KEYS IN DATABASE FOOTBALL_NARRATIVE_DEV" in q for q in executed_queries)
+    assert any("SHOW UNIQUE KEYS IN DATABASE FOOTBALL_NARRATIVE_DEV" in q for q in executed_queries)
+
+
+def test_reconcile_live_fails_closed_on_constraint_query_error():
+    """Verifies reconcile_live fails closed when SHOW constraint query fails."""
+    import pytest
+    from unittest.mock import MagicMock
+
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+
+    def mock_execute(sql, *args):
+        if "SHOW PRIMARY KEYS" in sql:
+            raise RuntimeError("001003: Insufficient privileges to view database constraints")
+
+    cursor.execute.side_effect = mock_execute
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+
+    reconciler = DeploymentReconciler()
+    with pytest.raises(RuntimeError) as exc_info:
+        reconciler.reconcile_live(conn, target_db="FOOTBALL_NARRATIVE_DEV")
+
+    assert "Failed to query PRIMARY KEY constraints" in str(exc_info.value)
+    assert "Insufficient privileges" in str(exc_info.value)

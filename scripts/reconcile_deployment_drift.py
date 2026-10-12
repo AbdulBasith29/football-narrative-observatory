@@ -1,7 +1,7 @@
 """Observatory Deployment Reconciliation Tool.
 
-Performs read-only comparison of live Snowflake information_schema against
-merged repository definitions (Phase 1E baseline: infra/snowflake/ddl + V001-V009).
+Performs read-only comparison of live Snowflake metadata against
+canonical repository definitions (infra/snowflake/ddl + V010 hardening).
 
 Checks:
 - Table presence across RAW, OPS, CORE, ML, MARTS
@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import glob
 import json
+import os
+import re
 import sys
 from typing import Any, Dict, List, Optional
 
@@ -43,312 +46,204 @@ class TableSpec:
     constraints: Dict[str, ConstraintSpec] = dataclasses.field(default_factory=dict)
 
 
-def get_canonical_phase_1e_specs() -> Dict[str, TableSpec]:
-    """Returns canonical TableSpecs for all expected Phase 1E warehouse tables."""
+def split_table_elements(body: str) -> List[str]:
+    """Splits a CREATE TABLE definition body by top-level commas."""
+    elements: List[str] = []
+    current: List[str] = []
+    depth = 0
+    in_quote = False
+    for ch in body:
+        if ch == "'" and not in_quote:
+            in_quote = True
+        elif ch == "'" and in_quote:
+            in_quote = False
+        elif not in_quote:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                elements.append("".join(current).strip())
+                current = []
+                continue
+        current.append(ch)
+    if current:
+        elements.append("".join(current).strip())
+    return [e for e in elements if e]
+
+
+def parse_column_and_constraints(elem: str, table_spec: TableSpec) -> None:
+    """Parses a single element (column or constraint) into TableSpec."""
+    # Table-level named PRIMARY KEY
+    m_con_pk = re.match(r"CONSTRAINT\s+([A-Za-z0-9_]+)\s+PRIMARY\s+KEY\s*\((.*?)\)", elem, re.IGNORECASE)
+    if m_con_pk:
+        con_name = m_con_pk.group(1).upper()
+        cols = [c.strip().upper() for c in m_con_pk.group(2).split(",")]
+        table_spec.constraints[con_name] = ConstraintSpec(con_name, "PRIMARY KEY", cols)
+        return
+
+    # Table-level named UNIQUE
+    m_con_uq = re.match(r"CONSTRAINT\s+([A-Za-z0-9_]+)\s+UNIQUE\s*\((.*?)\)", elem, re.IGNORECASE)
+    if m_con_uq:
+        con_name = m_con_uq.group(1).upper()
+        cols = [c.strip().upper() for c in m_con_uq.group(2).split(",")]
+        table_spec.constraints[con_name] = ConstraintSpec(con_name, "UNIQUE", cols)
+        return
+
+    # Table-level unnamed PRIMARY KEY
+    m_pk = re.match(r"PRIMARY\s+KEY\s*\((.*?)\)", elem, re.IGNORECASE)
+    if m_pk:
+        con_name = f"PK_{table_spec.table_name}"
+        cols = [c.strip().upper() for c in m_pk.group(1).split(",")]
+        table_spec.constraints[con_name] = ConstraintSpec(con_name, "PRIMARY KEY", cols)
+        return
+
+    # Table-level unnamed UNIQUE
+    m_uq = re.match(r"UNIQUE\s*\((.*?)\)", elem, re.IGNORECASE)
+    if m_uq:
+        con_name = f"UQ_{table_spec.table_name}"
+        cols = [c.strip().upper() for c in m_uq.group(1).split(",")]
+        table_spec.constraints[con_name] = ConstraintSpec(con_name, "UNIQUE", cols)
+        return
+
+    # Column definition: col_name type[(params)] [NOT NULL] [PRIMARY KEY] [DEFAULT ...]
+    tokens = elem.split()
+    if not tokens:
+        return
+    col_name = tokens[0].upper()
+    col_def_upper = elem.upper()
+
+    type_part = tokens[1].upper() if len(tokens) > 1 else "VARCHAR"
+    type_match = re.match(r"^([A-Z0-9_]+)(?:\((.*?)\))?", type_part)
+    if not type_match:
+        data_type = type_part
+        length = None
+        prec = None
+        scale = None
+    else:
+        data_type = type_match.group(1)
+        params = type_match.group(2)
+        length = None
+        prec = None
+        scale = None
+        if params:
+            parts = [p.strip() for p in params.split(",")]
+            if len(parts) == 1:
+                if data_type in ("VARCHAR", "CHAR", "STRING", "TEXT"):
+                    length = int(parts[0])
+                elif data_type in ("NUMBER", "NUMERIC", "DECIMAL", "INT", "INTEGER"):
+                    prec = int(parts[0])
+                    scale = 0
+            elif len(parts) == 2:
+                prec = int(parts[0])
+                scale = int(parts[1])
+
+    is_not_null = "NOT NULL" in col_def_upper or "PRIMARY KEY" in col_def_upper
+    is_nullable = "NO" if is_not_null else "YES"
+
+    if data_type in ("NUMBER", "NUMERIC", "DECIMAL", "INT", "INTEGER", "BIGINT") and prec is None:
+        prec = 38
+        scale = 0
+
+    col_spec = ColumnSpec(col_name, data_type, is_nullable, length, prec, scale)
+    table_spec.columns[col_name] = col_spec
+
+    # Inline PRIMARY KEY
+    if "PRIMARY KEY" in col_def_upper:
+        con_name = f"PK_{table_spec.table_name}"
+        if con_name not in table_spec.constraints:
+            table_spec.constraints[con_name] = ConstraintSpec(con_name, "PRIMARY KEY", [col_name])
+
+
+def parse_ddl_content(content: str, default_schema: str, specs: Dict[str, TableSpec]) -> None:
+    """Parses SQL DDL text into TableSpecs, registering tables and ALTER TABLE constraints."""
+    lines = []
+    for line in content.splitlines():
+        l_strip = line.strip()
+        if l_strip.startswith("--"):
+            continue
+        if "--" in line:
+            line = line.split("--")[0]
+        lines.append(line)
+    text = "\n".join(lines)
+
+    current_schema = default_schema
+    schema_match = re.search(r"USE\s+SCHEMA\s+([A-Za-z0-9_]+)", text, re.IGNORECASE)
+    if schema_match:
+        current_schema = schema_match.group(1).upper()
+
+    # Match CREATE TABLE statements
+    pattern = re.compile(
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_.]+)\s*\((.*?)\);",
+        re.DOTALL | re.IGNORECASE,
+    )
+    for tbl_name_raw, body in pattern.findall(text):
+        if "." in tbl_name_raw:
+            parts = tbl_name_raw.split(".")
+            s = parts[-2].upper()
+            t = parts[-1].upper()
+        else:
+            s, t = current_schema, tbl_name_raw.upper()
+
+        col_dict: Dict[str, ColumnSpec] = {}
+        con_dict: Dict[str, ConstraintSpec] = {}
+        table_spec = TableSpec(table_schema=s, table_name=t, columns=col_dict, constraints=con_dict)
+        for elem in split_table_elements(body):
+            parse_column_and_constraints(elem, table_spec)
+        tkey = f"{s}.{t}"
+        specs[tkey] = table_spec
+
+    # Match ALTER TABLE ADD CONSTRAINT statements
+    con_pattern = re.compile(
+        r"ALTER\s+TABLE\s+([A-Za-z0-9_.]+)\s+ADD\s+CONSTRAINT\s+([A-Za-z0-9_]+)\s+(PRIMARY\s+KEY|UNIQUE)\s*\((.*?)\)",
+        re.IGNORECASE,
+    )
+    for tbl_name_raw, con_name, con_type, cols_raw in con_pattern.findall(text):
+        if "." in tbl_name_raw:
+            parts = tbl_name_raw.split(".")
+            s = parts[-2].upper()
+            t = parts[-1].upper()
+        else:
+            s, t = current_schema, tbl_name_raw.upper()
+        tkey = f"{s}.{t}"
+        if tkey in specs:
+            cols = [c.strip().upper() for c in cols_raw.split(",")]
+            specs[tkey].constraints[con_name.upper()] = ConstraintSpec(
+                constraint_name=con_name.upper(),
+                constraint_type=con_type.upper(),
+                column_names=cols,
+            )
+
+
+def get_canonical_phase_1e_specs(base_dir: Optional[str] = None) -> Dict[str, TableSpec]:
+    """Returns canonical TableSpecs parsed from repository DDL files and V010 migration.
+
+    Covers all 54 warehouse tables across RAW, OPS, and CORE without hardcoded drift.
+    """
+    if base_dir is None:
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
     specs: Dict[str, TableSpec] = {}
+    ddl_dir = os.path.join(base_dir, "infra", "snowflake", "ddl")
 
-    def add_table(schema: str, name: str, cols: List[ColumnSpec], cons: Optional[List[ConstraintSpec]] = None):
-        key = f"{schema.upper()}.{name.upper()}"
-        col_map = {c.column_name.upper(): c for c in cols}
-        con_map = {cn.constraint_name.upper(): cn for cn in (cons or [])}
-        specs[key] = TableSpec(table_schema=schema.upper(), table_name=name.upper(), columns=col_map, constraints=con_map)
+    # 1. Parse repository DDL files in ordered sequence
+    for f in sorted(glob.glob(os.path.join(ddl_dir, "*.sql"))):
+        if os.path.basename(f).startswith("00_"):
+            continue
+        with open(f, "r", encoding="utf-8") as fh:
+            parse_ddl_content(fh.read(), "PUBLIC", specs)
 
-    # -------------------------------------------------------------------------
-    # RAW SCHEMA
-    # -------------------------------------------------------------------------
-    add_table(
-        "RAW", "YOUTUBE_API_RESPONSE",
-        [
-            ColumnSpec("RAW_RESPONSE_ID", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("API_REQUEST_ID", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("INGESTION_RUN_ID", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("SOURCE_SYSTEM", "VARCHAR", "NO", character_maximum_length=128),
-            ColumnSpec("ENDPOINT", "VARCHAR", "NO", character_maximum_length=128),
-            ColumnSpec("RESOURCE_SCOPE_TYPE", "VARCHAR", "NO", character_maximum_length=128),
-            ColumnSpec("RESOURCE_SCOPE_ID", "VARCHAR", "NO", character_maximum_length=128),
-            ColumnSpec("REQUEST_PARAMETERS", "VARIANT", "NO"),
-            ColumnSpec("HTTP_STATUS", "NUMBER", "YES", numeric_precision=3, numeric_scale=0),
-            ColumnSpec("PAGE_TOKEN_USED", "VARCHAR", "YES", character_maximum_length=1024),
-            ColumnSpec("NEXT_PAGE_TOKEN_RETURNED", "VARCHAR", "YES", character_maximum_length=1024),
-            ColumnSpec("RETRIEVED_AT", "TIMESTAMP_NTZ", "NO"),
-            ColumnSpec("RAW_JSON_PAYLOAD", "VARIANT", "NO"),
-            ColumnSpec("PAYLOAD_HASH", "VARCHAR", "NO", character_maximum_length=64),
-            ColumnSpec("PARSER_VERSION", "VARCHAR", "YES", character_maximum_length=128),
-            ColumnSpec("SOURCE_SCHEMA_VERSION", "VARCHAR", "YES", character_maximum_length=128),
-        ],
-        [
-            ConstraintSpec("PK_YOUTUBE_API_RESPONSE", "PRIMARY KEY", ["RAW_RESPONSE_ID"]),
-            ConstraintSpec("UQ_API_REQUEST_ID", "UNIQUE", ["API_REQUEST_ID"]),
-        ]
+    # 2. Parse V010 hardening migration (adds OPS.SCHEMA_VERSION, OPS.SCHEMA_LOCK, and PK/UQ constraints)
+    v010_path = os.path.join(
+        base_dir,
+        "infra",
+        "snowflake",
+        "migrations",
+        "V010__contract_hardening_and_schema_version.sql",
     )
-
-    # -------------------------------------------------------------------------
-    # OPS SCHEMA
-    # -------------------------------------------------------------------------
-    add_table(
-        "OPS", "FACT_INGESTION_RUN",
-        [
-            ColumnSpec("INGESTION_RUN_ID", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("RESOURCE_SCOPE_ID", "VARCHAR", "NO", character_maximum_length=128),
-            ColumnSpec("SOURCE_SYSTEM", "VARCHAR", "NO", character_maximum_length=128),
-            ColumnSpec("ENDPOINT", "VARCHAR", "NO", character_maximum_length=128),
-            ColumnSpec("RESOURCE_SCOPE_TYPE", "VARCHAR", "NO", character_maximum_length=128),
-            ColumnSpec("STARTED_AT", "TIMESTAMP_NTZ", "NO"),
-            ColumnSpec("COMPLETED_AT", "TIMESTAMP_NTZ", "YES"),
-            ColumnSpec("PAGES_REQUESTED", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("PAGES_SUCCEEDED", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("RECORDS_OBSERVED", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("RECORDS_INSERTED", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("DUPLICATE_RECORDS_OBSERVED", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("ERROR_CODE", "VARCHAR", "YES", character_maximum_length=128),
-            ColumnSpec("RUN_OUTCOME", "VARCHAR", "YES", character_maximum_length=64),
-            ColumnSpec("CONTINUITY_STATUS", "VARCHAR", "YES", character_maximum_length=64),
-            ColumnSpec("RUN_PURPOSE", "VARCHAR", "YES", character_maximum_length=64),
-        ]
-    )
-
-    add_table(
-        "OPS", "DISCOVERY_UNIT_STATE",
-        [
-            ColumnSpec("DISCOVERY_UNIT_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("FRAME_VERSION_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("CHANNEL_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("WINDOW_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("DISCOVERY_POLICY_VERSION", "VARCHAR", "NO", character_maximum_length=64),
-            ColumnSpec("QUERY_HASH", "VARCHAR", "NO", character_maximum_length=64),
-            ColumnSpec("QUERY_BATCH_NUMBER", "NUMBER", "NO", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("SEARCH_QUERY", "VARCHAR", "NO", character_maximum_length=1024),
-            ColumnSpec("STATUS", "VARCHAR", "NO", character_maximum_length=32),
-            ColumnSpec("PAGES_COMPLETED", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("NEXT_PAGE_TOKEN", "VARCHAR", "YES", character_maximum_length=2048),
-            ColumnSpec("ITEMS_OBSERVED", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("UNIQUE_VIDEO_IDS_OBSERVED", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("SEARCH_CALLS_CONSUMED", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("STARTED_AT", "TIMESTAMP_NTZ", "YES"),
-            ColumnSpec("UPDATED_AT", "TIMESTAMP_NTZ", "NO"),
-            ColumnSpec("COMPLETED_AT", "TIMESTAMP_NTZ", "YES"),
-            ColumnSpec("LAST_ERROR_CODE", "VARCHAR", "YES", character_maximum_length=128),
-            ColumnSpec("LAST_ERROR_MESSAGE", "VARCHAR", "YES", character_maximum_length=1024),
-            ColumnSpec("FIRST_INGESTION_RUN_ID", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("LATEST_INGESTION_RUN_ID", "VARCHAR", "NO", character_maximum_length=36),
-        ],
-        [
-            ConstraintSpec("PK_DISCOVERY_UNIT_STATE", "PRIMARY KEY", ["DISCOVERY_UNIT_KEY"]),
-            ConstraintSpec(
-                "UQ_DISCOVERY_UNIT_STATE", "UNIQUE",
-                ["FRAME_VERSION_KEY", "CHANNEL_KEY", "WINDOW_KEY", "DISCOVERY_POLICY_VERSION", "QUERY_HASH"]
-            ),
-        ]
-    )
-
-    add_table(
-        "OPS", "FACT_CHANNEL_CLASSIFICATION_ASSESSMENT",
-        [
-            ColumnSpec("ASSESSMENT_ID", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("CHANNEL_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("ASSESSED_AT", "TIMESTAMP_NTZ", "NO"),
-            ColumnSpec("ASSESSMENT_TRIGGER", "VARCHAR", "YES", character_maximum_length=64),
-            ColumnSpec("EVENT_VERSION_KEY", "VARCHAR", "YES", character_maximum_length=36),
-            ColumnSpec("CLASSIFICATION_PROTOCOL_VERSION", "VARCHAR", "YES", character_maximum_length=64),
-            ColumnSpec("RULE_CONFIG_VERSION", "VARCHAR", "YES", character_maximum_length=64),
-            ColumnSpec("RULE_CONFIG_HASH", "VARCHAR", "YES", character_maximum_length=64),
-            ColumnSpec("EVIDENCE_MANIFEST_HASH", "VARCHAR", "YES", character_maximum_length=64),
-            ColumnSpec("CHANNEL_TYPE_VALUE", "VARCHAR", "YES", character_maximum_length=64),
-            ColumnSpec("PLAYER_FOCUS_VALUE", "VARCHAR", "YES", character_maximum_length=64),
-            ColumnSpec("CHANNEL_TYPE_CONFIDENCE", "VARCHAR", "YES", character_maximum_length=32),
-            ColumnSpec("PLAYER_FOCUS_CONFIDENCE", "VARCHAR", "YES", character_maximum_length=32),
-            ColumnSpec("REFERENCE_PERIOD_START", "TIMESTAMP_NTZ", "YES"),
-            ColumnSpec("REFERENCE_PERIOD_END", "TIMESTAMP_NTZ", "YES"),
-            ColumnSpec("EFFECTIVE_WINDOW_DAYS", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("ELIGIBLE_VIDEO_COUNT", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("MESSI_VIDEO_COUNT", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("RONALDO_VIDEO_COUNT", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("MESSI_PREVALENCE", "NUMBER", "YES", numeric_precision=6, numeric_scale=5),
-            ColumnSpec("RONALDO_PREVALENCE", "NUMBER", "YES", numeric_precision=6, numeric_scale=5),
-            ColumnSpec("FOCUS_RATIO", "NUMBER", "YES", numeric_precision=10, numeric_scale=5),
-            ColumnSpec("FALLBACK_USED", "BOOLEAN", "YES"),
-            ColumnSpec("DEDUPLICATION_RULE_VERSION", "VARCHAR", "YES", character_maximum_length=64),
-            ColumnSpec("CHANNEL_TYPE_EVIDENCE", "VARIANT", "YES"),
-            ColumnSpec("PLAYER_FOCUS_EVIDENCE", "VARIANT", "YES"),
-            ColumnSpec("GIT_COMMIT_SHA", "VARCHAR", "YES", character_maximum_length=40),
-            ColumnSpec("INGESTION_RUN_ID", "VARCHAR", "YES", character_maximum_length=36),
-        ],
-        [ConstraintSpec("PK_FACT_CHANNEL_CLASSIFICATION_ASSESSMENT", "PRIMARY KEY", ["ASSESSMENT_ID"])]
-    )
-
-    add_table(
-        "OPS", "FACT_CHANNEL_ASSESSMENT_EVIDENCE_ITEM",
-        [
-            ColumnSpec("ASSESSMENT_EVIDENCE_ITEM_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("ASSESSMENT_ID", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("CHANNEL_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("VIDEO_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("SOURCE_VIDEO_ID", "VARCHAR", "NO", character_maximum_length=128),
-            ColumnSpec("PUBLISHED_AT", "TIMESTAMP_NTZ", "NO"),
-            ColumnSpec("DURATION_SECONDS", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("IS_SHORT", "BOOLEAN", "YES"),
-            ColumnSpec("RAW_RESPONSE_ID", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("API_REQUEST_ID", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("MESSI_ALIAS_MATCHED", "BOOLEAN", "NO"),
-            ColumnSpec("RONALDO_ALIAS_MATCHED", "BOOLEAN", "NO"),
-            ColumnSpec("MATCHED_PLAYER_ALIASES", "VARIANT", "YES"),
-            ColumnSpec("MATCHED_CLUB_ENTITIES", "VARIANT", "YES"),
-            ColumnSpec("MATCHED_ANALYSIS_TOPICS", "VARIANT", "YES"),
-            ColumnSpec("IS_DEDUPLICATED_DUPLICATE", "BOOLEAN", "NO"),
-            ColumnSpec("DEDUPLICATION_CLUSTER_ID", "VARCHAR", "YES", character_maximum_length=64),
-            ColumnSpec("INCLUDED_IN_PREVALENCE", "BOOLEAN", "NO"),
-        ],
-        [
-            ConstraintSpec("PK_ASSESSMENT_EVIDENCE_ITEM", "PRIMARY KEY", ["ASSESSMENT_EVIDENCE_ITEM_KEY"]),
-            ConstraintSpec("UQ_ASSESSMENT_VIDEO_EVIDENCE", "UNIQUE", ["ASSESSMENT_ID", "VIDEO_KEY"]),
-        ]
-    )
-
-    add_table(
-        "OPS", "CHANNEL_EVIDENCE_ACQUISITION_STATE",
-        [
-            ColumnSpec("ACQUISITION_STATE_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("FRAME_VERSION_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("CHANNEL_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("SOURCE_CHANNEL_ID", "VARCHAR", "NO", character_maximum_length=128),
-            ColumnSpec("UPLOADS_PLAYLIST_ID", "VARCHAR", "NO", character_maximum_length=128),
-            ColumnSpec("SCAN_SCOPE", "VARCHAR", "NO", character_maximum_length=32),
-            ColumnSpec("WINDOW_START_AT", "TIMESTAMP_NTZ", "NO"),
-            ColumnSpec("WINDOW_END_AT", "TIMESTAMP_NTZ", "NO"),
-            ColumnSpec("STATUS", "VARCHAR", "NO", character_maximum_length=32),
-            ColumnSpec("NEXT_PAGE_TOKEN", "VARCHAR", "YES", character_maximum_length=2048),
-            ColumnSpec("PAGES_COMPLETED", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("OLDEST_OBSERVED_PUBLISHED_AT", "TIMESTAMP_NTZ", "YES"),
-            ColumnSpec("ITEMS_OBSERVED", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("ELIGIBLE_VIDEOS_OBSERVED", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("API_CALLS_CONSUMED", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("FIRST_INGESTION_RUN_ID", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("LATEST_INGESTION_RUN_ID", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("LAST_API_REQUEST_ID", "VARCHAR", "YES", character_maximum_length=36),
-            ColumnSpec("RETRY_COUNT", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("LAST_ERROR_CODE", "VARCHAR", "YES", character_maximum_length=128),
-            ColumnSpec("LAST_ERROR_MESSAGE", "VARCHAR", "YES", character_maximum_length=1024),
-            ColumnSpec("STARTED_AT", "TIMESTAMP_NTZ", "YES"),
-            ColumnSpec("UPDATED_AT", "TIMESTAMP_NTZ", "NO"),
-            ColumnSpec("COMPLETED_AT", "TIMESTAMP_NTZ", "YES"),
-        ],
-        [
-            ConstraintSpec("PK_CHANNEL_EVIDENCE_ACQUISITION_STATE", "PRIMARY KEY", ["ACQUISITION_STATE_KEY"]),
-            ConstraintSpec("UQ_CHANNEL_EVIDENCE_SCOPE", "UNIQUE", ["FRAME_VERSION_KEY", "CHANNEL_KEY", "WINDOW_END_AT", "SCAN_SCOPE"]),
-        ]
-    )
-
-    add_table(
-        "OPS", "VIDEO_METADATA_RESOLUTION_STATE",
-        [
-            ColumnSpec("RESOLUTION_STATE_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("SOURCE_SYSTEM", "VARCHAR", "NO", character_maximum_length=128),
-            ColumnSpec("SOURCE_ID", "VARCHAR", "NO", character_maximum_length=128),
-            ColumnSpec("RESOLUTION_STATUS", "VARCHAR", "NO", character_maximum_length=64),
-            ColumnSpec("FIRST_DISCOVERED_AT", "TIMESTAMP_NTZ", "NO"),
-            ColumnSpec("RESOLVED_AT", "TIMESTAMP_NTZ", "YES"),
-            ColumnSpec("UPDATED_AT", "TIMESTAMP_NTZ", "NO"),
-            ColumnSpec("API_REQUEST_ID", "VARCHAR", "YES", character_maximum_length=36),
-            ColumnSpec("RAW_RESPONSE_ID", "VARCHAR", "YES", character_maximum_length=36),
-            ColumnSpec("FIRST_INGESTION_RUN_ID", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("LATEST_INGESTION_RUN_ID", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("LAST_ERROR_CODE", "VARCHAR", "YES", character_maximum_length=128),
-            ColumnSpec("LAST_ERROR_MESSAGE", "VARCHAR", "YES", character_maximum_length=1024),
-            ColumnSpec("RETRY_COUNT", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-        ],
-        [
-            ConstraintSpec("PK_VIDEO_METADATA_RESOLUTION_STATE", "PRIMARY KEY", ["RESOLUTION_STATE_KEY"]),
-            ConstraintSpec("UQ_VIDEO_METADATA_RESOLUTION_STATE", "UNIQUE", ["SOURCE_SYSTEM", "SOURCE_ID"]),
-        ]
-    )
-
-    # -------------------------------------------------------------------------
-    # CORE SCHEMA (Selected high-audit tables)
-    # -------------------------------------------------------------------------
-    add_table(
-        "CORE", "DIM_CHANNEL_STRATUM",
-        [
-            ColumnSpec("STRATUM_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("CHANNEL_TYPE_VALUE", "VARCHAR", "NO", character_maximum_length=128),
-            ColumnSpec("PLAYER_FOCUS_VALUE", "VARCHAR", "NO", character_maximum_length=128),
-            ColumnSpec("STRATUM_NAME", "VARCHAR", "YES", character_maximum_length=256),
-            ColumnSpec("ANALYTICAL_ELIGIBILITY", "BOOLEAN", "YES"),
-        ],
-        [
-            ConstraintSpec("PK_DIM_CHANNEL_STRATUM", "PRIMARY KEY", ["STRATUM_KEY"]),
-            ConstraintSpec("UQ_DIM_CHANNEL_STRATUM", "UNIQUE", ["CHANNEL_TYPE_VALUE", "PLAYER_FOCUS_VALUE"]),
-        ]
-    )
-
-    add_table(
-        "CORE", "BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT",
-        [
-            ColumnSpec("EVENT_CHANNEL_STRATUM_SNAPSHOT_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("EVENT_VERSION_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("CHANNEL_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("CLASSIFICATION_PROTOCOL_VERSION", "VARCHAR", "NO", character_maximum_length=64),
-            ColumnSpec("CHANNEL_TYPE_VALUE", "VARCHAR", "NO", character_maximum_length=64),
-            ColumnSpec("PLAYER_FOCUS_VALUE", "VARCHAR", "NO", character_maximum_length=64),
-            ColumnSpec("CHANNEL_TYPE_CONFIDENCE", "VARCHAR", "NO", character_maximum_length=32),
-            ColumnSpec("PLAYER_FOCUS_CONFIDENCE", "VARCHAR", "NO", character_maximum_length=32),
-            ColumnSpec("REFERENCE_PERIOD_START", "TIMESTAMP_NTZ", "NO"),
-            ColumnSpec("REFERENCE_PERIOD_END", "TIMESTAMP_NTZ", "NO"),
-            ColumnSpec("EFFECTIVE_WINDOW_DAYS", "NUMBER", "NO", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("ELIGIBLE_VIDEO_COUNT", "NUMBER", "NO", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("MESSI_VIDEO_COUNT", "NUMBER", "NO", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("RONALDO_VIDEO_COUNT", "NUMBER", "NO", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("MESSI_PREVALENCE", "NUMBER", "NO", numeric_precision=6, numeric_scale=5),
-            ColumnSpec("RONALDO_PREVALENCE", "NUMBER", "NO", numeric_precision=6, numeric_scale=5),
-            ColumnSpec("FOCUS_RATIO", "NUMBER", "NO", numeric_precision=10, numeric_scale=5),
-            ColumnSpec("FALLBACK_USED", "BOOLEAN", "NO"),
-            ColumnSpec("HEADLINE_DECOMPOSITION_ELIGIBLE", "BOOLEAN", "YES"),
-            ColumnSpec("SNAPSHOT_CREATED_AT", "TIMESTAMP_NTZ", "NO"),
-            ColumnSpec("ASSESSMENT_ID", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("OVERRIDE_ID", "VARCHAR", "YES", character_maximum_length=36),
-        ],
-        [
-            ConstraintSpec("PK_EVENT_CHANNEL_STRATUM_SNAPSHOT", "PRIMARY KEY", ["EVENT_CHANNEL_STRATUM_SNAPSHOT_KEY"]),
-            ConstraintSpec("UQ_EVENT_CHANNEL_STRATUM_SNAPSHOT", "UNIQUE", ["EVENT_VERSION_KEY", "CHANNEL_KEY", "CLASSIFICATION_PROTOCOL_VERSION"]),
-        ]
-    )
-
-    add_table(
-        "CORE", "BRIDGE_VIDEO_EVENT",
-        [
-            ColumnSpec("VIDEO_EVENT_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("VIDEO_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("EVENT_VERSION_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("SAMPLING_POLICY_VERSION_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("COHORT_TYPE", "VARCHAR", "NO", character_maximum_length=32),
-            ColumnSpec("SELECTION_RANK", "NUMBER", "YES", numeric_precision=38, numeric_scale=0),
-            ColumnSpec("INCLUSION_STATUS", "VARCHAR", "NO", character_maximum_length=32),
-            ColumnSpec("INCLUSION_RATIONALE", "VARCHAR", "YES", character_maximum_length=512),
-            ColumnSpec("PRIMARY_EXCLUSION_REASON", "VARCHAR", "YES", character_maximum_length=128),
-            ColumnSpec("DISCOVERY_METHOD", "VARCHAR", "NO", character_maximum_length=64),
-            ColumnSpec("DISCOVERY_PROVENANCE", "VARIANT", "YES"),
-            ColumnSpec("CANDIDATE_LIST_LINEAGE", "VARIANT", "YES"),
-            ColumnSpec("OVERRIDE_ID", "VARCHAR", "YES", character_maximum_length=36),
-            ColumnSpec("EVALUATED_AT", "TIMESTAMP_NTZ", "NO"),
-        ],
-        [ConstraintSpec("PK_BRIDGE_VIDEO_EVENT", "PRIMARY KEY", ["VIDEO_EVENT_KEY"])]
-    )
-
-    add_table(
-        "CORE", "BRIDGE_FRAME_CHANNEL",
-        [
-            ColumnSpec("FRAME_CHANNEL_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("FRAME_VERSION_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("CHANNEL_KEY", "VARCHAR", "NO", character_maximum_length=36),
-            ColumnSpec("EVALUATED_AT", "TIMESTAMP_NTZ", "NO"),
-            ColumnSpec("ELIGIBILITY_RULE_VERSION", "VARCHAR", "NO", character_maximum_length=64),
-            ColumnSpec("FRAME_INCLUSION_STATUS", "VARCHAR", "NO", character_maximum_length=64),
-            ColumnSpec("GENERAL_EXCLUSION_REASON", "VARCHAR", "YES", character_maximum_length=128),
-        ],
-        [
-            ConstraintSpec("PK_BRIDGE_FRAME_CHANNEL", "PRIMARY KEY", ["FRAME_CHANNEL_KEY"]),
-            ConstraintSpec("UQ_BRIDGE_FRAME_CHANNEL", "UNIQUE", ["FRAME_VERSION_KEY", "CHANNEL_KEY"]),
-        ]
-    )
+    if os.path.exists(v010_path):
+        with open(v010_path, "r", encoding="utf-8") as fh:
+            parse_ddl_content(fh.read(), "OPS", specs)
 
     return specs
 
@@ -390,7 +285,6 @@ class DeploymentReconciler:
         # Index live constraints: TABLE_KEY -> list of {name, type, columns}
         live_constraints: Dict[str, List[dict]] = {}
         if constraints_meta:
-            # Group by constraint_name
             by_cname: Dict[str, dict] = {}
             for r in constraints_meta:
                 cname = r["constraint_name"].upper()
@@ -415,7 +309,7 @@ class DeploymentReconciler:
                 })
 
         # Perform reconciliation
-        drift_report = {
+        drift_report: Dict[str, Any] = {
             "has_drift": False,
             "matching_tables": [],
             "missing_tables": [],
@@ -424,7 +318,7 @@ class DeploymentReconciler:
             "constraint_mismatches": [],
         }
 
-        # 1. Table existence
+        # Check for missing tables
         for tkey, expected_spec in self.canonical_specs.items():
             if tkey not in live_tables:
                 drift_report["missing_tables"].append(tkey)
@@ -432,32 +326,34 @@ class DeploymentReconciler:
                 continue
 
             drift_report["matching_tables"].append(tkey)
-            live_cols = live_columns.get(tkey, {})
+            t_live_cols = live_columns.get(tkey, {})
 
             # 2. Columns comparison
             for col_name, exp_col in expected_spec.columns.items():
-                if col_name not in live_cols:
+                if col_name not in t_live_cols:
                     drift_report["column_mismatches"].append({
                         "table": tkey,
                         "column": col_name,
                         "issue": "MISSING_COLUMN",
-                        "expected": dataclasses.asdict(exp_col),
-                        "actual": None,
                     })
                     drift_report["has_drift"] = True
                     continue
 
-                act_col = live_cols[col_name]
+                act_col = t_live_cols[col_name]
+
                 # Compare data type
                 if exp_col.data_type != act_col["data_type"]:
-                    drift_report["column_mismatches"].append({
-                        "table": tkey,
-                        "column": col_name,
-                        "issue": "DATA_TYPE_MISMATCH",
-                        "expected": exp_col.data_type,
-                        "actual": act_col["data_type"],
-                    })
-                    drift_report["has_drift"] = True
+                    # Equivalence for TEXT / VARCHAR
+                    text_types = {"VARCHAR", "TEXT", "STRING", "CHAR"}
+                    if not (exp_col.data_type in text_types and act_col["data_type"] in text_types):
+                        drift_report["column_mismatches"].append({
+                            "table": tkey,
+                            "column": col_name,
+                            "issue": "DATA_TYPE_MISMATCH",
+                            "expected": exp_col.data_type,
+                            "actual": act_col["data_type"],
+                        })
+                        drift_report["has_drift"] = True
 
                 # Compare length if expected
                 if exp_col.character_maximum_length is not None and act_col["character_maximum_length"] is not None:
@@ -473,7 +369,10 @@ class DeploymentReconciler:
 
                 # Compare precision & scale if expected
                 if exp_col.numeric_precision is not None and act_col["numeric_precision"] is not None:
-                    if (exp_col.numeric_precision, exp_col.numeric_scale) != (act_col["numeric_precision"], act_col["numeric_scale"]):
+                    if (exp_col.numeric_precision, exp_col.numeric_scale) != (
+                        act_col["numeric_precision"],
+                        act_col["numeric_scale"],
+                    ):
                         drift_report["column_mismatches"].append({
                             "table": tkey,
                             "column": col_name,
@@ -502,7 +401,8 @@ class DeploymentReconciler:
                     matching_live = [
                         lc for lc in t_live_cons
                         if lc["columns"] == exp_cols_sorted and (
-                            exp_con.constraint_type in lc["constraint_type"] or lc["constraint_type"] in exp_con.constraint_type
+                            exp_con.constraint_type in lc["constraint_type"]
+                            or lc["constraint_type"] in exp_con.constraint_type
                         )
                     ]
                     if not matching_live:
@@ -518,7 +418,7 @@ class DeploymentReconciler:
         return drift_report
 
     def reconcile_live(self, conn: Any, target_db: str = "FOOTBALL_NARRATIVE_DEV") -> dict:
-        """Strictly read-only query of information_schema on target Snowflake connection."""
+        """Strictly read-only query of information_schema and SHOW constraints on target Snowflake connection."""
         cur = conn.cursor()
         try:
             # 1. Query tables
@@ -553,30 +453,35 @@ class DeploymentReconciler:
                 for r in cur.fetchall()
             ]
 
-            # 3. Query constraints
-            constraints_meta = []
-            try:
-                cur.execute(
-                    f"SELECT tc.table_schema, tc.table_name, tc.constraint_name, tc.constraint_type, kcu.column_name "
-                    f"FROM {target_db}.information_schema.table_constraints tc "
-                    f"JOIN {target_db}.information_schema.key_column_usage kcu "
-                    f"  ON tc.constraint_name = kcu.constraint_name "
-                    f"  AND tc.table_schema = kcu.table_schema "
-                    f"WHERE tc.table_schema IN ('RAW', 'OPS', 'CORE', 'ML', 'MARTS')"
-                )
-                constraints_meta = [
-                    {
-                        "table_schema": r[0],
-                        "table_name": r[1],
-                        "constraint_name": r[2],
-                        "constraint_type": r[3],
-                        "column_name": r[4],
-                    }
-                    for r in cur.fetchall()
-                ]
-            except Exception:
-                # Information schema constraint joins may vary by permissions
-                constraints_meta = []
+            # 3. Query constraints using supported native Snowflake SHOW commands
+            constraints_meta: List[dict] = []
+            for cmd, con_type in [
+                (f"SHOW PRIMARY KEYS IN DATABASE {target_db}", "PRIMARY KEY"),
+                (f"SHOW UNIQUE KEYS IN DATABASE {target_db}", "UNIQUE"),
+            ]:
+                try:
+                    cur.execute(cmd)
+                    desc = [d[0].lower() for d in cur.description] if cur.description else []
+                    for row in cur.fetchall():
+                        r_dict = dict(zip(desc, row))
+                        schema_name = (
+                            r_dict.get("schema_name") or r_dict.get("table_schema") or ""
+                        ).upper()
+                        table_name = (r_dict.get("table_name") or "").upper()
+                        col_name = (r_dict.get("column_name") or "").upper()
+                        con_name = (r_dict.get("constraint_name") or "").upper()
+                        if schema_name in ("RAW", "OPS", "CORE", "ML", "MARTS"):
+                            constraints_meta.append({
+                                "table_schema": schema_name,
+                                "table_name": table_name,
+                                "constraint_name": con_name or f"{con_type[:2]}_{table_name}",
+                                "constraint_type": con_type,
+                                "column_name": col_name,
+                            })
+                except Exception as ex:
+                    raise RuntimeError(
+                        f"Failed to query {con_type} constraints via Snowflake command '{cmd}': {ex}"
+                    ) from ex
 
             return self.reconcile_from_metadata(tables_meta, columns_meta, constraints_meta)
         finally:
@@ -607,18 +512,18 @@ def main():
         print("\n=======================================================")
         print(f"DEPLOYMENT RECONCILIATION REPORT: {args.target_db}")
         print("=======================================================")
-        status_str = 'DRIFT DETECTED' if report['has_drift'] else 'MATCHES BASELINE'
+        status_str = "DRIFT DETECTED" if report["has_drift"] else "MATCHES BASELINE"
         print(f"Drift Status: {status_str}")
         print(f"Matching Tables: {len(report['matching_tables'])}")
         print(f"Missing Tables:  {len(report['missing_tables'])}")
-        if report['missing_tables']:
-            for t in report['missing_tables']:
+        if report["missing_tables"]:
+            for t in report["missing_tables"]:
                 print(f"  - {t}")
         print(f"Column Mismatches: {len(report['column_mismatches'])}")
-        for cm in report['column_mismatches']:
+        for cm in report["column_mismatches"]:
             print(f"  - {cm['table']}.{cm['column']}: {cm['issue']} (Expected: {cm.get('expected')}, Actual: {cm.get('actual')})")
         print(f"Constraint Mismatches: {len(report['constraint_mismatches'])}")
-        for csm in report['constraint_mismatches']:
+        for csm in report["constraint_mismatches"]:
             print(f"  - {csm['table']} constraint {csm['constraint']}: {csm['issue']}")
 
 

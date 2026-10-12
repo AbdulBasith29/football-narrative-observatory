@@ -47,6 +47,11 @@ class BaselineAdoptionError(MigrationError):
     pass
 
 
+class InterruptedMigrationError(MigrationError):
+    """Raised when a migration is in IN_PROGRESS state from a prior crashed or interrupted run."""
+    pass
+
+
 @dataclasses.dataclass(frozen=True)
 class MigrationFile:
     """Represents a discovered migration script on disk."""
@@ -133,71 +138,68 @@ class MigrationRunner:
 
         CREATE TABLE IF NOT EXISTS {self.target_db}.OPS.SCHEMA_LOCK (
             lock_id             VARCHAR(32) NOT NULL,
-            locked_at           TIMESTAMP_NTZ NOT NULL,
-            locked_by           VARCHAR(128) NOT NULL,
-            lock_token          VARCHAR(36) NOT NULL,
+            locked_at           TIMESTAMP_NTZ,
+            locked_by           VARCHAR(128),
+            lock_token          VARCHAR(36),
             lock_timeout_sec    NUMBER(38,0) NOT NULL DEFAULT 900,
             CONSTRAINT pk_schema_lock PRIMARY KEY (lock_id)
         );
+
+        MERGE INTO {self.target_db}.OPS.SCHEMA_LOCK AS target
+        USING (SELECT '{self.LOCK_ID}' AS lock_id) AS src
+        ON target.lock_id = src.lock_id
+        WHEN NOT MATCHED THEN
+            INSERT (lock_id, locked_at, locked_by, lock_token, lock_timeout_sec)
+            VALUES (src.lock_id, NULL, NULL, NULL, 900);
         """
         self.conn.execute_string(ddl)
 
     def acquire_lock(self, timeout_sec: int = DEFAULT_LOCK_TIMEOUT_SEC) -> str:
-        """Acquires the distributed migration lock or raises ConcurrentMigrationError."""
+        """Acquires the distributed migration lock atomically or raises ConcurrentMigrationError."""
         lock_token = str(uuid.uuid4())
         user_identity = os.environ.get("SNOWFLAKE_USER", "OBSERVATORY_RUNNER")
-        now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
         cur = self.conn.cursor()
         try:
-            # Check if active lock exists
+            # Atomic test-and-set: update the single lock row only if currently unlocked or lease has expired
             cur.execute(
-                f"SELECT lock_id, locked_at, locked_by, lock_token, lock_timeout_sec "
+                f"UPDATE {self.target_db}.OPS.SCHEMA_LOCK "
+                f"SET locked_at = CURRENT_TIMESTAMP(), "
+                f"    locked_by = %s, "
+                f"    lock_token = %s, "
+                f"    lock_timeout_sec = %s "
+                f"WHERE lock_id = %s "
+                f"  AND (locked_by IS NULL OR DATEADD(second, lock_timeout_sec, locked_at) < CURRENT_TIMESTAMP())",
+                (user_identity, lock_token, timeout_sec, self.LOCK_ID)
+            )
+            if getattr(cur, "rowcount", None) == 1:
+                return lock_token
+
+            # Lock was not acquired: inspect who holds the active lock
+            cur.execute(
+                f"SELECT locked_by, lock_token, locked_at, lock_timeout_sec "
                 f"FROM {self.target_db}.OPS.SCHEMA_LOCK WHERE lock_id = %s",
                 (self.LOCK_ID,)
             )
-            row = cur.fetchone()
-            if row:
-                locked_at = row[1]
-                locked_by = row[2]
-                lease_sec = row[4] or timeout_sec
-                # If naive or string, parse
-                if isinstance(locked_at, str):
-                    lock_time = datetime.datetime.fromisoformat(locked_at.replace("Z", "+00:00"))
-                elif isinstance(locked_at, datetime.datetime):
-                    lock_time = locked_at.replace(tzinfo=datetime.timezone.utc) if locked_at.tzinfo is None else locked_at
-                else:
-                    lock_time = datetime.datetime.now(datetime.timezone.utc)
-
-                age_sec = (datetime.datetime.now(datetime.timezone.utc) - lock_time).total_seconds()
-                if age_sec < lease_sec:
-                    raise ConcurrentMigrationError(
-                        f"Database {self.target_db} is locked by {locked_by} "
-                        f"(lock token: {row[3]}, age: {int(age_sec)}s, lease: {lease_sec}s)."
-                    )
-                # Stale lock: break lease
-                cur.execute(
-                    f"DELETE FROM {self.target_db}.OPS.SCHEMA_LOCK WHERE lock_id = %s",
-                    (self.LOCK_ID,)
+            holder = cur.fetchone()
+            if holder and holder[0]:
+                raise ConcurrentMigrationError(
+                    f"Database {self.target_db} is locked by {holder[0]} "
+                    f"(lock token: {holder[1]}, acquired at: {holder[2]}, lease: {holder[3]}s)."
                 )
-
-            # Insert new lock
-            cur.execute(
-                f"INSERT INTO {self.target_db}.OPS.SCHEMA_LOCK "
-                f"(lock_id, locked_at, locked_by, lock_token, lock_timeout_sec) "
-                f"VALUES (%s, %s, %s, %s, %s)",
-                (self.LOCK_ID, now_iso, user_identity, lock_token, timeout_sec)
-            )
-            return lock_token
+            raise ConcurrentMigrationError(f"Database {self.target_db} lock acquisition failed.")
         finally:
             cur.close()
 
     def release_lock(self, lock_token: str) -> None:
-        """Releases the migration lock if the token matches."""
+        """Releases the migration lock if the token matches (strict ownership check)."""
         cur = self.conn.cursor()
         try:
             cur.execute(
-                f"DELETE FROM {self.target_db}.OPS.SCHEMA_LOCK "
+                f"UPDATE {self.target_db}.OPS.SCHEMA_LOCK "
+                f"SET locked_at = NULL, "
+                f"    locked_by = NULL, "
+                f"    lock_token = NULL "
                 f"WHERE lock_id = %s AND lock_token = %s",
                 (self.LOCK_ID, lock_token)
             )
@@ -233,10 +235,102 @@ class MigrationRunner:
         finally:
             cur.close()
 
+    def _verify_migration_objects_exist(self, cur: Any, version_num: int) -> None:
+        """Verifies that physical database objects for a given migration version actually exist."""
+        if version_num == 1:
+            cur.execute(
+                f"SELECT character_maximum_length FROM {self.target_db}.information_schema.columns "
+                f"WHERE table_schema = 'OPS' AND table_name = 'FACT_API_REQUEST' AND column_name = 'PAGE_TOKEN_USED'"
+            )
+            row = cur.fetchone()
+            if not row or (row[0] is not None and row[0] < 1024):
+                raise BaselineAdoptionError(
+                    f"Cannot adopt baseline V001: OPS.FACT_API_REQUEST.PAGE_TOKEN_USED is missing or length < 1024 in {self.target_db}."
+                )
+        elif version_num == 2:
+            cur.execute(
+                f"SELECT count(*) FROM {self.target_db}.information_schema.columns "
+                f"WHERE table_schema = 'OPS' AND table_name = 'FACT_INGESTION_RUN' AND column_name = 'RUN_PURPOSE'"
+            )
+            if cur.fetchone()[0] == 0:
+                raise BaselineAdoptionError(
+                    f"Cannot adopt baseline V002: column OPS.FACT_INGESTION_RUN.RUN_PURPOSE does not exist in {self.target_db}."
+                )
+        elif version_num == 3:
+            cur.execute(
+                f"SELECT count(*) FROM {self.target_db}.information_schema.columns "
+                f"WHERE table_schema = 'CORE' AND table_name = 'BRIDGE_VIDEO_EVENT' AND column_name = 'PRIMARY_EXCLUSION_REASON'"
+            )
+            if cur.fetchone()[0] == 0:
+                raise BaselineAdoptionError(
+                    f"Cannot adopt baseline V003: column CORE.BRIDGE_VIDEO_EVENT.PRIMARY_EXCLUSION_REASON does not exist in {self.target_db}."
+                )
+        elif version_num == 4:
+            cur.execute(
+                f"SELECT count(*) FROM {self.target_db}.information_schema.tables "
+                f"WHERE table_schema = 'CORE' AND table_name IN ('DIM_CHANNEL_FRAME_VERSION', 'BRIDGE_FRAME_CHANNEL')"
+            )
+            if cur.fetchone()[0] < 2:
+                raise BaselineAdoptionError(
+                    f"Cannot adopt baseline V004: frame tables do not exist in {self.target_db}."
+                )
+        elif version_num == 5:
+            cur.execute(
+                f"SELECT count(*) FROM {self.target_db}.information_schema.columns "
+                f"WHERE table_schema = 'CORE' AND table_name = 'DIM_EVENT_VERSION' AND column_name = 'EVENT_TERMS'"
+            )
+            if cur.fetchone()[0] == 0:
+                raise BaselineAdoptionError(
+                    f"Cannot adopt baseline V005: column CORE.DIM_EVENT_VERSION.EVENT_TERMS does not exist in {self.target_db}."
+                )
+        elif version_num == 6:
+            cur.execute(
+                f"SELECT count(*) FROM {self.target_db}.information_schema.columns "
+                f"WHERE table_schema = 'OPS' AND table_name = 'DISCOVERY_UNIT_STATE' AND column_name = 'LAST_ERROR_CODE'"
+            )
+            if cur.fetchone()[0] == 0:
+                raise BaselineAdoptionError(
+                    f"Cannot adopt baseline V006: OPS.DISCOVERY_UNIT_STATE does not exist or lacks LAST_ERROR_CODE in {self.target_db}."
+                )
+        elif version_num == 7:
+            cur.execute(
+                f"SELECT count(*) FROM {self.target_db}.information_schema.tables "
+                f"WHERE table_schema = 'OPS' AND table_name = 'VIDEO_METADATA_RESOLUTION_STATE'"
+            )
+            t_count = cur.fetchone()[0]
+            cur.execute(
+                f"SELECT count(*) FROM {self.target_db}.information_schema.columns "
+                f"WHERE table_schema = 'CORE' AND table_name = 'FACT_VIDEO_SNAPSHOT' AND column_name = 'API_REQUEST_ID'"
+            )
+            c_count = cur.fetchone()[0]
+            if t_count == 0 or c_count == 0:
+                raise BaselineAdoptionError(
+                    f"Cannot adopt baseline V007: OPS.VIDEO_METADATA_RESOLUTION_STATE or CORE.FACT_VIDEO_SNAPSHOT lineage missing in {self.target_db}."
+                )
+        elif version_num == 8:
+            cur.execute(
+                f"SELECT count(*) FROM {self.target_db}.information_schema.columns "
+                f"WHERE table_schema = 'CORE' AND table_name = 'DIM_EVENT_VERSION' AND column_name = 'BASELINE_TERMS'"
+            )
+            if cur.fetchone()[0] == 0:
+                raise BaselineAdoptionError(
+                    f"Cannot adopt baseline V008: column CORE.DIM_EVENT_VERSION.BASELINE_TERMS does not exist in {self.target_db}."
+                )
+        elif version_num == 9:
+            cur.execute(
+                f"SELECT count(*) FROM {self.target_db}.information_schema.tables "
+                f"WHERE (table_schema = 'OPS' AND table_name IN ('FACT_CHANNEL_ASSESSMENT_EVIDENCE_ITEM', 'CHANNEL_EVIDENCE_ACQUISITION_STATE')) "
+                f"   OR (table_schema = 'CORE' AND table_name = 'DIM_CHANNEL_STRATUM')"
+            )
+            if cur.fetchone()[0] < 3:
+                raise BaselineAdoptionError(
+                    f"Cannot adopt baseline V009: stratification tables do not exist in {self.target_db}."
+                )
+
     def adopt_baseline(self, up_to_version_num: int = 9, installed_by: Optional[str] = None) -> dict:
         """Explicitly records historical migrations up to version as BASELINE_ADOPTION.
 
-        Fails if core tables do not exist or if ledger contains conflicting versions.
+        Validates physical existence of objects per migration version and checks existing ledger records.
         """
         self.ensure_ledger_tables()
         lock_token = self.acquire_lock()
@@ -246,22 +340,36 @@ class MigrationRunner:
             if not target_migrations:
                 raise BaselineAdoptionError(f"No migrations found up to V{up_to_version_num:03d}")
 
-            # Verify that core tables actually exist before marking baseline adoption
+            ledger = self.get_ledger()
+
+            # 1. Validate health and checksums of any existing ledger entries in target range
+            for m in target_migrations:
+                if m.version_str in ledger:
+                    entry = ledger[m.version_str]
+                    if entry["checksum"] != m.checksum:
+                        raise MigrationChecksumMismatchError(
+                            f"Checksum mismatch for migration {m.version_str} ({m.filename})! "
+                            f"Recorded in ledger ({entry['status']}): {entry['checksum']}, On Disk: {m.checksum}."
+                        )
+                    if entry["status"] == "FAILED":
+                        raise UnresolvedFailedMigrationError(
+                            f"Migration {m.version_str} in ledger is in FAILED state: {entry['error_message']}."
+                        )
+                    if entry["status"] == "IN_PROGRESS":
+                        raise InterruptedMigrationError(
+                            f"Migration {m.version_str} in ledger is in IN_PROGRESS state from an interrupted run."
+                        )
+
+            # 2. Verify physical database objects for each migration being baselined that is not yet in ledger
             cur = self.conn.cursor()
             try:
-                cur.execute(
-                    f"SELECT count(*) FROM {self.target_db}.information_schema.tables "
-                    f"WHERE table_schema = 'CORE' AND table_name IN ('DIM_CHANNEL', 'DIM_EVENT', 'DIM_VIDEO')"
-                )
-                core_count = cur.fetchone()[0]
-                if core_count < 3:
-                    raise BaselineAdoptionError(
-                        f"Cannot adopt baseline V{up_to_version_num:03d}: core tables do not exist in {self.target_db}."
-                    )
+                for m in target_migrations:
+                    if m.version_str not in ledger:
+                        self._verify_migration_objects_exist(cur, m.version_num)
             finally:
                 cur.close()
 
-            ledger = self.get_ledger()
+            # 3. Record baseline adoption entries for unrecorded migrations
             installer = installed_by or os.environ.get("SNOWFLAKE_USER", "SYSTEM")
             now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -311,29 +419,34 @@ class MigrationRunner:
             migrations = self.discover_migrations()
             ledger = self.get_ledger()
 
-            # Step 1: Verify checksums of all previously successful migrations
+            # Step 1: Verify checksums and health of all existing ledger records
             for m in migrations:
                 if m.version_str in ledger:
                     entry = ledger[m.version_str]
-                    if entry["status"] == "SUCCESS":
-                        if entry["checksum"] != m.checksum:
-                            raise MigrationChecksumMismatchError(
-                                f"Checksum mismatch for migration {m.version_str} ({m.filename})! "
-                                f"Recorded: {entry['checksum']}, On Disk: {m.checksum}. "
-                                f"Applied migrations are immutable."
-                            )
-                    elif entry["status"] == "FAILED":
+                    # Checksum verification applies to ALL existing entries
+                    if entry["checksum"] != m.checksum:
+                        raise MigrationChecksumMismatchError(
+                            f"Checksum mismatch for migration {m.version_str} ({m.filename})! "
+                            f"Recorded in ledger ({entry['status']}): {entry['checksum']}, On Disk: {m.checksum}. "
+                            f"Applied migrations are immutable."
+                        )
+                    if entry["status"] == "FAILED":
                         raise UnresolvedFailedMigrationError(
                             f"Migration {m.version_str} previously failed: {entry['error_message']}. "
                             f"Manual operator intervention required before continuing."
                         )
+                    if entry["status"] == "IN_PROGRESS":
+                        raise InterruptedMigrationError(
+                            f"Migration {m.version_str} is in IN_PROGRESS state from an interrupted or crashed run. "
+                            f"Snowflake DDL commits independently; manual operator inspection is required before resuming."
+                        )
 
-            # Step 2: Determine pending migrations
+            # Step 2: Determine pending migrations (strictly unapplied)
             pending: List[MigrationFile] = []
             for m in migrations:
                 if target_version_num is not None and m.version_num > target_version_num:
                     continue
-                if m.version_str not in ledger or ledger[m.version_str]["status"] != "SUCCESS":
+                if m.version_str not in ledger:
                     pending.append(m)
 
             if not pending:
@@ -353,21 +466,15 @@ class MigrationRunner:
                 start_time = time.time()
                 now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-                # Record IN_PROGRESS in ledger
+                # Record IN_PROGRESS in ledger with initial checksum
                 cur = self.conn.cursor()
                 try:
                     cur.execute(
-                        f"MERGE INTO {self.target_db}.OPS.SCHEMA_VERSION AS target "
-                        f"USING (SELECT %s AS version) AS src ON target.version = src.version "
-                        f"WHEN MATCHED THEN UPDATE SET "
-                        f"status = 'IN_PROGRESS', installed_on = %s, error_message = NULL "
-                        f"WHEN NOT MATCHED THEN INSERT ("
+                        f"INSERT INTO {self.target_db}.OPS.SCHEMA_VERSION ("
                         f"installed_rank, version, description, script_name, checksum, "
                         f"execution_type, installed_by, installed_on, execution_time_ms, status, error_message"
                         f") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                         (
-                            m.version_str,
-                            now_iso,
                             next_rank,
                             m.version_str,
                             m.description,
