@@ -19,6 +19,7 @@ from migration_runner import (
     BaselineAdoptionError,
     ConcurrentMigrationError,
     InterruptedMigrationError,
+    LockLostError,
     MigrationChecksumMismatchError,
     MigrationExecutionError,
     MigrationRunner,
@@ -35,6 +36,7 @@ ALL_BASELINE_OBJECTS = {
     "BRIDGE_VIDEO_EVENT",
     "DIM_CHANNEL_FRAME_VERSION",
     "BRIDGE_FRAME_CHANNEL",
+    "FRAME_CHANNEL_SOURCE_OBSERVATION",
     "DIM_EVENT_VERSION",
     "DISCOVERY_UNIT_STATE",
     "VIDEO_METADATA_RESOLUTION_STATE",
@@ -42,6 +44,12 @@ ALL_BASELINE_OBJECTS = {
     "FACT_CHANNEL_ASSESSMENT_EVIDENCE_ITEM",
     "CHANNEL_EVIDENCE_ACQUISITION_STATE",
     "DIM_CHANNEL_STRATUM",
+    "BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT",
+    "FACT_CHANNEL_CLASSIFICATION_ASSESSMENT",
+    "MANUAL_OVERRIDE",
+    "YOUTUBE_API_RESPONSE",
+    "CURRENT_CHECKPOINT",
+    "CHECKPOINT_HISTORY",
 }
 
 
@@ -59,6 +67,8 @@ class MockSnowflakeDatabase:
         else:
             self.existing_tables = set(existing_tables)
 
+        self.strata_seed_count: int = 30
+        self.missing_columns: Set[str] = set()
         self.schema_version: List[Dict[str, Any]] = []
         self.schema_lock: Optional[Dict[str, Any]] = None
         self.executed_strings: List[str] = []
@@ -98,7 +108,7 @@ class MockSnowflakeDatabase:
         clean_upper = clean.upper()
 
         # 1. Atomic UPDATE lock acquisition
-        if clean_upper.startswith("UPDATE") and "OPS.SCHEMA_LOCK" in clean_upper and "LOCKED_AT = CURRENT_TIMESTAMP()" in clean_upper:
+        if clean_upper.startswith("UPDATE") and "OPS.SCHEMA_LOCK" in clean_upper and "LOCKED_AT = CURRENT_TIMESTAMP()" in clean_upper and "LOCKED_BY =" in clean_upper:
             user_id = params[0]
             token = params[1]
             lease_sec = params[2]
@@ -119,6 +129,17 @@ class MockSnowflakeDatabase:
                     "lock_token": token,
                     "lock_timeout_sec": lease_sec,
                 }
+                self.rowcount = 1
+            else:
+                self.rowcount = 0
+            self._last_result = []
+
+        # 1b. Lease renewal by active holder
+        elif clean_upper.startswith("UPDATE") and "OPS.SCHEMA_LOCK" in clean_upper and "LOCKED_AT = CURRENT_TIMESTAMP()" in clean_upper and "LOCKED_BY =" not in clean_upper:
+            lock_id = params[0]
+            token = params[1]
+            if self.schema_lock and self.schema_lock.get("lock_id") == lock_id and self.schema_lock.get("lock_token") == token:
+                self.schema_lock["locked_at"] = datetime.datetime.now(datetime.timezone.utc)
                 self.rowcount = 1
             else:
                 self.rowcount = 0
@@ -150,28 +171,48 @@ class MockSnowflakeDatabase:
                 self._last_result = []
             self.rowcount = len(self._last_result)
 
+        # 3b. Query seed rows in DIM_CHANNEL_STRATUM
+        elif "CORE.DIM_CHANNEL_STRATUM" in clean_upper and "COUNT(*)" in clean_upper:
+            if "DIM_CHANNEL_STRATUM" in self.existing_tables:
+                self._last_result = [(self.strata_seed_count,)]
+            else:
+                self._last_result = [(0,)]
+            self.rowcount = 1
+
         # 4. Information schema columns
         elif "INFORMATION_SCHEMA.COLUMNS" in clean_upper:
             if "PAGE_TOKEN_USED" in clean_upper:
-                has_col = any("FACT_API_REQUEST" in t for t in self.existing_tables)
+                has_col = any("FACT_API_REQUEST" in t for t in self.existing_tables) and "PAGE_TOKEN_USED" not in self.missing_columns
                 self._last_result = [(1024,)] if has_col else []
             elif "RUN_PURPOSE" in clean_upper:
-                count = 1 if any("FACT_INGESTION_RUN" in t for t in self.existing_tables) else 0
+                count = 1 if any("FACT_INGESTION_RUN" in t for t in self.existing_tables) and "RUN_PURPOSE" not in self.missing_columns else 0
                 self._last_result = [(count,)]
             elif "PRIMARY_EXCLUSION_REASON" in clean_upper:
-                count = 1 if any("BRIDGE_VIDEO_EVENT" in t for t in self.existing_tables) else 0
+                count = 3 if any("BRIDGE_VIDEO_EVENT" in t for t in self.existing_tables) and "PRIMARY_EXCLUSION_REASON" not in self.missing_columns else 0
                 self._last_result = [(count,)]
             elif "EVENT_TERMS" in clean_upper and "BASELINE_TERMS" not in clean_upper:
-                count = 1 if any("DIM_EVENT_VERSION" in t for t in self.existing_tables) else 0
+                count = 1 if any("DIM_EVENT_VERSION" in t for t in self.existing_tables) and "EVENT_TERMS" not in self.missing_columns else 0
                 self._last_result = [(count,)]
             elif "LAST_ERROR_CODE" in clean_upper:
-                count = 1 if any("DISCOVERY_UNIT_STATE" in t for t in self.existing_tables) else 0
+                count = 2 if any("DISCOVERY_UNIT_STATE" in t for t in self.existing_tables) and "LAST_ERROR_CODE" not in self.missing_columns else 0
                 self._last_result = [(count,)]
-            elif "API_REQUEST_ID" in clean_upper:
-                count = 1 if any("FACT_VIDEO_SNAPSHOT" in t for t in self.existing_tables) else 0
+            elif "API_REQUEST_ID" in clean_upper and "FACT_VIDEO_SNAPSHOT" in clean_upper:
+                count = 2 if any("FACT_VIDEO_SNAPSHOT" in t for t in self.existing_tables) and "API_REQUEST_ID" not in self.missing_columns else 0
                 self._last_result = [(count,)]
             elif "BASELINE_TERMS" in clean_upper:
-                count = 1 if any("DIM_EVENT_VERSION" in t for t in self.existing_tables) else 0
+                count = 1 if any("DIM_EVENT_VERSION" in t for t in self.existing_tables) and "BASELINE_TERMS" not in self.missing_columns else 0
+                self._last_result = [(count,)]
+            elif "HEADLINE_DECOMPOSITION_ELIGIBLE" in clean_upper:
+                count = 1 if any("BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT" in t for t in self.existing_tables) and "HEADLINE_DECOMPOSITION_ELIGIBLE" not in self.missing_columns else 0
+                self._last_result = [(count,)]
+            elif "FOCUS_RATIO" in clean_upper and "NUMERIC_SCALE" in clean_upper:
+                scale = 5 if any("BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT" in t for t in self.existing_tables) and "FOCUS_RATIO_SCALE" not in self.missing_columns else 4
+                self._last_result = [(scale,)]
+            elif "FACT_CHANNEL_CLASSIFICATION_ASSESSMENT" in clean_upper and "ASSESSMENT_TRIGGER" in clean_upper:
+                count = 20 if any("FACT_CHANNEL_CLASSIFICATION_ASSESSMENT" in t for t in self.existing_tables) and "ASSESSMENT_TRIGGER" not in self.missing_columns else 0
+                self._last_result = [(count,)]
+            elif "MANUAL_OVERRIDE" in clean_upper and "CLASSIFICATION_AXIS_OVERRIDDEN" in clean_upper:
+                count = 7 if any("MANUAL_OVERRIDE" in t for t in self.existing_tables) and "CLASSIFICATION_AXIS_OVERRIDDEN" not in self.missing_columns else 0
                 self._last_result = [(count,)]
             else:
                 self._last_result = [(1,)]
@@ -190,10 +231,13 @@ class MockSnowflakeDatabase:
                 self._last_result = [(matched_count,)]
             elif "DIM_CHANNEL_FRAME_VERSION" in clean_upper:
                 matched_count = sum(
-                    1 for t in ["DIM_CHANNEL_FRAME_VERSION", "BRIDGE_FRAME_CHANNEL"]
+                    1 for t in ["DIM_CHANNEL_FRAME_VERSION", "BRIDGE_FRAME_CHANNEL", "FRAME_CHANNEL_SOURCE_OBSERVATION"]
                     if t in self.existing_tables
                 )
                 self._last_result = [(matched_count,)]
+            elif "DISCOVERY_UNIT_STATE" in clean_upper:
+                count = 1 if any("DISCOVERY_UNIT_STATE" in t for t in self.existing_tables) else 0
+                self._last_result = [(count,)]
             else:
                 matched_count = sum(1 for t in ["DIM_CHANNEL", "DIM_EVENT", "DIM_VIDEO"] if t in self.existing_tables)
                 self._last_result = [(matched_count,)]
@@ -833,7 +877,7 @@ def test_baseline_adoption_fails_if_v007_to_v009_missing(tmp_path: Any) -> None:
     only_v001_to_v006 = {
         "DIM_CHANNEL", "DIM_EVENT", "DIM_VIDEO",
         "FACT_API_REQUEST", "FACT_INGESTION_RUN", "BRIDGE_VIDEO_EVENT",
-        "DIM_CHANNEL_FRAME_VERSION", "BRIDGE_FRAME_CHANNEL",
+        "DIM_CHANNEL_FRAME_VERSION", "BRIDGE_FRAME_CHANNEL", "FRAME_CHANNEL_SOURCE_OBSERVATION",
         "DIM_EVENT_VERSION", "DISCOVERY_UNIT_STATE",
     }
     mock_db = MockSnowflakeDatabase(existing_tables=only_v001_to_v006)
@@ -999,3 +1043,167 @@ def test_migration_lock_atomic_race_and_ownership(tmp_path: Any) -> None:
     # 5. Runner 2 releases with valid token2 -> successfully released
     runner2.release_lock(token2)
     assert mock_db.schema_lock["locked_by"] is None
+
+
+def test_baseline_adoption_rejects_partial_v009_seed_data(tmp_path: Any) -> None:
+    """Verifies baseline adoption rejects deployment if V009 seed data in DIM_CHANNEL_STRATUM < 30."""
+    migrations_dir = tmp_path / "seed_migrations"
+    migrations_dir.mkdir()
+    for i in range(1, 10):
+        (migrations_dir / f"V{i:03d}__step_{i}.sql").write_text(f"SELECT {i};", encoding="utf-8")
+
+    mock_db = MockSnowflakeDatabase()
+    # Partial seed data: only 15 strata seeded instead of 30
+    mock_db.strata_seed_count = 15
+
+    runner = MigrationRunner(mock_db.get_connection(), migrations_dir=str(migrations_dir))
+
+    with pytest.raises(BaselineAdoptionError) as exc_info:
+        runner.adopt_baseline(up_to_version_num=9)
+
+    err = str(exc_info.value)
+    assert "Cannot adopt baseline V009: CORE.DIM_CHANNEL_STRATUM contains only 15 rows" in err
+    assert "expected at least 30 seeded composite strata" in err
+    # Strict reject: zero rows stamped into ledger
+    assert len(mock_db.schema_version) == 0
+
+
+def test_baseline_adoption_rejects_missing_v009_schema_elements(tmp_path: Any) -> None:
+    """Verifies baseline adoption rejects partial V009 deployments before stamping any rows."""
+    migrations_dir = tmp_path / "schema_migrations"
+    migrations_dir.mkdir()
+    for i in range(1, 10):
+        (migrations_dir / f"V{i:03d}__step_{i}.sql").write_text(f"SELECT {i};", encoding="utf-8")
+
+    # 1. Missing headline_decomposition_eligible on BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT
+    mock_db1 = MockSnowflakeDatabase()
+    mock_db1.missing_columns = {"HEADLINE_DECOMPOSITION_ELIGIBLE"}
+    runner1 = MigrationRunner(mock_db1.get_connection(), migrations_dir=str(migrations_dir))
+    with pytest.raises(BaselineAdoptionError) as exc1:
+        runner1.adopt_baseline(up_to_version_num=9)
+    assert "HEADLINE_DECOMPOSITION_ELIGIBLE missing" in str(exc1.value)
+    assert len(mock_db1.schema_version) == 0
+
+    # 2. Insufficient focus_ratio numeric scale (< 5) on snapshot table
+    mock_db2 = MockSnowflakeDatabase()
+    mock_db2.missing_columns = {"FOCUS_RATIO_SCALE"}
+    runner2 = MigrationRunner(mock_db2.get_connection(), migrations_dir=str(migrations_dir))
+    with pytest.raises(BaselineAdoptionError) as exc2:
+        runner2.adopt_baseline(up_to_version_num=9)
+    assert "FOCUS_RATIO scale is not >= 5" in str(exc2.value)
+    assert len(mock_db2.schema_version) == 0
+
+    # 3. Missing enhanced telemetry columns on FACT_CHANNEL_CLASSIFICATION_ASSESSMENT
+    mock_db3 = MockSnowflakeDatabase()
+    mock_db3.missing_columns = {"ASSESSMENT_TRIGGER"}
+    runner3 = MigrationRunner(mock_db3.get_connection(), migrations_dir=str(migrations_dir))
+    with pytest.raises(BaselineAdoptionError) as exc3:
+        runner3.adopt_baseline(up_to_version_num=9)
+    assert "enhanced telemetry columns missing on OPS.FACT_CHANNEL_CLASSIFICATION_ASSESSMENT" in str(exc3.value)
+    assert len(mock_db3.schema_version) == 0
+
+    # 4. Missing classification review columns on MANUAL_OVERRIDE
+    mock_db4 = MockSnowflakeDatabase()
+    mock_db4.missing_columns = {"CLASSIFICATION_AXIS_OVERRIDDEN"}
+    runner4 = MigrationRunner(mock_db4.get_connection(), migrations_dir=str(migrations_dir))
+    with pytest.raises(BaselineAdoptionError) as exc4:
+        runner4.adopt_baseline(up_to_version_num=9)
+    assert "classification review columns missing on OPS.MANUAL_OVERRIDE" in str(exc4.value)
+    assert len(mock_db4.schema_version) == 0
+
+
+def test_active_run_exceeding_lease_during_baseline_adoption_fails_closed(tmp_path: Any) -> None:
+    """Verifies that if an active baseline adoption run exceeds its lease, it refuses to stamp ledger rows."""
+    migrations_dir = tmp_path / "exceeded_lease_baseline"
+    migrations_dir.mkdir()
+    for i in range(1, 10):
+        (migrations_dir / f"V{i:03d}__step_{i}.sql").write_text(f"SELECT {i};", encoding="utf-8")
+
+    mock_db = MockSnowflakeDatabase()
+    runner = MigrationRunner(mock_db.get_connection(), migrations_dir=str(migrations_dir))
+
+    # Pre-expire the lock lease before stamping rows by simulating an elapsed duration > timeout
+    def simulate_slow_run_exceeding_lease():
+        stale_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=950)
+        if mock_db.schema_lock:
+            mock_db.schema_lock["locked_at"] = stale_time
+
+    # Hijack fetchone or handler to expire lease right after verification
+    orig_execute = mock_db.execute
+
+    def expiring_execute(sql: str, params: tuple = (), cursor: Optional[MagicMock] = None):
+        orig_execute(sql, params, cursor)
+        # When checking columns/tables during baseline adoption, advance clock to expire lease
+        if "DIM_CHANNEL_STRATUM" in sql.upper():
+            simulate_slow_run_exceeding_lease()
+
+    mock_db.execute = expiring_execute
+
+    with pytest.raises(LockLostError) as exc_info:
+        runner.adopt_baseline(up_to_version_num=9)
+
+    assert "Active run exceeded its lease timeout" in str(exc_info.value)
+    assert "Refusing to continue writing" in str(exc_info.value)
+    # Crucial guarantee: ZERO rows stamped into OPS.SCHEMA_VERSION
+    assert len(mock_db.schema_version) == 0
+
+
+def test_active_run_exceeding_lease_during_migration_execution_fails_closed(tmp_path: Any) -> None:
+    """Verifies that if an active migration run exceeds its lease, it halts and refuses to execute further DDL."""
+    migrations_dir = tmp_path / "exceeded_lease_migration"
+    migrations_dir.mkdir()
+    f1 = migrations_dir / "V001__first.sql"
+    f2 = migrations_dir / "V002__second.sql"
+    f1.write_text("CREATE TABLE T1 (id INT);", encoding="utf-8")
+    f2.write_text("CREATE TABLE T2 (id INT);", encoding="utf-8")
+
+    mock_db = MockSnowflakeDatabase()
+    runner = MigrationRunner(mock_db.get_connection(), migrations_dir=str(migrations_dir))
+
+    orig_execute = mock_db.execute
+
+    def expiring_execute(sql: str, params: tuple = (), cursor: Optional[MagicMock] = None):
+        orig_execute(sql, params, cursor)
+        # Expire lease during first migration processing
+        if "SCHEMA_VERSION" in sql.upper() and mock_db.schema_lock:
+            mock_db.schema_lock["locked_at"] = (
+                datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=950)
+            )
+
+    mock_db.execute = expiring_execute
+
+    with pytest.raises(LockLostError) as exc_info:
+        runner.run_migrations()
+
+    assert "Active run exceeded its lease timeout" in str(exc_info.value)
+    assert "Refusing to continue writing" in str(exc_info.value)
+    # T2 was never executed
+    assert not any("CREATE TABLE T2" in s for s in mock_db.executed_strings)
+
+
+def test_lease_expiry_prevents_takeover_and_fences_active_writes(tmp_path: Any) -> None:
+    """Verifies takeover prevention: an active run cannot have lock stolen, and if taken over, fences writes."""
+    mock_db = MockSnowflakeDatabase()
+    runner1 = MigrationRunner(mock_db.get_connection(), target_db="FOOTBALL_NARRATIVE_DEV")
+    runner2 = MigrationRunner(mock_db.get_connection(), target_db="FOOTBALL_NARRATIVE_DEV")
+
+    # 1. Runner 1 acquires lock
+    token1 = runner1.acquire_lock(timeout_sec=900)
+
+    # 2. While Runner 1 is active, Runner 2 cannot acquire lock (fails closed)
+    with pytest.raises(ConcurrentMigrationError):
+        runner2.acquire_lock(timeout_sec=900)
+
+    # 3. Simulate Runner 1 stalled and Runner 2 taking over expired lease
+    mock_db.schema_lock["locked_at"] = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1200)
+    )
+    token2 = runner2.acquire_lock(timeout_sec=900)
+    assert token2 != token1
+
+    # 4. If Runner 1 attempts to verify lock or write, it detects token mismatch and fails closed
+    with pytest.raises(LockLostError) as exc_info:
+        runner1.verify_active_lock(token1)
+
+    assert "Lock lease was lost or taken over" in str(exc_info.value)
+    assert f"expected '{token1}'" in str(exc_info.value)

@@ -96,21 +96,27 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
   2. Acquires lock with lease.
   3. If invoked with explicit baseline adoption (`--adopt-baseline V009`):
      - Validates that target migrations `V001` through `V009` exist on disk.
-     - **Physical Signature Verification**: For every version being adopted, inspects Snowflake metadata to verify that specific physical database objects and column contracts created by that migration exist in the target database:
-       * `V001`: `OPS.FACT_API_REQUEST.PAGE_TOKEN_USED` (length $\ge 1024$).
+     - **Physical Signature Verification**: For every version being adopted, inspects Snowflake metadata to verify that the complete physical database objects, column contracts, and deterministic seed data created by that migration exist in the target database:
+       * `V001`: `OPS.FACT_API_REQUEST.PAGE_TOKEN_USED` (length $\ge 1024$) and `RAW.YOUTUBE_API_RESPONSE.PAGE_TOKEN_USED` (length $\ge 1024$).
        * `V002`: `OPS.FACT_INGESTION_RUN.RUN_PURPOSE`.
-       * `V003`: `CORE.BRIDGE_VIDEO_EVENT.PRIMARY_EXCLUSION_REASON`.
-       * `V004`: `CORE.DIM_EVENT_VERSION.EVENT_TERMS`.
-       * `V005`: `OPS.DISCOVERY_UNIT_STATE.LAST_ERROR_CODE`.
-       * `V006`: `OPS.VIDEO_METADATA_RESOLUTION_STATE` table.
-       * `V007`: `CORE.FACT_VIDEO_SNAPSHOT.API_REQUEST_ID`.
+       * `V003`: `CORE.BRIDGE_VIDEO_EVENT` columns `PRIMARY_EXCLUSION_REASON`, `OBSERVED_AT`, `IS_WINDOW_OVERLAP`.
+       * `V004`: `CORE.DIM_CHANNEL_FRAME_VERSION`, `CORE.BRIDGE_FRAME_CHANNEL`, `CORE.FRAME_CHANNEL_SOURCE_OBSERVATION`.
+       * `V005`: `OPS.DISCOVERY_UNIT_STATE` table + `LAST_ERROR_CODE`.
+       * `V006`: `OPS.VIDEO_METADATA_RESOLUTION_STATE` table + `LAST_ERROR_CODE`.
+       * `V007`: `CORE.FACT_VIDEO_SNAPSHOT.API_REQUEST_ID` and `CORE.FACT_VIDEO_SNAPSHOT.RAW_RESPONSE_ID`.
        * `V008`: `CORE.DIM_EVENT_VERSION.BASELINE_TERMS`.
-       * `V009`: `OPS.FACT_CHANNEL_ASSESSMENT_EVIDENCE_ITEM`, `OPS.CHANNEL_EVIDENCE_ACQUISITION_STATE`, `CORE.DIM_CHANNEL_STRATUM`.
-       If any signature is missing, baseline adoption is rejected immediately (`BaselineAdoptionError`).
+       * `V009`: Complete V009 schema changes and deterministic seed data:
+         - Tables: `OPS.FACT_CHANNEL_ASSESSMENT_EVIDENCE_ITEM`, `OPS.CHANNEL_EVIDENCE_ACQUISITION_STATE`, `CORE.DIM_CHANNEL_STRATUM`.
+         - Deterministic seed data: `CORE.DIM_CHANNEL_STRATUM` row count $\ge 30$ (verifying the 30 composite strata seeded by V009).
+         - Schema extensions: `CORE.BRIDGE_EVENT_CHANNEL_STRATUM_SNAPSHOT` columns `HEADLINE_DECOMPOSITION_ELIGIBLE` and `FOCUS_RATIO` (numeric scale $\ge 5$).
+         - Telemetry columns: `OPS.FACT_CHANNEL_CLASSIFICATION_ASSESSMENT` has all 20 classification/telemetry columns.
+         - Override columns: `OPS.MANUAL_OVERRIDE` has all 7 override columns.
+       If any signature or seed data check is missing, baseline adoption is rejected immediately (`BaselineAdoptionError`) before stamping any ledger records.
      - **Existing Ledger Validation**: For any historical migration already present in `OPS.SCHEMA_VERSION`:
        * Verifies disk SHA-256 matches recorded checksum (rejects with `MigrationChecksumMismatchError` on mismatch).
        * Verifies recorded status is not `FAILED` (rejects with `UnresolvedFailedMigrationError`).
        * Verifies recorded status is not `IN_PROGRESS` (rejects with `InterruptedMigrationError`).
+     - **Lock Fencing**: Verifies active lock lease before starting verification and before inserting each baseline record (`verify_active_lock()`).
      - For unrecorded versions: inserts ledger records with `execution_type = 'BASELINE_ADOPTION'`, `status = 'SUCCESS'`, `execution_time_ms = 0`.
      - Releases lock.
      - Subsequent `--migrate` calls resume sequentially from `V010`.
@@ -211,6 +217,33 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
 
 ---
 
+### Scenario 7: Active Run Exceeding Lease & Continuous Write Fencing
+* **Initial State**: Process A acquires the lock with lease duration 900 seconds (`token_a`). Due to slow network, heavy catalog queries, or long-running DDL, Process A takes longer than 900 seconds.
+* **Problem Addressed**: If lease expiry allows Process B to break the lease and acquire `token_b`, Process A must NOT continue writing to `OPS.SCHEMA_VERSION` or executing further DDL/seed statements concurrently with Process B.
+* **Runner Action**:
+  1. **Continuous Fencing via `verify_active_lock()`**:
+     Before every write operation (stamping `IN_PROGRESS`, executing a migration script, recording `SUCCESS`/`FAILED`, or stamping baseline adoption rows), the runner inspects `OPS.SCHEMA_LOCK`:
+     ```sql
+     SELECT locked_by, lock_token, locked_at, lock_timeout_sec
+     FROM OPS.SCHEMA_LOCK
+     WHERE lock_id = 'GLOBAL_MIGRATION_LOCK';
+     ```
+  2. **Token & Lease Validation**:
+     - The runner verifies that `lock_token == self.active_lock_token`.
+     - When valid and approaching expiry, the runner can proactively renew the lease via `renew_lease()`:
+       ```sql
+       UPDATE OPS.SCHEMA_LOCK
+       SET locked_at = CURRENT_TIMESTAMP(), lock_timeout_sec = :timeout
+       WHERE lock_id = 'GLOBAL_MIGRATION_LOCK' AND lock_token = :my_token;
+       ```
+     - If the lock token does not match (or the lock was cleared or broken by another runner), the runner halts immediately and raises `LockLostError` (subclass of `ConcurrentMigrationError`):
+       ```text
+       FATAL: Active lock lease was lost or overtaken! Expected token 5a2c..., but lock held by 'ANALYST_B' (token 9b1e...). Halting execution immediately to prevent concurrent writes.
+       ```
+  3. **Zero Orphan Writes**: No further SQL statements or ledger mutations are permitted once lock ownership is lost, preventing brain-split conflicts.
+
+---
+
 ## 4. Summary Table of Runner Guarantees
 
 | Invariant | Enforcement Mechanism | Failure Mode |
@@ -218,9 +251,10 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
 | **Script Immutability** | SHA-256 checksum comparison on every run | `MigrationChecksumMismatchError` (fail closed) |
 | **Lock Atomicity** | `UPDATE OPS.SCHEMA_LOCK` singleton row condition (`rowcount == 1`) | `ConcurrentMigrationError` (fail closed; unenforced PK immune) |
 | **Lock Ownership** | `UPDATE ... WHERE lock_token = %s` on release | Prevents stale process from releasing active lock |
+| **Active Run Fencing** | `verify_active_lock()` before all DDL and ledger writes | `LockLostError` (halts immediately if lease overtaken) |
 | **Execution Order** | Integer version sorting (`V001` < `V002` < ... < `V010`) | Disallows out-of-order execution |
 | **Failure Halting** | Catches DDL error, updates `status = 'FAILED'`, halts runner | `MigrationExecutionError`, blocks subsequent scripts |
 | **Interrupted Safety** | Blocks replay on `IN_PROGRESS` ledger state | `InterruptedMigrationError` (fail closed on crash) |
 | **Baseline Distinction** | Explicit `execution_type`: `'MIGRATION'` vs `'BASELINE_ADOPTION'` | Never conflates inferred state with actual run |
-| **Signature Certification** | Physical table & column signature checks for V001–V009 | `BaselineAdoptionError` (rejects unverified baseline) |
+| **Signature Certification** | Physical table, column, and seed data checks for V001–V009 | `BaselineAdoptionError` (rejects unverified baseline) |
 | **DDL Auto-Commit Decoupling** | Per-migration ledger accounting with elapsed time and failure reason | Accurately records partial execution state |
