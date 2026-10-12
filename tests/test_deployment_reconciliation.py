@@ -10,10 +10,22 @@ Verifies detection of:
 - Constraint column composition mismatches
 """
 
-from scripts.reconcile_deployment_drift import (
-    DeploymentReconciler,
-    get_canonical_phase_1e_specs,
-)
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+try:
+    from reconcile_deployment_drift import (
+        DeploymentReconciler,
+        get_canonical_phase_1e_specs,
+    )
+except ImportError:
+    from scripts.reconcile_deployment_drift import (
+        DeploymentReconciler,
+        get_canonical_phase_1e_specs,
+    )
 
 
 def build_perfect_metadata(specs):
