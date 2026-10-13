@@ -52,6 +52,11 @@ class BaselineAdoptionError(MigrationError):
     pass
 
 
+class BaselineAdoptionDisabledError(BaselineAdoptionError):
+    """Raised when baseline adoption is attempted while disabled for this release."""
+    pass
+
+
 class InterruptedMigrationError(MigrationError):
     """Raised when a migration is in IN_PROGRESS state from a prior crashed or interrupted run."""
     pass
@@ -160,13 +165,17 @@ class MigrationRunner:
         self.conn.execute_string(ddl)
 
     def acquire_lock(self, timeout_sec: int = DEFAULT_LOCK_TIMEOUT_SEC) -> str:
-        """Acquires the distributed migration lock atomically or raises ConcurrentMigrationError."""
+        """Acquires the distributed migration lock atomically or raises ConcurrentMigrationError.
+
+        Automatic expired-lock takeover is disabled: an occupied lock blocks another runner
+        until explicitly recovered by an operator via recover_lock().
+        """
         lock_token = str(uuid.uuid4())
         user_identity = os.environ.get("SNOWFLAKE_USER", "OBSERVATORY_RUNNER")
 
         cur = self.conn.cursor()
         try:
-            # Atomic test-and-set: update the single lock row only if currently unlocked or lease has expired
+            # Atomic test-and-set: update the single lock row ONLY if currently unlocked (locked_by IS NULL).
             cur.execute(
                 f"UPDATE {self.target_db}.OPS.SCHEMA_LOCK "
                 f"SET locked_at = CURRENT_TIMESTAMP(), "
@@ -174,7 +183,7 @@ class MigrationRunner:
                 f"    lock_token = %s, "
                 f"    lock_timeout_sec = %s "
                 f"WHERE lock_id = %s "
-                f"  AND (locked_by IS NULL OR DATEADD(second, lock_timeout_sec, locked_at) < CURRENT_TIMESTAMP())",
+                f"  AND locked_by IS NULL",
                 (user_identity, lock_token, timeout_sec, self.LOCK_ID)
             )
             if getattr(cur, "rowcount", None) == 1:
@@ -192,9 +201,31 @@ class MigrationRunner:
             if holder and holder[0]:
                 raise ConcurrentMigrationError(
                     f"Database {self.target_db} is locked by {holder[0]} "
-                    f"(lock token: {holder[1]}, acquired at: {holder[2]}, lease: {holder[3]}s)."
+                    f"(lock token: {holder[1]}, acquired at: {holder[2]}). "
+                    f"Automatic expired-lock takeover is disabled. An occupied lock blocks execution "
+                    f"until explicitly recovered by an operator via recover_lock()."
                 )
             raise ConcurrentMigrationError(f"Database {self.target_db} lock acquisition failed.")
+        finally:
+            cur.close()
+
+    def recover_lock(self, operator_identity: Optional[str] = None) -> None:
+        """Explicit operator recovery to clear an occupied or orphaned migration lock.
+
+        Since automatic expired-lock takeover is disabled, an operator must explicitly
+        clear the lock if a prior process crashed or terminated abnormally.
+        """
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                f"UPDATE {self.target_db}.OPS.SCHEMA_LOCK "
+                f"SET locked_at = NULL, "
+                f"    locked_by = NULL, "
+                f"    lock_token = NULL "
+                f"WHERE lock_id = %s",
+                (self.LOCK_ID,)
+            )
+            self.active_lock_token = None
         finally:
             cur.close()
 
@@ -215,37 +246,10 @@ class MigrationRunner:
         finally:
             cur.close()
 
-    def renew_lease(self, lock_token: Optional[str] = None) -> None:
-        """Renews the lease timestamp on the lock held by this runner.
-
-        Raises LockLostError if the lock was taken over, expired, or released.
-        """
-        tok = lock_token or getattr(self, "active_lock_token", None)
-        if not tok:
-            raise LockLostError("Cannot renew lease: no active lock token held.")
-
-        # Fencing check: verify that the lease has not already expired or been taken over
-        self.verify_active_lock(tok)
-
-        cur = self.conn.cursor()
-        try:
-            cur.execute(
-                f"UPDATE {self.target_db}.OPS.SCHEMA_LOCK "
-                f"SET locked_at = CURRENT_TIMESTAMP() "
-                f"WHERE lock_id = %s AND lock_token = %s",
-                (self.LOCK_ID, tok),
-            )
-            if getattr(cur, "rowcount", None) == 0:
-                raise LockLostError(
-                    f"Lock lease was lost or taken over; token '{tok}' no longer holds the lock."
-                )
-        finally:
-            cur.close()
-
     def verify_active_lock(self, lock_token: Optional[str] = None) -> None:
-        """Verifies that this runner holds the active lock and that its lease has not expired.
+        """Verifies that this runner holds the active lock.
 
-        Raises LockLostError if the lock was taken over, released, or expired.
+        Raises LockLostError if the lock was cleared by operator recovery or taken over.
         """
         tok = lock_token or getattr(self, "active_lock_token", None)
         if not tok:
@@ -261,30 +265,8 @@ class MigrationRunner:
             if not row or row[1] != tok:
                 active_tok = row[1] if row else None
                 raise LockLostError(
-                    f"Lock lease was lost or taken over; active holder token is '{active_tok}', expected '{tok}'."
+                    f"Lock was lost or cleared; active holder token is '{active_tok}', expected '{tok}'."
                 )
-
-            locked_at = row[2]
-            timeout_sec = row[3] or getattr(self, "active_lock_timeout_sec", 900) or 900
-            if locked_at is not None:
-                if isinstance(locked_at, str):
-                    try:
-                        locked_at_dt = datetime.datetime.fromisoformat(locked_at)
-                    except Exception:
-                        locked_at_dt = datetime.datetime.now(datetime.timezone.utc)
-                else:
-                    locked_at_dt = locked_at
-
-                if locked_at_dt.tzinfo is None:
-                    locked_at_dt = locked_at_dt.replace(tzinfo=datetime.timezone.utc)
-
-                now_utc = datetime.datetime.now(datetime.timezone.utc)
-                elapsed = (now_utc - locked_at_dt).total_seconds()
-                if elapsed > timeout_sec:
-                    raise LockLostError(
-                        f"Active run exceeded its lease timeout ({elapsed:.1f}s > {timeout_sec}s). "
-                        f"Refusing to continue writing to {self.target_db}."
-                    )
         finally:
             cur.close()
 
@@ -500,100 +482,17 @@ class MigrationRunner:
                 )
 
     def adopt_baseline(self, up_to_version_num: int = 9, installed_by: Optional[str] = None) -> dict:
-        """Explicitly records historical migrations up to version as BASELINE_ADOPTION.
+        """Baseline adoption is disabled for this release.
 
-        Validates physical existence of objects and deterministic seed data per migration version,
-        fences against lease expiration, and checks existing ledger records.
-        Rejects partial deployments before stamping any ledger rows.
+        Attempts fail closed immediately without stamping historical migrations as successful.
+        Refer to docs/migration-runner-specification.md for the reviewed operator deployment procedure.
         """
-        self.ensure_ledger_tables()
-        lock_token = self.acquire_lock()
-        try:
-            migrations = self.discover_migrations()
-            target_migrations = [m for m in migrations if m.version_num <= up_to_version_num]
-            if not target_migrations:
-                raise BaselineAdoptionError(f"No migrations found up to V{up_to_version_num:03d}")
-
-            ledger = self.get_ledger()
-
-            # 1. Validate health and checksums of any existing ledger entries in target range
-            for m in target_migrations:
-                if m.version_str in ledger:
-                    entry = ledger[m.version_str]
-                    if entry["checksum"] != m.checksum:
-                        raise MigrationChecksumMismatchError(
-                            f"Checksum mismatch for migration {m.version_str} ({m.filename})! "
-                            f"Recorded in ledger ({entry['status']}): {entry['checksum']}, On Disk: {m.checksum}."
-                        )
-                    if entry["status"] == "FAILED":
-                        raise UnresolvedFailedMigrationError(
-                            f"Migration {m.version_str} in ledger is in FAILED state: {entry['error_message']}."
-                        )
-                    if entry["status"] == "IN_PROGRESS":
-                        raise InterruptedMigrationError(
-                            f"Migration {m.version_str} in ledger is in IN_PROGRESS state from an interrupted run."
-                        )
-
-            # 2. Fencing check: verify active lock and unexpired lease before running verification
-            self.verify_active_lock(lock_token)
-
-            # 3. Verify physical database objects and deterministic seed data for each migration being baselined
-            cur = self.conn.cursor()
-            try:
-                for m in target_migrations:
-                    if m.version_str not in ledger:
-                        self._verify_migration_objects_exist(cur, m.version_num)
-            finally:
-                cur.close()
-
-            # 4. Fencing check: verify active lock AGAIN before stamping any rows
-            # If the verification took too long and exceeded the lease, or if lock was taken over,
-            # this raises LockLostError and prevents stamping ANY rows into the ledger.
-            self.verify_active_lock(lock_token)
-
-            # 5. Record baseline adoption entries for unrecorded migrations
-            installer = installed_by or os.environ.get("SNOWFLAKE_USER", "SYSTEM")
-            now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-            adopted = []
-            cur = self.conn.cursor()
-            try:
-                for rank, m in enumerate(target_migrations, start=1):
-                    if m.version_str in ledger:
-                        continue
-                    # Fencing check on each insert to guarantee no writing if lease expired
-                    self.verify_active_lock(lock_token)
-                    cur.execute(
-                        f"INSERT INTO {self.target_db}.OPS.SCHEMA_VERSION ("
-                        f"installed_rank, version, description, script_name, checksum, "
-                        f"execution_type, installed_by, installed_on, execution_time_ms, status, error_message"
-                        f") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                        (
-                            rank,
-                            m.version_str,
-                            m.description,
-                            m.filename,
-                            m.checksum,
-                            "BASELINE_ADOPTION",
-                            installer,
-                            now_iso,
-                            0,
-                            "SUCCESS",
-                            None,
-                        )
-                    )
-                    adopted.append(m.version_str)
-            finally:
-                cur.close()
-
-            return {
-                "status": "BASELINE_ADOPTED",
-                "adopted_count": len(adopted),
-                "adopted_versions": adopted,
-                "up_to_version": f"V{up_to_version_num:03d}",
-            }
-        finally:
-            self.release_lock(lock_token)
+        raise BaselineAdoptionDisabledError(
+            f"Baseline adoption is disabled for this release. "
+            f"Historical migrations up to V{up_to_version_num:03d} cannot be adopted or stamped "
+            f"as successful in {self.target_db}. "
+            f"Refer to docs/migration-runner-specification.md for the reviewed operator deployment procedure."
+        )
 
     def run_migrations(self, target_version_num: Optional[int] = None) -> dict:
         """Executes all pending migrations in strict ascending numerical order."""
