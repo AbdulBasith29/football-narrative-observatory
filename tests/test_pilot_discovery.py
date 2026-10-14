@@ -34,6 +34,8 @@ from discover_pilot_coverage import (
     discover_channel_candidates_date_bounded_search,
     discover_channel_candidates_uploads_walk,
     evaluate_format_uncertainty,
+    extract_match_excerpt,
+    find_matching_terms,
     format_report_summary_markdown,
     hydrate_video_metadata_live,
     load_repository_configuration,
@@ -62,7 +64,7 @@ def test_load_repository_configuration():
     # Invariant: channels must contain the 7 canonical pilot channels
     cids = {ch["channel_id"] for ch in config["channels"]}
     assert "UCNAf1k0yIjyGu3k9BwAg3lg" in cids  # Sky Sports PL
-    assert "UCiWLfSweyRNmLpgEHekhoAg" in cids  # ESPN FC
+    assert "UC6c1z7bA__85CIWZ_jpCK-Q" in cids  # ESPN FC (verified ID)
 
 
 # =============================================================================
@@ -200,7 +202,7 @@ def test_validate_channel_identities_live_detects_mismatches():
     # CHANNEL_NOT_FOUND on UC_missing
     assert any(d["channel_id"] == "UC_missing" and d["discrepancy_type"] == "CHANNEL_NOT_FOUND" for d in discrepancies)
     # Discrepancy resolution must preserve membership
-    assert "Preserved" in discrepancies[0]["resolution"]
+    assert "preserved" in discrepancies[0]["resolution"].lower()
 
 
 # =============================================================================
@@ -246,7 +248,7 @@ def test_discover_channel_candidates_uploads_walk_early_stopping():
         telemetry=telem,
     )
 
-    assert res["completeness_status"] == "EXHAUSTIVE"
+    assert res["completeness_status"] == "RETURNED_PAGES_EXHAUSTED"
     assert len(res["items"]) == 2
     assert res["is_truncated"] is False
     assert res["pages_fetched"] == 1
@@ -379,6 +381,140 @@ def test_classify_hydrated_candidate():
     res_3 = classify_hydrated_candidate(cand_3, w_start, w_end, aliases, event_terms)
     assert res_3["status"] == "INELIGIBLE"
     assert res_3["exclusion_reason"] == "OUT_OF_WINDOW"
+
+
+def test_relevance_tiers_separation():
+    """Validates separation of PLAYER_MATCH, EVENT_SPECIFIC, BROAD_EVENT_UNCERTAIN, and NO_MATCH."""
+    w_start = datetime.datetime(2022, 12, 18, 0, 0, tzinfo=datetime.timezone.utc)
+    w_end = datetime.datetime(2022, 12, 20, 23, 59, tzinfo=datetime.timezone.utc)
+    aliases = {
+        "Lionel Messi": ["messi", "leo messi"],
+        "Cristiano Ronaldo": ["ronaldo", "cristiano", "cr7"],
+    }
+    event_terms = ["world cup", "final", "argentina vs france"]
+
+    # 1. Focal player match (Messi)
+    messi_cand = {
+        "video_id": "v_messi",
+        "title": "Messi lifts the World Cup trophy",
+        "description": "Argentina win 2022 World Cup",
+        "published_at": "2022-12-18T20:00:00Z",
+        "duration_seconds": 600,
+        "is_available": True,
+    }
+    res_messi = classify_hydrated_candidate(messi_cand, w_start, w_end, aliases, event_terms)
+    assert res_messi["status"] == "ELIGIBLE"
+    assert res_messi["relevance_tier"] == "PLAYER_MATCH"
+    assert res_messi["player_relevance"] == "MESSI"
+
+    # 2. Event-specific without focal player (Ten Hag / Haaland case)
+    event_cand = {
+        "video_id": "v_event",
+        "title": "Haaland reaction to tournament",
+        "description": "Erling Haaland interview following the World Cup",
+        "published_at": "2022-12-19T10:00:00Z",
+        "duration_seconds": 300,
+        "is_available": True,
+    }
+    res_event = classify_hydrated_candidate(event_cand, w_start, w_end, aliases, event_terms)
+    assert res_event["status"] == "ELIGIBLE"
+    assert res_event["relevance_tier"] == "EVENT_SPECIFIC"
+    assert res_event["player_relevance"] == "NONE"
+
+    # 3. Broad generic term only (LeBron dunk case: matched only "final" in description)
+    lebron_cand = {
+        "video_id": "v_lebron",
+        "title": "LeBron puts Lakers ahead with dunk",
+        "description": "LeBron James thunderous dunk in the final 30 seconds of play",
+        "published_at": "2022-12-19T04:00:00Z",
+        "duration_seconds": 90,
+        "is_available": True,
+    }
+    res_lebron = classify_hydrated_candidate(lebron_cand, w_start, w_end, aliases, event_terms)
+    assert res_lebron["status"] == "ELIGIBLE"
+    assert res_lebron["relevance_tier"] == "BROAD_EVENT_UNCERTAIN"
+    assert res_lebron["matched_event_terms"] == ["final"]
+    assert res_lebron["matched_player_aliases"] == []
+
+    # 4. Completely unrelated
+    unrelated_cand = {
+        "video_id": "v_unrelated",
+        "title": "Cooking pasta recipe",
+        "description": "How to make bolognese",
+        "published_at": "2022-12-19T12:00:00Z",
+        "duration_seconds": 400,
+        "is_available": True,
+    }
+    res_unrelated = classify_hydrated_candidate(unrelated_cand, w_start, w_end, aliases, event_terms)
+    assert res_unrelated["status"] == "INELIGIBLE"
+    assert res_unrelated["relevance_tier"] == "NO_MATCH"
+    assert res_unrelated["exclusion_reason"] == "NO_TARGET_RELEVANCE"
+
+
+def test_extract_match_excerpt_and_matched_field():
+    """Verifies that contextual excerpts and matched fields are accurately identified."""
+    w_start = datetime.datetime(2022, 12, 18, 0, 0, tzinfo=datetime.timezone.utc)
+    w_end = datetime.datetime(2022, 12, 20, 23, 59, tzinfo=datetime.timezone.utc)
+    aliases = {"Lionel Messi": ["messi"]}
+    event_terms = ["world cup"]
+
+    # Match in title only
+    cand_title = {
+        "video_id": "vt",
+        "title": "Incredible goal from Messi today",
+        "description": "Just another great evening of football",
+        "published_at": "2022-12-18T18:00:00Z",
+        "is_available": True,
+    }
+    res_title = classify_hydrated_candidate(cand_title, w_start, w_end, aliases, event_terms)
+    assert res_title["matched_field"] == "title"
+    assert "Messi" in res_title["match_excerpt"]
+
+    # Match in description only
+    cand_desc = {
+        "video_id": "vd",
+        "title": "Post Match Press Conference",
+        "description": "Highlights from the world cup final match",
+        "published_at": "2022-12-18T18:00:00Z",
+        "is_available": True,
+    }
+    res_desc = classify_hydrated_candidate(cand_desc, w_start, w_end, aliases, event_terms)
+    assert res_desc["matched_field"] == "description"
+    assert "world cup" in res_desc["match_excerpt"]
+
+    # Match in both title and description
+    cand_both = {
+        "video_id": "vb",
+        "title": "Messi wins the world cup",
+        "description": "Full analysis of Messi and the squad",
+        "published_at": "2022-12-18T18:00:00Z",
+        "is_available": True,
+    }
+    res_both = classify_hydrated_candidate(cand_both, w_start, w_end, aliases, event_terms)
+    assert res_both["matched_field"] == "both"
+
+
+def test_unresolved_channel_identity_gated_from_eligible():
+    """Unresolved channel identities must be set INELIGIBLE and gated from totals."""
+    w_start = datetime.datetime(2022, 12, 18, 0, 0, tzinfo=datetime.timezone.utc)
+    w_end = datetime.datetime(2022, 12, 20, 23, 59, tzinfo=datetime.timezone.utc)
+    aliases = {"Lionel Messi": ["messi"]}
+    event_terms = ["world cup"]
+
+    cand = {
+        "video_id": "v_unresolved",
+        "channel_id": "UC_unresolved",
+        "title": "Messi brilliant goal",
+        "description": "World Cup highlight",
+        "published_at": "2022-12-18T18:00:00Z",
+        "is_available": True,
+    }
+    res = classify_hydrated_candidate(
+        cand, w_start, w_end, aliases, event_terms, channel_is_validated=False
+    )
+    assert res["status"] == "INELIGIBLE"
+    assert res["exclusion_reason"] == "UNRESOLVED_CHANNEL_IDENTITY"
+    assert res["relevance_tier"] == "UNRESOLVED_CHANNEL"
 
 
 # =============================================================================

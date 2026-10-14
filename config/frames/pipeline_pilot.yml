@@ -2,6 +2,15 @@
 # Methodology Version: 1.2
 # Defines the PIPELINE_PILOT frame membership for minimal-quota pipeline verification.
 # Invariant: RESEARCH runs strictly reject this frame.
+#
+# Identity Corrections (Verified via YouTube Data API channels.list on 2026-10-14):
+# - Sky Sports Premier League: UCNAf1k0yIjyGu3k9BwAg3lg (verified matching @skysportspremierleague)
+# - The United Stand: UCMmVPVb0BwSIOWVeDwlPocQ (verified matching @unitedstand)
+# - Overlap Daily (formerly That's Football): UCFxG3MxHC1ogUglvJeMHmVQ (replaced unresolvable UC_5kL-3t0fUzi8kHwRTY-zQ)
+# - TalkFCB: UCvExuGSwx1Yw30dDY8JEJ3w (replaced unresolvable UCqGqA2hV9e95F9Cj3k2M0gQ; verified via @talkfcb)
+# - Statman Dave: UCXzrxvm0Jqq1OpSZQhT6lEQ (replaced unresolvable UCbX6M_6E0iMzi1Z7H2Bv9KA; verified via @statmandave)
+# - IShowSpeed: UCWsDFcIhY2DBi3GB5uykGXA (replaced UC-lHJZR3Gqxm24_Vd_AJ5Yw which was PewDiePie; verified via @ishowspeed)
+# - ESPN FC: UC6c1z7bA__85CIWZ_jpCK-Q (replaced UCiWLfSweyRNmLpgEHekhoAg which was main US ESPN; verified via @espnfc)
 
 frame_name: "Pilot Pipeline Frame"
 frame_purpose: "PIPELINE_PILOT"
@@ -13,12 +22,12 @@ channels:
     discovery_source: "manual_bootstrap"
     discovery_source_version: "pilot_v1"
 
-  - channel_id: "UC_5kL-3t0fUzi8kHwRTY-zQ"
-    channel_name: "Mark Goldbridge That's Football"
+  - channel_id: "UCFxG3MxHC1ogUglvJeMHmVQ"
+    channel_name: "Overlap Daily"
     discovery_source: "manual_bootstrap"
     discovery_source_version: "pilot_v1"
 
-  - channel_id: "UCqGqA2hV9e95F9Cj3k2M0gQ"
+  - channel_id: "UCvExuGSwx1Yw30dDY8JEJ3w"
     channel_name: "TalkFCB"
     discovery_source: "manual_bootstrap"
     discovery_source_version: "pilot_v1"
@@ -28,17 +37,17 @@ channels:
     discovery_source: "manual_bootstrap"
     discovery_source_version: "pilot_v1"
 
-  - channel_id: "UC-lHJZR3Gqxm24_Vd_AJ5Yw"
+  - channel_id: "UCWsDFcIhY2DBi3GB5uykGXA"
     channel_name: "IShowSpeed"
     discovery_source: "manual_bootstrap"
     discovery_source_version: "pilot_v1"
 
-  - channel_id: "UCbX6M_6E0iMzi1Z7H2Bv9KA"
+  - channel_id: "UCXzrxvm0Jqq1OpSZQhT6lEQ"
     channel_name: "Statman Dave"
     discovery_source: "manual_bootstrap"
     discovery_source_version: "pilot_v1"
 
-  - channel_id: "UCiWLfSweyRNmLpgEHekhoAg"
+  - channel_id: "UC6c1z7bA__85CIWZ_jpCK-Q"
     channel_name: "ESPN FC"
     discovery_source: "manual_bootstrap"
     discovery_source_version: "pilot_v1"
