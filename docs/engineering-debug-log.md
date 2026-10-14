@@ -200,6 +200,21 @@ During exact-SHA inspection of HEAD `d34cd23` (Actions run 36697399828):
 - **Subsecond Precision & Consistent UTC Conversion**: Refactored `normalize_ntz_timestamp` to parse ISO strings, convert timezone-aware representations to UTC before casting to naive, and format using `.isoformat()`, preserving microseconds when non-zero. Confirmed that candidate payloads with 500ms drift raise `SnapshotMutationViolationError` and that equivalent aware datetimes and offset strings produce identical normalized representations.
 - **Selective Duplicate Constraint Handling in V009**: Replaced `WHEN OTHER THEN NULL;` in V009 with conditional error discrimination checking `(SQLSTATE = ''42710'' OR SQLCODE = 2002 OR SQLERRM ILIKE ''%already exists%'') THEN NULL; ELSE RAISE; END IF;`, ensuring unhandled errors immediately halt migration execution.
 - **Test Coverage**: Added tests in [`tests/test_channel_stratification.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/tests/test_channel_stratification.py) verifying fractional-second preservation, offset conversions, subsecond snapshot mutation violation, and V009 exception rethrow semantics (75/75 passing offline).
+---
 
+## Incident 11: CI Pytest Path Resolution and Snowflake DDL Auto-Commit Migration Runner Semantics (Package 2A)
 
+### Context
+1. **GitHub Actions Pytest Collection Failure**: In CI run `37564083026`, `pytest` failed during test collection with exit code 2: `ModuleNotFoundError: No module named 'scripts.reconcile_deployment_drift'`.
+2. **Snowflake DDL Independent Transaction Auto-Commit Semantics**: In Snowflake, DDL statements (`CREATE`, `ALTER`, `DROP`) implicitly commit any open transaction and execute in their own autocommit scope. A multi-statement migration script containing DDL cannot be rolled back via standard SQL transactions if an error occurs midway through script execution.
 
+### Root Cause Analysis
+- **Pytest pythonpath Configuration**: `pyproject.toml` had previously configured `pythonpath = ["scripts"]`. In that configuration, modules inside `scripts/` were importable as top-level names (e.g. `import reconcile_deployment_drift`), but importing with package qualification `from scripts.reconcile_deployment_drift import ...` failed in fresh environments where the repository root was not in `sys.path`.
+- **Snowflake Migration Rollback Impossibility**: Standard migration runners often assume database transactions can roll back DDL on failure. In Snowflake, partial DDL execution persists permanently. Attempting to roll back or pretending a failed migration never ran leaves the database in an unrecorded, corrupted intermediate state.
+
+### Resolution
+- **Robust Path Configuration & Import Fallbacks**: Updated `pyproject.toml` to `pythonpath = [".", "scripts"]` and implemented resilient `sys.path.insert` logic with `try/except ImportError` fallbacks in [`tests/test_deployment_reconciliation.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/tests/test_deployment_reconciliation.py).
+- **Fail-Closed Migration Ledger State Tracking**: In [`scripts/migration_runner.py`](file:///c:/Users/abdul/Documents/football-narrative-observatory/scripts/migration_runner.py), documented and implemented explicit `FAILED` state recording in `OPS.SCHEMA_VERSION`. If a migration encounters an error during execution:
+  1. The error details (`error_code`, `error_message`, `execution_time_ms`) are recorded with `status = 'FAILED'`.
+  2. The runner halts immediately and raises `MigrationExecutionError`.
+  3. Subsequent runner invocations detect the failed migration in the ledger and refuse to run (`MigrationExecutionError: Cannot execute migration ... previous run FAILED`), requiring explicit administrative investigation rather than silent retry or corrupted continuation.
