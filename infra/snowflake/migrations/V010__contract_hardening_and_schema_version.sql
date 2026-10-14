@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS OPS.SCHEMA_LOCK (
 );
 
 MERGE INTO OPS.SCHEMA_LOCK AS target
-USING (SELECT 'GLOBAL_MIGRATION_LOCK' AS lock_id) AS src
+USING (SELECT 'MIGRATION_RUNNER_LOCK' AS lock_id) AS src
 ON target.lock_id = src.lock_id
 WHEN NOT MATCHED THEN
     INSERT (lock_id, locked_at, locked_by, lock_token, lock_timeout_sec)

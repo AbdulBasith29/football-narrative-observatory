@@ -48,11 +48,11 @@ CREATE TABLE IF NOT EXISTS OPS.SCHEMA_VERSION (
 ```
 
 ### 2.2 `OPS.SCHEMA_LOCK`
-Coordinates distributed concurrency to prevent simultaneous execution or statement interleaving. Because Snowflake **does not enforce PRIMARY KEY or UNIQUE constraints** at write time on standard tables, concurrency cannot rely on constraint violation errors from concurrent `INSERT` statements. Instead, `OPS.SCHEMA_LOCK` is pre-seeded with a single persistent row (`GLOBAL_MIGRATION_LOCK`). Processes acquire the lock via an atomic conditional `UPDATE` checking `rowcount == 1`.
+Coordinates distributed concurrency to prevent simultaneous execution or statement interleaving. Because Snowflake **does not enforce PRIMARY KEY or UNIQUE constraints** at write time on standard tables, concurrency cannot rely on constraint violation errors from concurrent `INSERT` statements. Instead, `OPS.SCHEMA_LOCK` is pre-seeded with a single persistent row (`MIGRATION_RUNNER_LOCK`). Processes acquire the lock via an atomic conditional `UPDATE` checking `rowcount == 1`.
 
 ```sql
 CREATE TABLE IF NOT EXISTS OPS.SCHEMA_LOCK (
-    lock_id             VARCHAR(64) NOT NULL, -- Constant: 'GLOBAL_MIGRATION_LOCK'
+    lock_id             VARCHAR(64) NOT NULL, -- Constant: 'MIGRATION_RUNNER_LOCK'
     locked_at           TIMESTAMP_NTZ,        -- NULL when lock is free
     locked_by           VARCHAR(128),         -- NULL when lock is free
     lock_token          VARCHAR(36),          -- UUIDv4 unique to running process, NULL when free
@@ -75,7 +75,7 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
 ### Scenario 1: Fresh Database with No Ledger
 * **Initial State**: Empty or newly created database; `OPS.SCHEMA_VERSION` does not exist.
 * **Runner Action**:
-  1. Ensures `OPS.SCHEMA_VERSION` and `OPS.SCHEMA_LOCK` exist (and seeds singleton `GLOBAL_MIGRATION_LOCK` row via idempotent `MERGE`).
+  1. Ensures `OPS.SCHEMA_VERSION` and `OPS.SCHEMA_LOCK` exist (and seeds singleton `MIGRATION_RUNNER_LOCK` row via idempotent `MERGE`).
   2. Acquires migration lock with unique UUID token via atomic `UPDATE`.
   3. Discovers all available migration scripts on disk (`V001` through `V010`+).
   4. For each migration in ascending numerical order:
@@ -97,7 +97,7 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
   1. **Pre-Deployment Drift Reconciliation**:
      Run the read-only drift reconciler:
      ```bash
-     python scripts/reconcile_deployment_drift.py --database FOOTBALL_NARRATIVE_DEV
+     python scripts/reconcile_deployment_drift.py --target-db FOOTBALL_NARRATIVE_DEV
      ```
      Inspect the emitted reconciliation report. Verify that tables, columns, numeric scale/precision, nullability, and primary/unique key column compositions match Phase 1E repository DDL.
   2. **Human Operator Sign-Off**:
@@ -133,7 +133,7 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
      );
 
      MERGE INTO OPS.SCHEMA_LOCK AS target
-     USING (SELECT 'GLOBAL_MIGRATION_LOCK' AS lock_id) AS src
+     USING (SELECT 'MIGRATION_RUNNER_LOCK' AS lock_id) AS src
      ON target.lock_id = src.lock_id
      WHEN NOT MATCHED THEN
          INSERT (lock_id, locked_at, locked_by, lock_token, lock_timeout_sec)
@@ -145,14 +145,14 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
          execution_type, installed_by, installed_on, execution_time_ms, status
      ) VALUES
          (1, 'V001', 'expand_pagination_token_columns', 'V001__expand_pagination_token_columns.sql', '<V001_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS'),
-         (2, 'V002', 'add_run_purpose_to_ingestion_runs', 'V002__add_run_purpose_to_ingestion_runs.sql', '<V002_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS'),
-         (3, 'V003', 'bridge_video_event_enrichment', 'V003__bridge_video_event_enrichment.sql', '<V003_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS'),
+         (2, 'V002', 'add_run_purpose', 'V002__add_run_purpose.sql', '<V002_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS'),
+         (3, 'V003', 'add_exclusion_reason', 'V003__add_exclusion_reason.sql', '<V003_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS'),
          (4, 'V004', 'add_channel_frame_tables', 'V004__add_channel_frame_tables.sql', '<V004_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS'),
-         (5, 'V005', 'discovery_unit_state_tracking', 'V005__discovery_unit_state_tracking.sql', '<V005_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS'),
-         (6, 'V006', 'video_metadata_resolution_state', 'V006__video_metadata_resolution_state.sql', '<V006_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS'),
-         (7, 'V007', 'lineage_fk_and_constraints_repair', 'V007__lineage_fk_and_constraints_repair.sql', '<V007_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS'),
-         (8, 'V008', 'event_baseline_terms_expansion', 'V008__event_baseline_terms_expansion.sql', '<V008_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS'),
-         (9, 'V009', 'channel_stratification_framework', 'V009__channel_stratification_framework.sql', '<V009_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS');
+         (5, 'V005', 'add_event_terms', 'V005__add_event_terms.sql', '<V005_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS'),
+         (6, 'V006', 'create_discovery_unit_state', 'V006__create_discovery_unit_state.sql', '<V006_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS'),
+         (7, 'V007', 'add_metadata_resolution_and_snapshot_lineage', 'V007__add_metadata_resolution_and_snapshot_lineage.sql', '<V007_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS'),
+         (8, 'V008', 'add_baseline_terms_to_event_version', 'V008__add_baseline_terms_to_event_version.sql', '<V008_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS'),
+         (9, 'V009', 'channel_stratification_and_overrides', 'V009__channel_stratification_and_overrides.sql', '<V009_SHA256>', 'REVIEWED_BASELINE', CURRENT_USER(), CURRENT_TIMESTAMP(), 0, 'SUCCESS');
      ```
   4. **Resume Automated Upgrades**:
      Once `OPS.SCHEMA_VERSION` is populated by the operator, `MigrationRunner.run_migrations()`:
@@ -174,7 +174,7 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
      - If disk checksum != recorded checksum: **FAIL CLOSED**.
        Raises `MigrationChecksumMismatchError`:
        ```text
-       FATAL: Checksum mismatch for migration V004 (V004__expand_event_terms.sql)!
+       FATAL: Checksum mismatch for migration V004 (V004__add_channel_frame_tables.sql)!
        Recorded in ledger (SUCCESS): 3a9f...c120, On Disk: 8e1b...d944.
        Applied migrations are immutable.
        ```
@@ -228,7 +228,7 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
          locked_by = :user,
          lock_token = :token,
          lock_timeout_sec = 900
-     WHERE lock_id = 'GLOBAL_MIGRATION_LOCK'
+     WHERE lock_id = 'MIGRATION_RUNNER_LOCK'
        AND locked_by IS NULL;
      ```
   2. In Snowflake, row-level updates are serialized.
@@ -248,7 +248,7 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
      ```sql
      UPDATE OPS.SCHEMA_LOCK
      SET locked_at = NULL, locked_by = NULL, lock_token = NULL
-     WHERE lock_id = 'GLOBAL_MIGRATION_LOCK' AND lock_token = :token_a;
+     WHERE lock_id = 'MIGRATION_RUNNER_LOCK' AND lock_token = :token_a;
      ```
      Verifying `lock_token = :token_a` ensures that only the acquiring process can release its lock.
 
@@ -262,7 +262,7 @@ Scripts are ordered strictly by integer version number ($1, 2, \dots, 9, 10, \do
      ```sql
      UPDATE OPS.SCHEMA_LOCK
      SET locked_at = NULL, locked_by = NULL, lock_token = NULL
-     WHERE lock_id = 'GLOBAL_MIGRATION_LOCK';
+     WHERE lock_id = 'MIGRATION_RUNNER_LOCK';
      ```
   3. Subsequent runners can now acquire the lock cleanly.
 * **Write Fencing via `verify_active_lock()`**:
