@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """scripts/discover_pilot_coverage.py
-Read-only pilot candidate video discovery and coverage reporter for the Football Narrative Observatory.
+Working candidate video discovery and coverage reporter for the Football Narrative Observatory.
 
-Governing Principles:
-1. Zero Snowflake Writes: Strictly read-only discovery and reporting.
-2. Frozen Methodology: Rule-based eligibility matching (target player aliases, event terms).
-   No manual video cherry-picking and no comment sentiment for eligibility.
-3. Accurate Repository Contracts: Uses real pilot channels from config/frames/pipeline_pilot.yml.
-4. Format Disambiguation: Does NOT infer YouTube Shorts solely from duration.
-5. Temporal Grain Protection: Explicitly distinguishes video publication windows from comment
-   publication windows, tagging retrospective comments and reporting comment truncation.
-6. Offline Parity: Full offline mock mode for deterministic CI and hands-on audits.
+Governing Invariants:
+1. Zero Snowflake Writes: Strictly read-only candidate discovery and coverage reporting.
+2. Real API Execution: Connects to YouTube Data API v3 using credentials from environment
+   (YOUTUBE_API_KEY). Live mode NEVER silently falls back to mock fixtures.
+3. Explicit Synthetic Mock Mode: `--mock` must be passed explicitly; all mock reports are
+   prominently labeled SYNTHETIC_MOCK_DATA with prominent warnings.
+4. Repository Configuration: Loads channels from config/frames/pipeline_pilot.yml, aliases from
+   config/player_aliases.yml, and event terms from config/event_windows.yml.
+5. Identity Validation: Validates channel identities via channels.list. Discrepancies are reported
+   without silently altering frame membership.
+6. Real Telemetry & Pagination: Tracks actual API requests, pagination pages, discovery method,
+   quota units consumed, truncation, and errors. No assumptions of completeness without evidence.
+7. Methodology Protection: Preserves format uncertainty (Decision A.1: is_short = UNKNOWN for
+   <=60s without vertical confirmation) without adding unsupported exclusions or invented strata.
 """
 
 from __future__ import annotations
@@ -21,149 +26,111 @@ import json
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import yaml
+
+# Optional dotenv support for loading local .env
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+# Optional googleapiclient import for live mode
+try:
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    HAVE_GOOGLE_API = True
+except ImportError:
+    HAVE_GOOGLE_API = False
+    HttpError = Exception  # type: ignore
 
 
 # =============================================================================
-# 1. Approved Repository Pilot Channels (config/frames/pipeline_pilot.yml)
+# 1. Official YouTube Data API Quota Reference (Official Google Documentation)
 # =============================================================================
 
-APPROVED_PILOT_CHANNELS = [
-    {
-        "channel_id": "UCNAf1k0yIjyGu3k9BwAg3lg",
-        "channel_name": "Sky Sports Premier League",
-        "expected_handle": "@SkySportsPL",
-        "stratum": "TIER_1_BROADCAST",
-    },
-    {
-        "channel_id": "UC_5kL-3t0fUzi8kHwRTY-zQ",
-        "channel_name": "Mark Goldbridge That's Football",
-        "expected_handle": "@ThatsFootballTV",
-        "stratum": "FAN_MEDIA_PUNDITRY",
-    },
-    {
-        "channel_id": "UCqGqA2hV9e95F9Cj3k2M0gQ",
-        "channel_name": "TalkFCB",
-        "expected_handle": "@talkfcb",
-        "stratum": "FAN_MEDIA_CLUB_SPECIFIC",
-    },
-    {
-        "channel_id": "UCMmVPVb0BwSIOWVeDwlPocQ",
-        "channel_name": "The United Stand",
-        "expected_handle": "@TheUnitedStand",
-        "stratum": "FAN_MEDIA_CLUB_SPECIFIC",
-    },
-    {
-        "channel_id": "UC-lHJZR3Gqxm24_Vd_AJ5Yw",
-        "channel_name": "IShowSpeed",
-        "expected_handle": "@IShowSpeed",
-        "stratum": "REACTION_STREAMER",
-    },
-    {
-        "channel_id": "UCbX6M_6E0iMzi1Z7H2Bv9KA",
-        "channel_name": "Statman Dave",
-        "expected_handle": "@StatmanDave",
-        "stratum": "TACTICAL_ANALYTICS",
-    },
-    {
-        "channel_id": "UCiWLfSweyRNmLpgEHekhoAg",
-        "channel_name": "ESPN FC",
-        "expected_handle": "@ESPNFC",
-        "stratum": "TIER_1_BROADCAST",
-    },
-]
-
-# Approved player aliases (from config/player_aliases.yml)
-MESSI_ALIASES = ["lionel messi", "leo messi", "messi", "lm10", "la pulga"]
-RONALDO_ALIASES = ["cristiano ronaldo", "cristiano", "ronaldo", "cr7"]
-
-# Pilot event terms (from config/event_windows.yml for WC_2022_FINAL)
-WC_2022_EVENT_TERMS = ["world cup", "final", "argentina vs france", "fifa world cup", "qatar 2022"]
+OFFICIAL_QUOTA_COSTS = {
+    "channels.list": 1,
+    "playlistItems.list": 1,
+    "videos.list": 1,
+    "search.list": 100,
+    "commentThreads.list": 1,
+}
 
 
 # =============================================================================
-# 2. Historical Pagination Cost Model
+# 2. Configuration Loader
 # =============================================================================
 
-def explain_historical_pagination_costs(
-    channel_daily_upload_rates: Optional[Dict[str, float]] = None,
-    target_event_year: int = 2022,
-    reference_date: Optional[datetime.date] = None,
-) -> Dict[str, Any]:
-    """Explains the mathematical quota trade-off between upload playlist walk and date-bounded search."""
-    if reference_date is None:
-        reference_date = datetime.date(2026, 10, 14)
-    target_date = datetime.date(target_event_year, 11, 20)
-    days_elapsed = max(1, (reference_date - target_date).days)
+def load_repository_configuration(repo_root: Optional[str] = None) -> Dict[str, Any]:
+    """Loads pilot channels, player aliases, and event definitions from config/ YAML files."""
+    if repo_root is None:
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-    # Default upload frequency per channel (approximate historical averages)
-    rates = channel_daily_upload_rates or {
-        "Sky Sports Premier League": 8.0,
-        "Mark Goldbridge That's Football": 4.0,
-        "TalkFCB": 2.5,
-        "The United Stand": 6.0,
-        "IShowSpeed": 1.5,
-        "Statman Dave": 0.8,
-        "ESPN FC": 22.0,  # ESPN FC uploads high volume (20-25 clips/day)
-    }
+    # 1. Pilot frame channels
+    pilot_frame_path = os.path.join(repo_root, "config", "frames", "pipeline_pilot.yml")
+    if not os.path.exists(pilot_frame_path):
+        raise FileNotFoundError(f"Pilot frame configuration not found at {pilot_frame_path}")
+    with open(pilot_frame_path, "r", encoding="utf-8") as f:
+        pilot_data = yaml.safe_load(f)
+    channels = pilot_data.get("channels", [])
 
-    playlist_estimates = {}
-    total_playlist_units = 0
-    total_videos_to_walk = 0
+    # 2. Player aliases
+    aliases_path = os.path.join(repo_root, "config", "player_aliases.yml")
+    if not os.path.exists(aliases_path):
+        raise FileNotFoundError(f"Player aliases configuration not found at {aliases_path}")
+    with open(aliases_path, "r", encoding="utf-8") as f:
+        alias_data = yaml.safe_load(f)
 
-    for ch_name, rate in rates.items():
-        vids_since_target = int(rate * days_elapsed)
-        pages_to_walk = max(1, (vids_since_target + 49) // 50)
-        quota_cost = pages_to_walk * 1  # playlistItems.list costs 1 quota unit
-        playlist_estimates[ch_name] = {
-            "daily_rate": rate,
-            "videos_since_event": vids_since_target,
-            "pages_to_walk": pages_to_walk,
-            "quota_units": quota_cost,
-        }
-        total_playlist_units += quota_cost
-        total_videos_to_walk += vids_since_target
+    player_aliases: Dict[str, List[str]] = {}
+    for target in alias_data.get("targets", []):
+        name = target.get("entity_name")
+        alias_list = [a.get("text", "").lower() for a in target.get("aliases", []) if a.get("text")]
+        if name:
+            player_aliases[name] = alias_list
 
-    # Search.list calculation: 100 units per page, bounded by publishedAfter & publishedBefore
-    channels_count = len(rates)
-    search_pages_per_channel = 2  # Typically 1-2 pages of 50 items suffice for a 7-day window
-    search_units_per_page = 100
-    search_total_units = channels_count * search_pages_per_channel * search_units_per_page
+    # 3. Event windows & terms
+    events_path = os.path.join(repo_root, "config", "event_windows.yml")
+    if not os.path.exists(events_path):
+        raise FileNotFoundError(f"Event windows configuration not found at {events_path}")
+    with open(events_path, "r", encoding="utf-8") as f:
+        events_data = yaml.safe_load(f)
 
     return {
-        "analysis_date": reference_date.isoformat(),
-        "target_event_date": target_date.isoformat(),
-        "days_elapsed": days_elapsed,
-        "uploads_playlist_walk": {
-            "per_page_quota_cost": 1,
-            "total_videos_to_paginate": total_videos_to_walk,
-            "total_quota_units_needed": total_playlist_units,
-            "channel_breakdown": playlist_estimates,
-            "viability": (
-                "QUOTA_PROHIBITIVE for historical backfill: walking ESPN FC alone from 2026 back to 2022 "
-                f"requires ~{playlist_estimates.get('ESPN FC', {}).get('pages_to_walk', 0)} pages (~{playlist_estimates.get('ESPN FC', {}).get('quota_units', 0)} units). "
-                "Uploads playlist walk is ideal for recent/continuous ingestion, but inefficient for deep historical events."
-            ),
-        },
-        "date_bounded_search": {
-            "per_page_quota_cost": 100,
-            "estimated_pages_per_channel": search_pages_per_channel,
-            "total_quota_units_needed": search_total_units,
-            "viability": (
-                "RECOMMENDED for historical event windows: directly targets the date interval "
-                f"(~{search_total_units} units for 7 channels across a 7-day event window) "
-                "without traversing years of intervening uploads."
-            ),
-        },
+        "channels": channels,
+        "player_aliases": player_aliases,
+        "events": events_data.get("events", []),
+        "frame_purpose": pilot_data.get("frame_purpose", "PIPELINE_PILOT"),
+        "methodology_version": pilot_data.get("methodology_version", "1.2"),
     }
 
 
 # =============================================================================
-# 3. Format Disambiguation & Entity Classification Logic
+# 3. Helpers: Duration Parsing & Word-Boundary Matching
 # =============================================================================
 
+def parse_iso8601_duration(duration_str: str) -> int:
+    """Parses an ISO 8601 duration string (e.g. 'PT4M13S', 'PT58S') into integer seconds."""
+    if not duration_str or not isinstance(duration_str, str):
+        return 0
+    pattern = re.compile(
+        r'P(?:(?P<days>\d+)D)?(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?'
+    )
+    match = pattern.match(duration_str)
+    if not match:
+        return 0
+    parts = match.groupdict()
+    days = int(parts.get('days') or 0)
+    hours = int(parts.get('hours') or 0)
+    minutes = int(parts.get('minutes') or 0)
+    seconds = int(parts.get('seconds') or 0)
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
 def matches_aliases(text: str, aliases: List[str]) -> bool:
-    """Matches aliases using word boundaries to avoid spurious substring matches."""
+    """Matches aliases using word boundaries to prevent substring false positives."""
     text_lower = text.lower()
     for alias in aliases:
         pattern = r"\b" + re.escape(alias.lower()) + r"\b"
@@ -172,11 +139,14 @@ def matches_aliases(text: str, aliases: List[str]) -> bool:
     return False
 
 
-def classify_player_relevance(title: str, description: str = "") -> str:
-    """Classifies target player relevance strictly based on frozen dictionary."""
+def classify_focal_players(title: str, description: str, aliases_dict: Dict[str, List[str]]) -> str:
+    """Classifies focal target players (MESSI, RONALDO, DUAL, NONE) based on config."""
     combined = f"{title} {description}"
-    has_messi = matches_aliases(combined, MESSI_ALIASES)
-    has_ronaldo = matches_aliases(combined, RONALDO_ALIASES)
+    messi_aliases = aliases_dict.get("Lionel Messi", ["messi", "leo messi", "lionel messi"])
+    ronaldo_aliases = aliases_dict.get("Cristiano Ronaldo", ["ronaldo", "cristiano", "cr7"])
+
+    has_messi = matches_aliases(combined, messi_aliases)
+    has_ronaldo = matches_aliases(combined, ronaldo_aliases)
 
     if has_messi and has_ronaldo:
         return "DUAL"
@@ -184,440 +154,1011 @@ def classify_player_relevance(title: str, description: str = "") -> str:
         return "MESSI"
     elif has_ronaldo:
         return "RONALDO"
-    else:
-        return "NONE"
+    return "NONE"
 
 
-def disambiguate_format(
-    duration_seconds: Optional[int],
+def evaluate_format_uncertainty(
+    duration_seconds: int,
     title: str = "",
     description: str = "",
     aspect_ratio: Optional[float] = None,
-    is_shorts_url_confirmed: bool = False,
-) -> str:
-    """Disambiguates YouTube video format without inferring Shorts solely from duration.
+) -> Tuple[str, Optional[bool]]:
+    """Evaluates format under Decision A.1: status cannot be inferred from duration alone.
 
-    Methodology Rule (Decision A.1):
-    Duration <= 60s is insufficient on its own to confirm a YouTube Short,
-    as teasers, trailers, and clips are often <60s but published as standard horizontal video.
+    Returns:
+        (format_label, is_short)
+        where is_short is True, False, or None (UNKNOWN).
     """
     text = f"{title} {description}".lower()
     has_shorts_hashtag = bool(re.search(r"#shorts\b", text))
 
-    if is_shorts_url_confirmed:
-        return "SHORTS_CONFIRMED"
     if aspect_ratio is not None and aspect_ratio < 1.0:
-        return "SHORTS_CONFIRMED"
-    if has_shorts_hashtag and duration_seconds is not None and duration_seconds <= 60:
-        return "SHORTS_CONFIRMED"
+        return "SHORTS_CONFIRMED", True
+    if has_shorts_hashtag and duration_seconds <= 60:
+        return "SHORTS_CONFIRMED", True
+    if duration_seconds > 60:
+        return "LONG_FORM", False
 
-    if duration_seconds is not None and duration_seconds <= 60:
-        # Ambiguous: duration <= 60s but no vertical aspect ratio or shorts confirmation
-        return "UNCERTAIN_FORMAT"
-
-    return "LONG_FORM"
+    # Duration <= 60s without vertical aspect ratio or #shorts tag is UNKNOWN
+    return "FORMAT_UNKNOWN", None
 
 
-def evaluate_candidate(
-    video: Dict[str, Any],
+# =============================================================================
+# 4. Telemetry Tracker
+# =============================================================================
+
+class DiscoveryTelemetry:
+    """Tracks actual API calls, quota units, and execution telemetry."""
+
+    def __init__(self):
+        self.requests_by_endpoint: Dict[str, int] = {
+            "channels.list": 0,
+            "playlistItems.list": 0,
+            "videos.list": 0,
+            "search.list": 0,
+        }
+        self.errors: List[Dict[str, Any]] = []
+
+    def record_request(self, endpoint: str):
+        if endpoint in self.requests_by_endpoint:
+            self.requests_by_endpoint[endpoint] += 1
+        else:
+            self.requests_by_endpoint[endpoint] = 1
+
+    def record_error(self, endpoint: str, channel_id: Optional[str], error: Exception):
+        err_msg = str(error)
+        status_code = getattr(getattr(error, 'resp', None), 'status', None)
+        self.errors.append({
+            "endpoint": endpoint,
+            "channel_id": channel_id,
+            "status_code": status_code,
+            "error_message": err_msg[:500],
+            "is_quota_error": "429" in err_msg or "quota" in err_msg.lower(),
+        })
+
+    def total_requests(self) -> int:
+        return sum(self.requests_by_endpoint.values())
+
+    def calculate_actual_quota_units(self) -> int:
+        total = 0
+        for ep, count in self.requests_by_endpoint.items():
+            cost = OFFICIAL_QUOTA_COSTS.get(ep, 1)
+            total += count * cost
+        return total
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "requests_by_endpoint": dict(self.requests_by_endpoint),
+            "total_api_requests": self.total_requests(),
+            "actual_quota_units_consumed": self.calculate_actual_quota_units(),
+            "official_quota_rates_used": OFFICIAL_QUOTA_COSTS,
+            "error_count": len(self.errors),
+            "errors": self.errors,
+        }
+
+
+# =============================================================================
+# 5. Live YouTube API Operations
+# =============================================================================
+
+def build_youtube_client(api_key: Optional[str] = None):
+    """Instantiates the YouTube Data API v3 client reading credentials from environment."""
+    if not HAVE_GOOGLE_API:
+        raise ImportError(
+            "google-api-python-client is not installed. Please install it to run live discovery."
+        )
+
+    resolved_key = api_key or os.getenv("YOUTUBE_API_KEY")
+    if not resolved_key:
+        raise RuntimeError(
+            "YOUTUBE_API_KEY environment variable is missing. "
+            "Set YOUTUBE_API_KEY in your environment or use --mock for synthetic offline validation."
+        )
+
+    return build("youtube", "v3", developerKey=resolved_key, cache_discovery=False)
+
+
+def validate_channel_identities_live(
+    youtube,
+    configured_channels: List[Dict[str, Any]],
+    telemetry: DiscoveryTelemetry,
+) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+    """Validates channel existence and identities via channels.list without altering membership."""
+    channel_ids = [ch["channel_id"] for ch in configured_channels]
+    validated: Dict[str, Dict[str, Any]] = {}
+    discrepancies: List[Dict[str, Any]] = []
+
+    # Batch in groups of up to 50 IDs
+    for i in range(0, len(channel_ids), 50):
+        batch = channel_ids[i:i + 50]
+        telemetry.record_request("channels.list")
+        try:
+            req = youtube.channels().list(
+                part="snippet,contentDetails,status",
+                id=",".join(batch)
+            )
+            resp = req.execute()
+        except Exception as exc:
+            telemetry.record_error("channels.list", None, exc)
+            raise RuntimeError(f"channels.list request failed: {exc}") from exc
+
+        items = resp.get("items", [])
+        items_by_id = {item["id"]: item for item in items}
+
+        for ch in configured_channels:
+            cid = ch["channel_id"]
+            configured_name = ch.get("channel_name", "")
+            if cid in items_by_id:
+                item = items_by_id[cid]
+                snippet = item.get("snippet", {})
+                live_title = snippet.get("title", "")
+                custom_url = snippet.get("customUrl", "")
+                related = item.get("contentDetails", {}).get("relatedPlaylists", {})
+                uploads_id = related.get("uploads")
+
+                # Detect identity discrepancies (e.g. title renames)
+                if live_title.strip().lower() != configured_name.strip().lower():
+                    discrepancies.append({
+                        "channel_id": cid,
+                        "configured_name": configured_name,
+                        "live_title": live_title,
+                        "custom_url": custom_url,
+                        "discrepancy_type": "TITLE_MISMATCH",
+                        "resolution": "Preserved configured membership; recorded discrepancy for review.",
+                    })
+
+                validated[cid] = {
+                    "channel_id": cid,
+                    "configured_name": configured_name,
+                    "live_title": live_title,
+                    "custom_url": custom_url,
+                    "uploads_playlist_id": uploads_id,
+                    "discovery_source": ch.get("discovery_source", "manual_bootstrap"),
+                    "status": "VALIDATED",
+                }
+            else:
+                discrepancies.append({
+                    "channel_id": cid,
+                    "configured_name": configured_name,
+                    "discrepancy_type": "CHANNEL_NOT_FOUND",
+                    "resolution": "Channel not returned by channels.list; preserved in frame as unvalidated.",
+                })
+                validated[cid] = {
+                    "channel_id": cid,
+                    "configured_name": configured_name,
+                    "status": "NOT_FOUND",
+                }
+
+    return validated, discrepancies
+
+
+def discover_channel_candidates_uploads_walk(
+    youtube,
+    channel_info: Dict[str, Any],
     window_start: datetime.datetime,
     window_end: datetime.datetime,
+    max_pages: int,
+    telemetry: DiscoveryTelemetry,
+) -> Dict[str, Any]:
+    """Discovers candidates by paginating the uploads playlist backwards in time."""
+    uploads_id = channel_info.get("uploads_playlist_id")
+    cid = channel_info["channel_id"]
+
+    if not uploads_id:
+        return {
+            "channel_id": cid,
+            "discovery_method": "UPLOADS_PLAYLIST_WALK",
+            "items": [],
+            "pages_fetched": 0,
+            "is_truncated": False,
+            "completeness_status": "SKIPPED_NO_UPLOADS_PLAYLIST",
+        }
+
+    items = []
+    page_token = None
+    pages_fetched = 0
+    is_truncated = False
+    is_monotonic = True
+    last_pub = None
+
+    while True:
+        if pages_fetched >= max_pages:
+            is_truncated = True
+            break
+
+        telemetry.record_request("playlistItems.list")
+        pages_fetched += 1
+        try:
+            req = youtube.playlistItems().list(
+                part="snippet,contentDetails",
+                playlistId=uploads_id,
+                maxResults=50,
+                pageToken=page_token
+            )
+            resp = req.execute()
+        except Exception as exc:
+            telemetry.record_error("playlistItems.list", cid, exc)
+            return {
+                "channel_id": cid,
+                "discovery_method": "UPLOADS_PLAYLIST_WALK",
+                "items": items,
+                "pages_fetched": pages_fetched,
+                "is_truncated": True,
+                "completeness_status": "ABORTED_ON_API_ERROR",
+                "error": str(exc),
+            }
+
+        batch_items = resp.get("items", [])
+        if not batch_items:
+            break
+
+        for it in batch_items:
+            pub_raw = it.get("contentDetails", {}).get("videoPublishedAt") or it.get("snippet", {}).get("publishedAt", "")
+            try:
+                pub_dt = datetime.datetime.fromisoformat(pub_raw.replace("Z", "+00:00"))
+            except Exception:
+                continue
+
+            if last_pub and pub_dt > last_pub:
+                is_monotonic = False
+            last_pub = pub_dt
+
+            # If item is newer than window_end, continue paginating backwards
+            if pub_dt > window_end:
+                continue
+            # If item is older than window_start, we have passed the window
+            if pub_dt < window_start:
+                if is_monotonic:
+                    # Deterministic early stop: all subsequent items will be even older
+                    return {
+                        "channel_id": cid,
+                        "discovery_method": "UPLOADS_PLAYLIST_WALK",
+                        "items": items,
+                        "pages_fetched": pages_fetched,
+                        "is_truncated": False,
+                        "completeness_status": "EXHAUSTIVE",
+                    }
+                else:
+                    continue
+
+            v_id = it.get("contentDetails", {}).get("videoId") or it.get("snippet", {}).get("resourceId", {}).get("videoId")
+            if v_id:
+                items.append({
+                    "video_id": v_id,
+                    "channel_id": cid,
+                    "title": it.get("snippet", {}).get("title", ""),
+                    "description": it.get("snippet", {}).get("description", ""),
+                    "published_at": pub_raw,
+                })
+
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    completeness = "TRUNCATED_AT_PAGE_LIMIT" if is_truncated else "EXHAUSTIVE"
+    return {
+        "channel_id": cid,
+        "discovery_method": "UPLOADS_PLAYLIST_WALK",
+        "items": items,
+        "pages_fetched": pages_fetched,
+        "is_truncated": is_truncated,
+        "completeness_status": completeness,
+    }
+
+
+def discover_channel_candidates_date_bounded_search(
+    youtube,
+    channel_info: Dict[str, Any],
+    window_start: datetime.datetime,
+    window_end: datetime.datetime,
+    max_pages: int,
+    telemetry: DiscoveryTelemetry,
+) -> Dict[str, Any]:
+    """Discovers candidates using date-bounded search.list."""
+    cid = channel_info["channel_id"]
+    items = []
+    page_token = None
+    pages_fetched = 0
+    is_truncated = False
+
+    w_start_iso = window_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    w_end_iso = window_end.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    while True:
+        if pages_fetched >= max_pages:
+            is_truncated = True
+            break
+
+        telemetry.record_request("search.list")
+        pages_fetched += 1
+        try:
+            req = youtube.search().list(
+                part="snippet",
+                channelId=cid,
+                type="video",
+                publishedAfter=w_start_iso,
+                publishedBefore=w_end_iso,
+                maxResults=50,
+                pageToken=page_token
+            )
+            resp = req.execute()
+        except Exception as exc:
+            telemetry.record_error("search.list", cid, exc)
+            return {
+                "channel_id": cid,
+                "discovery_method": "DATE_BOUNDED_SEARCH",
+                "items": items,
+                "pages_fetched": pages_fetched,
+                "is_truncated": True,
+                "completeness_status": "ABORTED_ON_API_ERROR",
+                "error": str(exc),
+            }
+
+        batch_items = resp.get("items", [])
+        if not batch_items:
+            break
+
+        for it in batch_items:
+            v_id = it.get("id", {}).get("videoId")
+            if v_id:
+                items.append({
+                    "video_id": v_id,
+                    "channel_id": cid,
+                    "title": it.get("snippet", {}).get("title", ""),
+                    "description": it.get("snippet", {}).get("description", ""),
+                    "published_at": it.get("snippet", {}).get("publishedAt", ""),
+                })
+
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    completeness = "TRUNCATED_AT_PAGE_LIMIT" if is_truncated else "EXHAUSTIVE"
+    return {
+        "channel_id": cid,
+        "discovery_method": "DATE_BOUNDED_SEARCH",
+        "items": items,
+        "pages_fetched": pages_fetched,
+        "is_truncated": is_truncated,
+        "completeness_status": completeness,
+    }
+
+
+def hydrate_video_metadata_live(
+    youtube,
+    video_ids: List[str],
+    telemetry: DiscoveryTelemetry,
+) -> Dict[str, Dict[str, Any]]:
+    """Hydrates full video metadata via videos.list in batches of up to 50 IDs."""
+    hydrated: Dict[str, Dict[str, Any]] = {}
+    unique_ids = sorted(list(set(video_ids)))
+
+    for i in range(0, len(unique_ids), 50):
+        batch = unique_ids[i:i + 50]
+        telemetry.record_request("videos.list")
+        try:
+            req = youtube.videos().list(
+                part="snippet,contentDetails,statistics,status",
+                id=",".join(batch)
+            )
+            resp = req.execute()
+        except Exception as exc:
+            telemetry.record_error("videos.list", None, exc)
+            raise RuntimeError(f"videos.list request failed: {exc}") from exc
+
+        items = resp.get("items", [])
+        returned_ids = set()
+
+        for it in items:
+            vid = it.get("id")
+            returned_ids.add(vid)
+            snippet = it.get("snippet", {})
+            content = it.get("contentDetails", {})
+            stats = it.get("statistics", {})
+
+            duration_raw = content.get("duration", "")
+            duration_sec = parse_iso8601_duration(duration_raw)
+
+            lang = snippet.get("defaultAudioLanguage") or snippet.get("defaultLanguage")
+            primary_lang = lang.strip().lower() if lang else "UNKNOWN"
+
+            hydrated[vid] = {
+                "video_id": vid,
+                "title": snippet.get("title", ""),
+                "description": snippet.get("description", ""),
+                "published_at": snippet.get("publishedAt", ""),
+                "channel_id": snippet.get("channelId", ""),
+                "channel_title": snippet.get("channelTitle", ""),
+                "duration_seconds": duration_sec,
+                "primary_language": primary_lang,
+                "view_count": stats.get("viewCount"),
+                "like_count": stats.get("likeCount"),
+                "comment_count": stats.get("commentCount"),
+                "is_available": True,
+            }
+
+        # Track videos that were discovered but not returned by videos.list (e.g. deleted/private)
+        missing_ids = set(batch) - returned_ids
+        for mid in missing_ids:
+            hydrated[mid] = {
+                "video_id": mid,
+                "is_available": False,
+                "exclusion_reason": "VIDEO_UNAVAILABLE",
+            }
+
+    return hydrated
+
+
+# =============================================================================
+# 6. Candidate Classification & Report Generation
+# =============================================================================
+
+def classify_hydrated_candidate(
+    candidate: Dict[str, Any],
+    window_start: datetime.datetime,
+    window_end: datetime.datetime,
+    player_aliases: Dict[str, List[str]],
     event_terms: List[str],
 ) -> Dict[str, Any]:
-    """Evaluates a video candidate against window and relevance criteria."""
-    snippet = video.get("snippet", {})
-    title = snippet.get("title", "")
-    description = snippet.get("description", "")
-    pub_str = snippet.get("publishedAt", "")
-    content_details = video.get("contentDetails", {})
+    """Applies frozen methodology rules to classify video relevance and format uncertainty."""
+    if not candidate.get("is_available", True):
+        return {
+            "video_id": candidate["video_id"],
+            "channel_id": candidate.get("channel_id"),
+            "status": "INELIGIBLE",
+            "exclusion_reason": "VIDEO_UNAVAILABLE",
+            "is_short": None,
+            "format_label": "UNKNOWN",
+            "player_relevance": "NONE",
+            "has_event_term": False,
+        }
 
-    # Parse publication timestamp
+    title = candidate.get("title", "")
+    desc = candidate.get("description", "")
+    pub_raw = candidate.get("published_at", "")
+
     try:
-        pub_dt = datetime.datetime.fromisoformat(pub_str.replace("Z", "+00:00"))
+        pub_dt = datetime.datetime.fromisoformat(pub_raw.replace("Z", "+00:00"))
     except Exception:
         pub_dt = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
 
-    # Temporal Window Evaluation
+    # 1. Temporal Window
     in_window = (window_start <= pub_dt <= window_end)
 
-    # Player Relevance
-    player_category = classify_player_relevance(title, description)
+    # 2. Player Relevance
+    player_rel = classify_focal_players(title, desc, player_aliases)
 
-    # Event Term Relevance
-    combined_text = f"{title} {description}"
-    has_event_term = matches_aliases(combined_text, event_terms)
+    # 3. Event Relevance
+    combined = f"{title} {desc}"
+    has_event = matches_aliases(combined, event_terms)
 
-    # Format Disambiguation
-    duration_sec = video.get("duration_seconds")
-    aspect_ratio = video.get("aspect_ratio")
-    is_shorts_url = video.get("is_shorts_url", False)
-    format_type = disambiguate_format(
-        duration_seconds=duration_sec,
+    # 4. Format Disambiguation under Decision A.1 (Preserve Uncertainty)
+    dur = candidate.get("duration_seconds", 0)
+    format_label, is_short = evaluate_format_uncertainty(
+        duration_seconds=dur,
         title=title,
-        description=description,
-        aspect_ratio=aspect_ratio,
-        is_shorts_url_confirmed=is_shorts_url,
+        description=desc,
+        aspect_ratio=candidate.get("aspect_ratio"),
     )
 
-    # Eligibility & Exclusion Determination
+    # 5. Eligibility Determination (Strictly approved rules)
     exclusion_reason = None
     if not in_window:
         status = "INELIGIBLE"
         exclusion_reason = "OUT_OF_WINDOW"
-    elif player_category == "NONE" and not has_event_term:
+    elif player_rel == "NONE" and not has_event:
         status = "INELIGIBLE"
         exclusion_reason = "NO_TARGET_RELEVANCE"
-    elif format_type == "UNCERTAIN_FORMAT":
-        # Decision A.1: ambiguous format fails closed from default selection cohort
-        status = "INELIGIBLE"
-        exclusion_reason = "UNCERTAIN_FORMAT_GATED"
     else:
         status = "ELIGIBLE"
 
     return {
-        "video_id": video.get("id") or snippet.get("resourceId", {}).get("videoId"),
-        "channel_id": snippet.get("channelId"),
-        "channel_title": snippet.get("channelTitle"),
+        "video_id": candidate["video_id"],
+        "channel_id": candidate.get("channel_id"),
+        "channel_title": candidate.get("channel_title"),
         "title": title,
-        "published_at": pub_str,
+        "published_at": pub_raw,
         "in_window": in_window,
-        "player_category": player_category,
-        "has_event_term": has_event_term,
-        "format_type": format_type,
+        "player_relevance": player_rel,
+        "has_event_term": has_event,
+        "duration_seconds": dur,
+        "is_short": is_short,
+        "format_label": format_label,
         "status": status,
         "exclusion_reason": exclusion_reason,
-        "comment_count": video.get("statistics", {}).get("commentCount"),
-        "view_count": video.get("statistics", {}).get("viewCount"),
+        "view_count": candidate.get("view_count"),
+        "comment_count": candidate.get("comment_count"),
     }
 
 
 # =============================================================================
-# 4. Temporal Grain: Video Publication vs Comment Publication
+# 7. Explicit Synthetic Mock Mode Fixtures
 # =============================================================================
 
-def explain_comment_temporal_grain(
-    video_published_at_str: str,
-    comment_published_at_str: str,
-    contemporaneous_grace_period_days: int = 30,
-) -> Dict[str, Any]:
-    """Analyzes comment timestamp against video timestamp to avoid retrospective pollution."""
-    v_dt = datetime.datetime.fromisoformat(video_published_at_str.replace("Z", "+00:00"))
-    c_dt = datetime.datetime.fromisoformat(comment_published_at_str.replace("Z", "+00:00"))
-
-    delta_days = (c_dt - v_dt).total_seconds() / 86400.0
-    is_contemporaneous = 0.0 <= delta_days <= contemporaneous_grace_period_days
-
-    observation_type = "CONTEMPORANEOUS_REACTION" if is_contemporaneous else "RETROSPECTIVE_OBSERVATION"
-
-    return {
-        "video_published_at": video_published_at_str,
-        "comment_published_at": comment_published_at_str,
-        "elapsed_days_post_video": round(delta_days, 2),
-        "is_contemporaneous": is_contemporaneous,
-        "observation_type": observation_type,
-        "analytical_rule": (
-            "Comments posted >30 days after video publication reflect retrospective reception, "
-            "algorithmic resurrection, or tournament aftermath, and MUST NOT be presented as real-time event reactions."
-        ),
-    }
-
-
-# =============================================================================
-# 5. Deterministic Mock Fixture Data
-# =============================================================================
-
-def get_mock_candidates_fixture() -> List[Dict[str, Any]]:
-    """Generates realistic mock candidate videos across the 7 pilot channels for 2022 World Cup Final window."""
-    return [
-        # 1. Sky Sports Premier League
-        {
-            "id": "sky_vid_001",
-            "snippet": {
-                "channelId": "UCNAf1k0yIjyGu3k9BwAg3lg",
-                "channelTitle": "Sky Sports Premier League",
-                "title": "Lionel Messi lifts World Cup: Historic Argentina triumph reaction",
-                "description": "Full pundit reaction as Messi cements his legacy in Qatar 2022.",
-                "publishedAt": "2022-12-18T19:30:00Z",
-            },
-            "duration_seconds": 920,
-            "statistics": {"commentCount": "4520", "viewCount": "1250000"},
-        },
-        {
-            "id": "sky_vid_002",
-            "snippet": {
-                "channelId": "UCNAf1k0yIjyGu3k9BwAg3lg",
-                "channelTitle": "Sky Sports Premier League",
-                "title": "Premier League returns: Boxing day preview",
-                "description": "Arsenal, Man City, and Chelsea prepare for the league restart.",
-                "publishedAt": "2022-12-23T11:00:00Z",
-            },
-            "duration_seconds": 600,
-            "statistics": {"commentCount": "890", "viewCount": "210000"},
-        },
-        # 2. ESPN FC
-        {
-            "id": "espn_vid_001",
-            "snippet": {
-                "channelId": "UCiWLfSweyRNmLpgEHekhoAg",
-                "channelTitle": "ESPN FC",
-                "title": "Is Messi the undisputed GOAT over Ronaldo now? | ESPN FC",
-                "description": "Dan Thomas, Craig Burley, and Shaka Hislop debate Messi vs Cristiano Ronaldo after the final.",
-                "publishedAt": "2022-12-18T21:00:00Z",
-            },
-            "duration_seconds": 780,
-            "statistics": {"commentCount": "8930", "viewCount": "1840000"},
-        },
-        {
-            "id": "espn_vid_002",
-            "snippet": {
-                "channelId": "UCiWLfSweyRNmLpgEHekhoAg",
-                "channelTitle": "ESPN FC",
-                "title": "Mbappe's unbelievable World Cup final hat-trick breakdown",
-                "description": "Tactical analysis of France vs Argentina world cup final.",
-                "publishedAt": "2022-12-19T02:00:00Z",
-            },
-            "duration_seconds": 540,
-            "statistics": {"commentCount": "2300", "viewCount": "670000"},
-        },
-        # 3. Mark Goldbridge That's Football
-        {
-            "id": "goldbridge_vid_001",
-            "snippet": {
-                "channelId": "UC_5kL-3t0fUzi8kHwRTY-zQ",
-                "channelTitle": "Mark Goldbridge That's Football",
-                "title": "MESSI WINS THE WORLD CUP! Greatest Final EVER! Argentina 3-3 France Reaction",
-                "description": "Live watchalong and post-match thoughts on Messi's World Cup glory.",
-                "publishedAt": "2022-12-18T18:45:00Z",
-            },
-            "duration_seconds": 1820,
-            "statistics": {"commentCount": "6120", "viewCount": "920000"},
-        },
-        # 4. TalkFCB
-        {
-            "id": "talkfcb_vid_001",
-            "snippet": {
-                "channelId": "UCqGqA2hV9e95F9Cj3k2M0gQ",
-                "channelTitle": "TalkFCB",
-                "title": "MESSI IS THE WORLD CHAMPION! Barcelona Legend Achieves Destiny",
-                "description": "Emotional reaction to Leo Messi winning the World Cup final.",
-                "publishedAt": "2022-12-18T19:00:00Z",
-            },
-            "duration_seconds": 850,
-            "statistics": {"commentCount": "3410", "viewCount": "410000"},
-        },
-        # 5. The United Stand
-        {
-            "id": "unitedstand_vid_001",
-            "snippet": {
-                "channelId": "UCMmVPVb0BwSIOWVeDwlPocQ",
-                "channelTitle": "The United Stand",
-                "title": "Ronaldo vs Messi World Cup debate settled? Man United transfer latest",
-                "description": "Discussing Cristiano Ronaldo's contract termination and Messi's triumph.",
-                "publishedAt": "2022-12-19T14:00:00Z",
-            },
-            "duration_seconds": 1420,
-            "statistics": {"commentCount": "4800", "viewCount": "530000"},
-        },
-        # 6. Statman Dave
-        {
-            "id": "statman_vid_001",
-            "snippet": {
-                "channelId": "UCbX6M_6E0iMzi1Z7H2Bv9KA",
-                "channelTitle": "Statman Dave",
-                "title": "How Lionel Messi Won The World Cup | Tactical Breakdown",
-                "description": "Statistical analysis of Lionel Messi's playmaking and Argentina's structure.",
-                "publishedAt": "2022-12-19T16:00:00Z",
-            },
-            "duration_seconds": 640,
-            "statistics": {"commentCount": "1940", "viewCount": "380000"},
-        },
-        # 7. IShowSpeed (Reaction Streamer - includes Short and Uncertain formats)
-        {
-            "id": "speed_vid_001",
-            "snippet": {
-                "channelId": "UC-lHJZR3Gqxm24_Vd_AJ5Yw",
-                "channelTitle": "IShowSpeed",
-                "title": "Speed cries as Messi wins World Cup over Ronaldo #shorts",
-                "description": "Speed reaction to World Cup final #shorts",
-                "publishedAt": "2022-12-18T18:30:00Z",
-            },
-            "duration_seconds": 45,
-            "aspect_ratio": 0.56,
-            "is_shorts_url": True,
-            "statistics": {"commentCount": "12500", "viewCount": "4500000"},
-        },
-        {
-            "id": "speed_vid_002",
-            "snippet": {
-                "channelId": "UC-lHJZR3Gqxm24_Vd_AJ5Yw",
-                "channelTitle": "IShowSpeed",
-                "title": "Ronaldo will always be my GOAT no matter what!",
-                "description": "Speed defense of CR7 after Qatar 2022.",
-                "publishedAt": "2022-12-19T20:00:00Z",
-            },
-            "duration_seconds": 55,  # Short duration but NO vertical metadata -> UNCERTAIN_FORMAT
-            "statistics": {"commentCount": "8900", "viewCount": "2100000"},
-        },
-        # Out of Window example
-        {
-            "id": "espn_vid_out_001",
-            "snippet": {
-                "channelId": "UCiWLfSweyRNmLpgEHekhoAg",
-                "channelTitle": "ESPN FC",
-                "title": "Cristiano Ronaldo signs official contract with Al Nassr",
-                "description": "Ronaldo transfer unveiled in Saudi Arabia.",
-                "publishedAt": "2023-01-03T17:00:00Z",  # Jan 2023 is outside WC 2022 window
-            },
-            "duration_seconds": 450,
-            "statistics": {"commentCount": "7200", "viewCount": "1500000"},
-        },
-    ]
-
-
-# =============================================================================
-# 6. Report Generator & Runner
-# =============================================================================
-
-def run_pilot_discovery(
-    channels: List[Dict[str, Any]],
-    candidates: List[Dict[str, Any]],
+def run_synthetic_mock_discovery(
+    repo_config: Dict[str, Any],
     window_start: datetime.datetime,
     window_end: datetime.datetime,
     event_terms: List[str],
 ) -> Dict[str, Any]:
-    """Evaluates candidate pool and produces a structured candidate coverage report."""
-    evaluated = [
-        evaluate_candidate(c, window_start, window_end, event_terms)
-        for c in candidates
+    """Generates an explicitly labeled SYNTHETIC candidate coverage report."""
+    channels = repo_config["channels"]
+    aliases = repo_config["player_aliases"]
+
+    # Synthetic candidate pool
+    synthetic_raw_candidates = [
+        # Sky Sports PL
+        {
+            "video_id": "mock_sky_01",
+            "channel_id": "UCNAf1k0yIjyGu3k9BwAg3lg",
+            "channel_title": "Sky Sports Premier League",
+            "title": "Lionel Messi wins World Cup: Historic Argentina triumph reaction",
+            "description": "Full reaction to the Qatar 2022 World Cup final.",
+            "published_at": "2022-12-18T19:30:00Z",
+            "duration_seconds": 920,
+            "view_count": "1450000",
+            "comment_count": "4520",
+            "is_available": True,
+        },
+        {
+            "video_id": "mock_sky_02",
+            "channel_id": "UCNAf1k0yIjyGu3k9BwAg3lg",
+            "channel_title": "Sky Sports Premier League",
+            "title": "Premier League restart preview: Arsenal, City, Liverpool",
+            "description": "Looking ahead to Boxing Day action.",
+            "published_at": "2022-12-23T10:00:00Z",
+            "duration_seconds": 600,
+            "view_count": "210000",
+            "comment_count": "890",
+            "is_available": True,
+        },
+        # ESPN FC
+        {
+            "video_id": "mock_espn_01",
+            "channel_id": "UCiWLfSweyRNmLpgEHekhoAg",
+            "channel_title": "ESPN FC",
+            "title": "Is Messi the undisputed GOAT over Ronaldo now? | ESPN FC",
+            "description": "Dan Thomas and Craig Burley debate Messi vs Cristiano Ronaldo after the final.",
+            "published_at": "2022-12-18T21:00:00Z",
+            "duration_seconds": 780,
+            "view_count": "1840000",
+            "comment_count": "8930",
+            "is_available": True,
+        },
+        {
+            "video_id": "mock_espn_02",
+            "channel_id": "UCiWLfSweyRNmLpgEHekhoAg",
+            "channel_title": "ESPN FC",
+            "title": "Mbappe's unbelievable World Cup final hat-trick breakdown",
+            "description": "Tactical analysis of France vs Argentina world cup final.",
+            "published_at": "2022-12-19T02:00:00Z",
+            "duration_seconds": 540,
+            "view_count": "670000",
+            "comment_count": "2300",
+            "is_available": True,
+        },
+        # Mark Goldbridge That's Football
+        {
+            "video_id": "mock_gold_01",
+            "channel_id": "UC_5kL-3t0fUzi8kHwRTY-zQ",
+            "channel_title": "Mark Goldbridge That's Football",
+            "title": "MESSI WINS THE WORLD CUP! Greatest Final EVER! Argentina 3-3 France Reaction",
+            "description": "Live post-match watchalong thoughts on Messi's glory.",
+            "published_at": "2022-12-18T18:45:00Z",
+            "duration_seconds": 1820,
+            "view_count": "920000",
+            "comment_count": "6120",
+            "is_available": True,
+        },
+        # TalkFCB
+        {
+            "video_id": "mock_talk_01",
+            "channel_id": "UCqGqA2hV9e95F9Cj3k2M0gQ",
+            "channel_title": "TalkFCB",
+            "title": "MESSI IS THE WORLD CHAMPION! Barcelona Legend Achieves Destiny",
+            "description": "Emotional reaction to Leo Messi winning the World Cup final.",
+            "published_at": "2022-12-18T19:00:00Z",
+            "duration_seconds": 850,
+            "view_count": "410000",
+            "comment_count": "3410",
+            "is_available": True,
+        },
+        # The United Stand
+        {
+            "video_id": "mock_tus_01",
+            "channel_id": "UCMmVPVb0BwSIOWVeDwlPocQ",
+            "channel_title": "The United Stand",
+            "title": "Ronaldo vs Messi World Cup debate settled? Man United transfer latest",
+            "description": "Discussing Cristiano Ronaldo's contract termination and Messi's triumph.",
+            "published_at": "2022-12-19T14:00:00Z",
+            "duration_seconds": 1420,
+            "view_count": "530000",
+            "comment_count": "4800",
+            "is_available": True,
+        },
+        # Statman Dave
+        {
+            "video_id": "mock_stat_01",
+            "channel_id": "UCbX6M_6E0iMzi1Z7H2Bv9KA",
+            "channel_title": "Statman Dave",
+            "title": "How Lionel Messi Won The World Cup | Tactical Breakdown",
+            "description": "Statistical analysis of Lionel Messi's playmaking and Argentina's structure.",
+            "published_at": "2022-12-19T16:00:00Z",
+            "duration_seconds": 640,
+            "view_count": "380000",
+            "comment_count": "1940",
+            "is_available": True,
+        },
+        # IShowSpeed
+        {
+            "video_id": "mock_speed_01",
+            "channel_id": "UC-lHJZR3Gqxm24_Vd_AJ5Yw",
+            "channel_title": "IShowSpeed",
+            "title": "Speed cries as Messi wins World Cup over Ronaldo #shorts",
+            "description": "Reaction to World Cup final #shorts",
+            "published_at": "2022-12-18T18:30:00Z",
+            "duration_seconds": 45,
+            "view_count": "4500000",
+            "comment_count": "12500",
+            "is_available": True,
+        },
+        {
+            "video_id": "mock_speed_02",
+            "channel_id": "UC-lHJZR3Gqxm24_Vd_AJ5Yw",
+            "channel_title": "IShowSpeed",
+            "title": "Ronaldo will always be my GOAT no matter what!",
+            "description": "Speed defense of CR7 after Qatar 2022.",
+            "published_at": "2022-12-19T20:00:00Z",
+            "duration_seconds": 55,  # <=60s without vertical confirmation -> format UNKNOWN (preserved)
+            "view_count": "2100000",
+            "comment_count": "8900",
+            "is_available": True,
+        },
     ]
 
-    # Aggregations by channel
-    channel_summary: Dict[str, Dict[str, Any]] = {}
+    evaluated = [
+        classify_hydrated_candidate(c, window_start, window_end, aliases, event_terms)
+        for c in synthetic_raw_candidates
+    ]
+
+    channel_breakdown: Dict[str, Any] = {}
     for ch in channels:
         cid = ch["channel_id"]
         c_vids = [v for v in evaluated if v["channel_id"] == cid]
-        eligible_vids = [v for v in c_vids if v["status"] == "ELIGIBLE"]
-
-        channel_summary[cid] = {
-            "channel_name": ch["channel_name"],
-            "expected_handle": ch["expected_handle"],
-            "stratum": ch["stratum"],
-            "total_candidates_evaluated": len(c_vids),
-            "eligible_candidates": len(eligible_vids),
+        eligible = [v for v in c_vids if v["status"] == "ELIGIBLE"]
+        channel_breakdown[cid] = {
+            "channel_id": cid,
+            "configured_name": ch.get("channel_name"),
+            "discovery_method": "SYNTHETIC_FIXTURE",
+            "pages_fetched": 1,
+            "is_truncated": False,
+            "completeness_status": "SYNTHETIC_COMPLETE",
+            "total_candidates": len(c_vids),
+            "eligible_candidates": len(eligible),
             "by_player": {
-                "MESSI": sum(1 for v in eligible_vids if v["player_category"] == "MESSI"),
-                "RONALDO": sum(1 for v in eligible_vids if v["player_category"] == "RONALDO"),
-                "DUAL": sum(1 for v in eligible_vids if v["player_category"] == "DUAL"),
-                "GENERAL_EVENT": sum(1 for v in eligible_vids if v["player_category"] == "NONE" and v["has_event_term"]),
+                "MESSI": sum(1 for v in eligible if v["player_relevance"] == "MESSI"),
+                "RONALDO": sum(1 for v in eligible if v["player_relevance"] == "RONALDO"),
+                "DUAL": sum(1 for v in eligible if v["player_relevance"] == "DUAL"),
+                "GENERAL_EVENT": sum(1 for v in eligible if v["player_relevance"] == "NONE" and v["has_event_term"]),
             },
             "by_format": {
-                "LONG_FORM": sum(1 for v in eligible_vids if v["format_type"] == "LONG_FORM"),
-                "SHORTS_CONFIRMED": sum(1 for v in eligible_vids if v["format_type"] == "SHORTS_CONFIRMED"),
-                "UNCERTAIN_FORMAT": sum(1 for v in c_vids if v["format_type"] == "UNCERTAIN_FORMAT"),
+                "LONG_FORM": sum(1 for v in eligible if v["is_short"] is False),
+                "SHORTS_CONFIRMED": sum(1 for v in eligible if v["is_short"] is True),
+                "FORMAT_UNKNOWN": sum(1 for v in eligible if v["is_short"] is None),
             },
             "exclusions": {
                 "OUT_OF_WINDOW": sum(1 for v in c_vids if v["exclusion_reason"] == "OUT_OF_WINDOW"),
                 "NO_TARGET_RELEVANCE": sum(1 for v in c_vids if v["exclusion_reason"] == "NO_TARGET_RELEVANCE"),
-                "UNCERTAIN_FORMAT_GATED": sum(1 for v in c_vids if v["exclusion_reason"] == "UNCERTAIN_FORMAT_GATED"),
             },
         }
-
-    # Coverage gaps: channels with zero eligible candidates
-    coverage_gaps = [
-        ch_info["channel_name"]
-        for cid, ch_info in channel_summary.items()
-        if ch_info["eligible_candidates"] == 0
-    ]
-
-    # Quota analysis for historical window
-    quota_analysis = explain_historical_pagination_costs(
-        target_event_year=window_start.year,
-        reference_date=datetime.date(2026, 10, 14),
-    )
-
-    total_eligible = sum(1 for v in evaluated if v["status"] == "ELIGIBLE")
-    total_evaluated = len(evaluated)
 
     return {
         "report_metadata": {
             "report_generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "pipeline_frame": "PIPELINE_PILOT",
-            "frame_source": "config/frames/pipeline_pilot.yml",
-            "methodology_version": "1.2",
+            "execution_mode": "SYNTHETIC_MOCK",
+            "data_provenance": "SYNTHETIC_FIXTURE_DATA_NOT_LIVE_API",
+            "warning": "WARNING: ALL METRICS AND CANDIDATES IN THIS REPORT ARE SYNTHETIC FIXTURES.",
+            "pipeline_frame": repo_config.get("frame_purpose", "PIPELINE_PILOT"),
+            "methodology_version": repo_config.get("methodology_version", "1.2"),
             "window_start": window_start.isoformat(),
             "window_end": window_end.isoformat(),
-            "event_terms": event_terms,
+            "discovery_method": "SYNTHETIC_FIXTURE",
         },
+        "telemetry": {
+            "requests_by_endpoint": {"channels.list": 0, "playlistItems.list": 0, "videos.list": 0, "search.list": 0},
+            "total_api_requests": 0,
+            "actual_quota_units_consumed": 0,
+            "official_quota_rates_used": OFFICIAL_QUOTA_COSTS,
+            "error_count": 0,
+            "errors": [],
+        },
+        "channel_identity_validations": [],
         "overall_summary": {
-            "total_channels_tracked": len(channels),
-            "total_candidates_evaluated": total_evaluated,
-            "total_eligible_candidates": total_eligible,
-            "coverage_gap_channels_count": len(coverage_gaps),
-            "coverage_gap_channels": coverage_gaps,
+            "total_channels": len(channels),
+            "total_candidates_evaluated": len(evaluated),
+            "total_eligible_candidates": sum(1 for v in evaluated if v["status"] == "ELIGIBLE"),
+            "coverage_gaps": [
+                ch["channel_name"] for ch in channels if channel_breakdown[ch["channel_id"]]["eligible_candidates"] == 0
+            ],
         },
-        "channel_breakdown": channel_summary,
-        "historical_pagination_cost_model": quota_analysis,
+        "channel_breakdown": channel_breakdown,
         "evaluated_candidates": evaluated,
     }
 
 
+# =============================================================================
+# 8. Main Orchestrator (Live & Mock)
+# =============================================================================
+
+def execute_discovery(
+    repo_root: Optional[str] = None,
+    mock: bool = False,
+    api_key: Optional[str] = None,
+    method: str = "uploads_playlist",
+    window_start_str: str = "2022-12-18T00:00:00Z",
+    window_end_str: str = "2022-12-20T23:59:59Z",
+    max_pages_per_channel: int = 5,
+) -> Dict[str, Any]:
+    """Orchestrates candidate video discovery without performing any Snowflake writes."""
+    config = load_repository_configuration(repo_root)
+
+    w_start = datetime.datetime.fromisoformat(window_start_str.replace("Z", "+00:00"))
+    w_end = datetime.datetime.fromisoformat(window_end_str.replace("Z", "+00:00"))
+
+    # Select event terms from first matching pilot event (WC_2022_FINAL)
+    event_terms = ["world cup", "final", "argentina vs france", "fifa world cup", "qatar 2022"]
+    for ev in config.get("events", []):
+        if ev.get("external_event_id") == "WC_2022_FINAL":
+            terms = ev.get("event_terms", []) + ev.get("baseline_terms", [])
+            if terms:
+                event_terms = sorted(list(set(terms)))
+            break
+
+    # 1. Synthetic Mock Mode
+    if mock:
+        return run_synthetic_mock_discovery(config, w_start, w_end, event_terms)
+
+    # 2. Live Mode (Strictly fail-closed; no silent mock fallback)
+    youtube = build_youtube_client(api_key=api_key)
+    telemetry = DiscoveryTelemetry()
+
+    # Step A: Validate channel identities
+    validated_channels, discrepancies = validate_channel_identities_live(
+        youtube=youtube,
+        configured_channels=config["channels"],
+        telemetry=telemetry,
+    )
+
+    # Step B: Discover candidate videos per channel
+    all_raw_candidates: List[Dict[str, Any]] = []
+    channel_telemetry: Dict[str, Any] = {}
+
+    for ch in config["channels"]:
+        cid = ch["channel_id"]
+        ch_val = validated_channels.get(cid, {"channel_id": cid})
+
+        if method == "search":
+            disc_res = discover_channel_candidates_date_bounded_search(
+                youtube=youtube,
+                channel_info=ch_val,
+                window_start=w_start,
+                window_end=w_end,
+                max_pages=max_pages_per_channel,
+                telemetry=telemetry,
+            )
+        else:
+            disc_res = discover_channel_candidates_uploads_walk(
+                youtube=youtube,
+                channel_info=ch_val,
+                window_start=w_start,
+                window_end=w_end,
+                max_pages=max_pages_per_channel,
+                telemetry=telemetry,
+            )
+
+        channel_telemetry[cid] = disc_res
+        all_raw_candidates.extend(disc_res.get("items", []))
+
+    # Step C: Hydrate video metadata in batches via videos.list
+    candidate_ids = [c["video_id"] for c in all_raw_candidates if "video_id" in c]
+    hydrated_dict = hydrate_video_metadata_live(
+        youtube=youtube,
+        video_ids=candidate_ids,
+        telemetry=telemetry,
+    )
+
+    # Step D: Classify candidates against frozen methodology rules
+    classified_candidates = [
+        classify_hydrated_candidate(
+            candidate=hydrated_dict.get(c["video_id"], c),
+            window_start=w_start,
+            window_end=w_end,
+            player_aliases=config["player_aliases"],
+            event_terms=event_terms,
+        )
+        for c in all_raw_candidates
+    ]
+
+    # Step E: Aggregate channel breakdown
+    channel_breakdown: Dict[str, Any] = {}
+    for ch in config["channels"]:
+        cid = ch["channel_id"]
+        disc_info = channel_telemetry.get(cid, {})
+        c_vids = [v for v in classified_candidates if v.get("channel_id") == cid]
+        eligible = [v for v in c_vids if v["status"] == "ELIGIBLE"]
+
+        channel_breakdown[cid] = {
+            "channel_id": cid,
+            "configured_name": ch.get("channel_name"),
+            "live_title": validated_channels.get(cid, {}).get("live_title"),
+            "discovery_method": disc_info.get("discovery_method", method),
+            "pages_fetched": disc_info.get("pages_fetched", 0),
+            "is_truncated": disc_info.get("is_truncated", False),
+            "completeness_status": disc_info.get("completeness_status", "UNKNOWN"),
+            "total_candidates": len(c_vids),
+            "eligible_candidates": len(eligible),
+            "by_player": {
+                "MESSI": sum(1 for v in eligible if v["player_relevance"] == "MESSI"),
+                "RONALDO": sum(1 for v in eligible if v["player_relevance"] == "RONALDO"),
+                "DUAL": sum(1 for v in eligible if v["player_relevance"] == "DUAL"),
+                "GENERAL_EVENT": sum(1 for v in eligible if v["player_relevance"] == "NONE" and v["has_event_term"]),
+            },
+            "by_format": {
+                "LONG_FORM": sum(1 for v in eligible if v["is_short"] is False),
+                "SHORTS_CONFIRMED": sum(1 for v in eligible if v["is_short"] is True),
+                "FORMAT_UNKNOWN": sum(1 for v in eligible if v["is_short"] is None),
+            },
+            "exclusions": {
+                "OUT_OF_WINDOW": sum(1 for v in c_vids if v["exclusion_reason"] == "OUT_OF_WINDOW"),
+                "NO_TARGET_RELEVANCE": sum(1 for v in c_vids if v["exclusion_reason"] == "NO_TARGET_RELEVANCE"),
+                "VIDEO_UNAVAILABLE": sum(1 for v in c_vids if v["exclusion_reason"] == "VIDEO_UNAVAILABLE"),
+            },
+        }
+
+    coverage_gaps = [
+        ch["channel_name"] for ch in config["channels"]
+        if channel_breakdown[ch["channel_id"]]["eligible_candidates"] == 0
+    ]
+
+    return {
+        "report_metadata": {
+            "report_generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "execution_mode": "LIVE_YOUTUBE_API",
+            "pipeline_frame": config.get("frame_purpose", "PIPELINE_PILOT"),
+            "methodology_version": config.get("methodology_version", "1.2"),
+            "window_start": w_start.isoformat(),
+            "window_end": w_end.isoformat(),
+            "discovery_method": method,
+            "max_pages_per_channel": max_pages_per_channel,
+        },
+        "telemetry": telemetry.to_dict(),
+        "channel_identity_validations": discrepancies,
+        "overall_summary": {
+            "total_channels": len(config["channels"]),
+            "total_candidates_evaluated": len(classified_candidates),
+            "total_eligible_candidates": sum(1 for v in classified_candidates if v["status"] == "ELIGIBLE"),
+            "coverage_gaps": coverage_gaps,
+        },
+        "channel_breakdown": channel_breakdown,
+        "evaluated_candidates": classified_candidates,
+    }
+
+
 def format_report_summary_markdown(report: Dict[str, Any]) -> str:
-    """Renders human-readable markdown table of candidate coverage."""
-    lines = []
-    lines.append("## Pilot Candidate Coverage Report (Read-Only Discovery)")
-    lines.append("")
+    """Renders human-readable summary table of discovery results."""
     meta = report["report_metadata"]
-    lines.append(f"**Window**: `{meta['window_start']}` to `{meta['window_end']}`")
-    lines.append(f"**Frame**: `{meta['pipeline_frame']}` (Methodology v{meta['methodology_version']})")
+    lines = []
+
+    if meta.get("execution_mode") == "SYNTHETIC_MOCK":
+        lines.append("=" * 70)
+        lines.append("  [WARNING: SYNTHETIC DATA - NOT LIVE YOUTUBE API OBSERVATIONS]")
+        lines.append("  ALL CANDIDATES AND METRICS BELOW ARE GENERATED FROM TEST FIXTURES.")
+        lines.append("=" * 70)
+        lines.append("")
+
+    lines.append("## Pilot Candidate Coverage Report")
+    lines.append(f"- **Execution Mode**: `{meta['execution_mode']}`")
+    lines.append(f"- **Window**: `{meta['window_start']}` to `{meta['window_end']}`")
+    lines.append(f"- **Method**: `{meta['discovery_method']}`")
     lines.append("")
+
+    # Identity Discrepancies
+    discrepancies = report.get("channel_identity_validations", [])
+    if discrepancies:
+        lines.append("### Channel Identity Notices")
+        for d in discrepancies:
+            lines.append(f"- **{d['discrepancy_type']}** on `{d['channel_id']}`: Configured as '{d.get('configured_name')}', Live Title: '{d.get('live_title')}'. ({d.get('resolution')})")
+        lines.append("")
+
+    # Telemetry
+    telem = report.get("telemetry", {})
+    lines.append("### API & Quota Telemetry")
+    lines.append(f"- **Total API Requests**: {telem.get('total_api_requests', 0)}")
+    lines.append(f"- **Actual Quota Units Consumed**: {telem.get('actual_quota_units_consumed', 0)}")
+    lines.append(f"- **Calls Breakdown**: {telem.get('requests_by_endpoint', {})}")
+    if telem.get("error_count", 0) > 0:
+        lines.append(f"- **Errors Encountered**: {telem.get('error_count')} (inspect report JSON for details)")
+    lines.append("")
+
+    # Table
     lines.append("### Channel Candidate Distribution")
     lines.append("")
-    lines.append("| Channel Name | Stratum | Evaluated | Eligible | Messi | Ronaldo | Dual | Long-Form | Shorts | Gated Uncertain |")
-    lines.append("| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+    lines.append("| Channel Name | Method | Pages | Status | Total | Eligible | Messi | Ronaldo | Dual | Long-Form | Shorts | Format Unknown |")
+    lines.append("| :--- | :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
 
     for cid, ch in report["channel_breakdown"].items():
+        name = ch.get("live_title") or ch.get("configured_name")
         bp = ch["by_player"]
         bf = ch["by_format"]
-        ex = ch["exclusions"]
         lines.append(
-            f"| {ch['channel_name']} | {ch['stratum']} | {ch['total_candidates_evaluated']} | "
-            f"**{ch['eligible_candidates']}** | {bp['MESSI']} | {bp['RONALDO']} | {bp['DUAL']} | "
-            f"{bf['LONG_FORM']} | {bf['SHORTS_CONFIRMED']} | {ex['UNCERTAIN_FORMAT_GATED']} |"
+            f"| {name} | {ch['discovery_method']} | {ch['pages_fetched']} | {ch['completeness_status']} | "
+            f"{ch['total_candidates']} | **{ch['eligible_candidates']}** | {bp['MESSI']} | {bp['RONALDO']} | {bp['DUAL']} | "
+            f"{bf['LONG_FORM']} | {bf['SHORTS_CONFIRMED']} | {bf['FORMAT_UNKNOWN']} |"
         )
 
     lines.append("")
-    lines.append("### Exclusions & Coverage Summary")
     ov = report["overall_summary"]
     lines.append(f"- **Total Candidates Evaluated**: {ov['total_candidates_evaluated']}")
     lines.append(f"- **Total Eligible Candidates**: {ov['total_eligible_candidates']}")
-    if ov["coverage_gap_channels"]:
-        lines.append(f"- **Coverage Gaps (0 eligible)**: {', '.join(ov['coverage_gap_channels'])}")
+    if ov["coverage_gaps"]:
+        lines.append(f"- **Coverage Gaps (0 eligible)**: {', '.join(ov['coverage_gaps'])}")
     else:
-        lines.append("- **Coverage Gaps**: None. All 7 channels have eligible candidates in this window.")
-
-    lines.append("")
-    lines.append("### Historical Pagination Cost Recommendation")
-    cost_model = report.get("historical_pagination_cost_model", {})
-    srch = cost_model.get("date_bounded_search", {})
-    pl = cost_model.get("uploads_playlist_walk", {})
-    lines.append(f"- **Date-Bounded Search (`search.list`)**: ~{srch.get('total_quota_units_needed', 'N/A')} quota units ({srch.get('viability', '')})")
-    lines.append(f"- **Uploads Playlist Walk (`playlistItems.list`)**: ~{pl.get('total_quota_units_needed', 'N/A')} quota units ({pl.get('viability', '')})")
+        lines.append("- **Coverage Gaps**: None. All tracked channels have eligible candidates in this window.")
 
     return "\n".join(lines)
 
 
 # =============================================================================
-# 7. CLI Entry Point
+# 9. CLI Interface
 # =============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Pilot candidate coverage and discovery reporter")
-    parser.add_argument("--mock", action="store_true", default=True, help="Run in deterministic offline mock mode")
-    parser.add_argument("--api-key", default=None, help="YouTube Data API key for live online discovery")
-    parser.add_argument("--window-start", default="2022-12-18T00:00:00Z", help="Event window start ISO timestamp")
-    parser.add_argument("--window-end", default="2022-12-20T23:59:59Z", help="Event window end ISO timestamp")
-    parser.add_argument("--output", default="reports/pilot_candidate_coverage_report.json", help="Path to write JSON report")
-    parser.add_argument("--summary", default=None, help="Print summary of an existing JSON report file")
+    parser = argparse.ArgumentParser(
+        description="Candidate video discovery and coverage reporter for the Football Narrative Observatory"
+    )
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        default=False,
+        help="Explicitly run in synthetic offline mock mode (outputs clearly marked SYNTHETIC)"
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="Optional YouTube API key override (defaults to YOUTUBE_API_KEY environment variable)"
+    )
+    parser.add_argument(
+        "--method",
+        choices=["uploads_playlist", "search"],
+        default="uploads_playlist",
+        help="Discovery method: 'uploads_playlist' (1 quota unit/page) or 'search' (100 quota units/page)"
+    )
+    parser.add_argument(
+        "--window-start",
+        default="2022-12-18T00:00:00Z",
+        help="Event window start ISO timestamp (default: 2022-12-18T00:00:00Z)"
+    )
+    parser.add_argument(
+        "--window-end",
+        default="2022-12-20T23:59:59Z",
+        help="Event window end ISO timestamp (default: 2022-12-20T23:59:59Z)"
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=5,
+        help="Maximum pagination pages per channel (default: 5)"
+    )
+    parser.add_argument(
+        "--output",
+        default="reports/pilot_candidate_coverage_report.json",
+        help="Output JSON report file path"
+    )
+    parser.add_argument(
+        "--summary",
+        default=None,
+        help="Render summary table of an existing report JSON file without running discovery"
+    )
     return parser.parse_args()
 
 
@@ -626,43 +1167,34 @@ def main():
 
     if args.summary:
         if not os.path.exists(args.summary):
-            print(f"Error: summary file '{args.summary}' does not exist.", file=sys.stderr)
+            print(f"Error: report file '{args.summary}' does not exist.", file=sys.stderr)
             sys.exit(1)
         with open(args.summary, "r", encoding="utf-8") as f:
             report_data = json.load(f)
         print(format_report_summary_markdown(report_data))
         return
 
-    # Parse window
-    w_start = datetime.datetime.fromisoformat(args.window_start.replace("Z", "+00:00"))
-    w_end = datetime.datetime.fromisoformat(args.window_end.replace("Z", "+00:00"))
-
-    # Acquire candidate data (mock or live)
-    if args.api_key:
-        print("[INFO] Live YouTube Data API discovery mode selected.", file=sys.stderr)
-        # Live discovery implementation connects via build('youtube', 'v3', developerKey=...)
-        # For read-only safety, if channels.list reports discrepancy, halt before proceeding.
-        print("[ERROR] Live API credentials provided, but online quota execution requires operator approval.", file=sys.stderr)
+    try:
+        report = execute_discovery(
+            mock=args.mock,
+            api_key=args.api_key,
+            method=args.method,
+            window_start_str=args.window_start,
+            window_end_str=args.window_end,
+            max_pages_per_channel=args.max_pages,
+        )
+    except Exception as exc:
+        print(f"[FATAL ERROR] Discovery execution failed: {exc}", file=sys.stderr)
         sys.exit(1)
-    else:
-        candidates = get_mock_candidates_fixture()
 
-    report = run_pilot_discovery(
-        channels=APPROVED_PILOT_CHANNELS,
-        candidates=candidates,
-        window_start=w_start,
-        window_end=w_end,
-        event_terms=WC_2022_EVENT_TERMS,
-    )
-
-    # Save output
+    # Save output report
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
-    # Print summary markdown to stdout
+    # Output markdown summary
     print(format_report_summary_markdown(report))
-    print(f"\n[OK] Full candidate report written to: {args.output}")
+    print(f"\n[OK] Coverage report written to: {args.output}")
 
 
 if __name__ == "__main__":
