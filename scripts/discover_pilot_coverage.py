@@ -1541,6 +1541,10 @@ def regenerate_from_saved_report(
         ret_idx = c.get("retrieval_index")
         disc_method = c.get("discovery_method") or method
 
+        # Normalize player label: use player_category when present, otherwise player_relevance
+        raw_player_label = c.get("player_category") if c.get("player_category") is not None else c.get("player_relevance")
+        player_label = raw_player_label if raw_player_label is not None else ("NONE" if c.get("status") else None)
+
         occ = {
             "channel_id": c.get("channel_id"),
             "channel_title": c.get("channel_title") or c.get("configured_name"),
@@ -1565,6 +1569,7 @@ def regenerate_from_saved_report(
                     cand_entry["status"] = "UNRESOLVED"
                     cand_entry["relevance_tier"] = "UNRESOLVED"
                     cand_entry["player_category"] = "UNRESOLVED"
+                    cand_entry["player_relevance"] = "UNRESOLVED"
                     cand_entry["classification_provenance"] = "UNRESOLVED_FULL_DESCRIPTION_UNAVAILABLE"
                     cand_entry["audit_note"] = "Classification cannot be established without full description."
                 else:
@@ -1580,6 +1585,8 @@ def regenerate_from_saved_report(
                     cand_entry.update(classified)
             else:
                 cand_entry["classification_provenance"] = "PRESERVED_FROM_SAVED_REPORT"
+                cand_entry["player_category"] = player_label or "NONE"
+                cand_entry["player_relevance"] = player_label or "NONE"
 
             # Check audit flags for human methodology review without mutating preserved classifications
             relevance_tier = cand_entry.get("relevance_tier")
@@ -1619,7 +1626,7 @@ def regenerate_from_saved_report(
                 "after_status": cand_entry.get("status"),
                 "before_relevance_tier": c.get("relevance_tier"),
                 "after_relevance_tier": cand_entry.get("relevance_tier"),
-                "before_player_category": c.get("player_category"),
+                "before_player_category": player_label,
                 "after_player_category": cand_entry.get("player_category"),
                 "classification_change": "NONE",
                 "notes": "Unique video candidate; live classifications and matching evidence preserved verbatim.",
@@ -1641,7 +1648,7 @@ def regenerate_from_saved_report(
                 "after_status": "DROPPED_AS_DUPLICATE",
                 "before_relevance_tier": c.get("relevance_tier"),
                 "after_relevance_tier": "DROPPED_AS_DUPLICATE",
-                "before_player_category": c.get("player_category"),
+                "before_player_category": player_label,
                 "after_player_category": "DROPPED_AS_DUPLICATE",
                 "classification_change": "NONE",
                 "original_occurrence_index": first_idx,
@@ -1657,7 +1664,7 @@ def regenerate_from_saved_report(
                     "duplicate_occurrence_index": idx,
                     "original_occurrence_index": first_idx,
                     "preserved_relevance_tier": c.get("relevance_tier"),
-                    "preserved_player_category": c.get("player_category"),
+                    "preserved_player_category": player_label,
                     "preserved_status": c.get("status"),
                     "action": "REMOVED_DUPLICATE_OCCURRENCE",
                 })
@@ -1711,10 +1718,10 @@ def regenerate_from_saved_report(
                 "EVENT_SPECIFIC": sum(1 for v in eligible if v.get("relevance_tier") == "EVENT_SPECIFIC"),
             },
             "by_player": {
-                "MESSI": sum(1 for v in eligible if v.get("player_category") == "MESSI"),
-                "RONALDO": sum(1 for v in eligible if v.get("player_category") == "RONALDO"),
-                "DUAL": sum(1 for v in eligible if v.get("player_category") == "DUAL"),
-                "NONE": sum(1 for v in eligible if v.get("player_category") == "NONE"),
+                "MESSI": sum(1 for v in eligible if (v.get("player_category") or v.get("player_relevance")) == "MESSI"),
+                "RONALDO": sum(1 for v in eligible if (v.get("player_category") or v.get("player_relevance")) == "RONALDO"),
+                "DUAL": sum(1 for v in eligible if (v.get("player_category") or v.get("player_relevance")) == "DUAL"),
+                "NONE": sum(1 for v in eligible if (v.get("player_category") or v.get("player_relevance")) == "NONE"),
             },
             "by_format": {
                 "LONG_FORM": sum(1 for v in eligible if v.get("is_short") is False),
@@ -1766,10 +1773,10 @@ def regenerate_from_saved_report(
             "player_focal_candidates": sum(1 for v in unique_candidates if v.get("status") == "ELIGIBLE" and v.get("relevance_tier") == "PLAYER_MATCH"),
             "event_specific_candidates": sum(1 for v in unique_candidates if v.get("status") == "ELIGIBLE" and v.get("relevance_tier") == "EVENT_SPECIFIC"),
             "by_player": {
-                "MESSI": sum(1 for v in unique_candidates if v.get("status") == "ELIGIBLE" and v.get("player_category") == "MESSI"),
-                "DUAL": sum(1 for v in unique_candidates if v.get("status") == "ELIGIBLE" and v.get("player_category") == "DUAL"),
-                "RONALDO": sum(1 for v in unique_candidates if v.get("status") == "ELIGIBLE" and v.get("player_category") == "RONALDO"),
-                "NONE": sum(1 for v in unique_candidates if v.get("status") == "ELIGIBLE" and v.get("player_category") == "NONE"),
+                "MESSI": sum(1 for v in unique_candidates if v.get("status") == "ELIGIBLE" and (v.get("player_category") or v.get("player_relevance")) == "MESSI"),
+                "DUAL": sum(1 for v in unique_candidates if v.get("status") == "ELIGIBLE" and (v.get("player_category") or v.get("player_relevance")) == "DUAL"),
+                "RONALDO": sum(1 for v in unique_candidates if v.get("status") == "ELIGIBLE" and (v.get("player_category") or v.get("player_relevance")) == "RONALDO"),
+                "NONE": sum(1 for v in unique_candidates if v.get("status") == "ELIGIBLE" and (v.get("player_category") or v.get("player_relevance")) == "NONE"),
             },
             "coverage_gaps": coverage_gaps,
         },

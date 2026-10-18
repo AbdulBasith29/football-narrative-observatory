@@ -898,3 +898,132 @@ def test_regenerate_from_saved_report_no_invented_provenance(tmp_path):
     assert occ["retrieval_index"] == "UNKNOWN"
 
 
+def test_regenerate_from_saved_report_legacy_player_relevance_field(tmp_path):
+    """Verifies backward compatibility with saved reports containing only player_relevance (no player_category)."""
+    mini_report = {
+        "report_metadata": {
+            "execution_mode": "LIVE_YOUTUBE_API",
+            "window_start": "2022-12-18T00:00:00Z",
+            "window_end": "2022-12-20T23:59:59Z",
+            "discovery_method": "DATE_BOUNDED_SEARCH",
+        },
+        "evaluated_candidates": [
+            {
+                "video_id": "vid_messi_only",
+                "channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q",
+                "channel_title": "ESPN FC",
+                "title": "Messi masterclass in World Cup Final",
+                "published_at": "2022-12-18T18:00:00Z",
+                "status": "ELIGIBLE",
+                "relevance_tier": "PLAYER_MATCH",
+                "player_relevance": "MESSI",  # Deliberately omitting player_category
+                "has_event_term": True,
+                "matched_event_terms": ["world cup", "final"],
+                "matched_player_aliases": ["messi"],
+                "is_available": True,
+                "duration_seconds": 600,
+                "view_count": "5000",
+                "comment_count": "50",
+            },
+            {
+                "video_id": "vid_dual_only",
+                "channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q",
+                "channel_title": "ESPN FC",
+                "title": "Messi vs Ronaldo World Cup debate",
+                "published_at": "2022-12-18T19:00:00Z",
+                "status": "ELIGIBLE",
+                "relevance_tier": "PLAYER_MATCH",
+                "player_relevance": "DUAL",  # Deliberately omitting player_category
+                "has_event_term": True,
+                "matched_event_terms": ["world cup"],
+                "matched_player_aliases": ["messi", "ronaldo"],
+                "is_available": True,
+                "duration_seconds": 600,
+                "view_count": "3000",
+                "comment_count": "30",
+            },
+            {
+                "video_id": "vid_none_only",
+                "channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q",
+                "channel_title": "ESPN FC",
+                "title": "Argentina vs France World Cup Final recap",
+                "published_at": "2022-12-18T20:00:00Z",
+                "status": "ELIGIBLE",
+                "relevance_tier": "EVENT_SPECIFIC",
+                "player_relevance": "NONE",  # Deliberately omitting player_category
+                "has_event_term": True,
+                "matched_event_terms": ["world cup", "final"],
+                "matched_player_aliases": [],
+                "is_available": True,
+                "duration_seconds": 600,
+                "view_count": "2000",
+                "comment_count": "20",
+            },
+            # Duplicate occurrence of vid_messi_only with only player_relevance
+            {
+                "video_id": "vid_messi_only",
+                "channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q",
+                "channel_title": "ESPN FC",
+                "title": "Messi masterclass in World Cup Final",
+                "published_at": "2022-12-18T18:00:00Z",
+                "status": "ELIGIBLE",
+                "relevance_tier": "PLAYER_MATCH",
+                "player_relevance": "MESSI",
+                "has_event_term": True,
+                "matched_event_terms": ["world cup", "final"],
+                "matched_player_aliases": ["messi"],
+                "is_available": True,
+                "duration_seconds": 600,
+            },
+        ],
+        "channel_identity_validations": [],
+        "channel_breakdown": {},
+    }
+    report_file = tmp_path / "legacy_player_relevance_report.json"
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(mini_report, f)
+
+    report = regenerate_from_saved_report(str(report_file))
+
+    # Assert overall summary normalized and aggregated properly
+    by_player = report["overall_summary"]["by_player"]
+    assert by_player["MESSI"] == 1
+    assert by_player["DUAL"] == 1
+    assert by_player["RONALDO"] == 0
+    assert by_player["NONE"] == 1
+
+    # Assert unique evaluated candidate has both fields normalized
+    cand = next(c for c in report["evaluated_candidates"] if c["video_id"] == "vid_messi_only")
+    assert cand["player_category"] == "MESSI"
+    assert cand["player_relevance"] == "MESSI"
+
+    # Assert per_video_comparison before and after player categories are normalized
+    unique_comp = next(
+        c for c in report["per_video_comparison"]
+        if c["video_id"] == "vid_messi_only" and not c["is_duplicate_occurrence"]
+    )
+    assert unique_comp["before_player_category"] == "MESSI"
+    assert unique_comp["after_player_category"] == "MESSI"
+
+    dup_comp = next(
+        c for c in report["per_video_comparison"]
+        if c["video_id"] == "vid_messi_only" and c["is_duplicate_occurrence"]
+    )
+    assert dup_comp["before_player_category"] == "MESSI"
+    assert dup_comp["after_player_category"] == "DROPPED_AS_DUPLICATE"
+
+    # Assert duplicate details preserved player category
+    dup_detail = next(
+        d for d in report["deduplication_summary"]["duplicate_details"]
+        if d["video_id"] == "vid_messi_only"
+    )
+    assert dup_detail["preserved_player_category"] == "MESSI"
+
+    # Assert channel breakdown by_player
+    espn_cb = report["channel_breakdown"]["UC6c1z7bA__85CIWZ_jpCK-Q"]
+    assert espn_cb["by_player"]["MESSI"] == 1
+    assert espn_cb["by_player"]["DUAL"] == 1
+    assert espn_cb["by_player"]["NONE"] == 1
+
+
+
