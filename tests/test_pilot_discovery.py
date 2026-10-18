@@ -17,6 +17,7 @@ Validates:
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -31,6 +32,7 @@ from discover_pilot_coverage import (
     build_youtube_client,
     classify_focal_players,
     classify_hydrated_candidate,
+    deduplicate_candidate_occurrences,
     discover_channel_candidates_date_bounded_search,
     discover_channel_candidates_uploads_walk,
     evaluate_format_uncertainty,
@@ -41,6 +43,7 @@ from discover_pilot_coverage import (
     load_repository_configuration,
     matches_aliases,
     parse_iso8601_duration,
+    regenerate_from_saved_report,
     run_synthetic_mock_discovery,
     validate_channel_identities_live,
 )
@@ -535,3 +538,271 @@ def test_run_synthetic_mock_discovery_labels():
     md = format_report_summary_markdown(report)
     assert "WARNING: SYNTHETIC DATA - NOT LIVE YOUTUBE API OBSERVATIONS" in md
     assert "SYNTHETIC_MOCK" in md
+
+
+# =============================================================================
+# 11. Deduplication, Baseline Term Separation & Report Regeneration Tests
+# =============================================================================
+
+def test_deduplicate_candidate_occurrences_overlapping_pages():
+    """Ensures multi-page candidate occurrences are deduplicated by video_id with full provenance."""
+    raw_candidates = [
+        {
+            "video_id": "vid_overlap_1",
+            "channel_id": "UC_test",
+            "channel_title": "Test Channel",
+            "title": "Video 1 on Page 1",
+            "page_number": 1,
+            "retrieval_index": 1,
+            "discovery_method": "DATE_BOUNDED_SEARCH",
+            "published_at": "2022-12-18T18:00:00Z",
+        },
+        {
+            "video_id": "vid_unique_2",
+            "channel_id": "UC_test",
+            "channel_title": "Test Channel",
+            "title": "Video 2 on Page 1",
+            "page_number": 1,
+            "retrieval_index": 2,
+            "discovery_method": "DATE_BOUNDED_SEARCH",
+            "published_at": "2022-12-18T19:00:00Z",
+        },
+        {
+            "video_id": "vid_overlap_1",
+            "channel_id": "UC_test",
+            "channel_title": "Test Channel",
+            "title": "Video 1 on Page 2 (offset overlap)",
+            "page_number": 2,
+            "retrieval_index": 3,
+            "discovery_method": "DATE_BOUNDED_SEARCH",
+            "published_at": "2022-12-18T18:00:00Z",
+        },
+    ]
+
+    unique_cands, telem = deduplicate_candidate_occurrences(raw_candidates, default_method="DATE_BOUNDED_SEARCH")
+
+    assert telem["total_raw_occurrences"] == 3
+    assert telem["total_unique_candidates"] == 2
+    assert telem["total_duplicate_occurrences_collapsed"] == 1
+    assert telem["duplicate_video_ids"] == ["vid_overlap_1"]
+
+    # Verify occurrence tracking on collapsed video
+    overlap_cand = next(c for c in unique_cands if c["video_id"] == "vid_overlap_1")
+    assert overlap_cand["occurrence_count"] == 2
+    assert len(overlap_cand["discovery_occurrences"]) == 2
+    assert overlap_cand["discovery_occurrences"][0]["page_number"] == 1
+    assert overlap_cand["discovery_occurrences"][1]["page_number"] == 2
+
+
+def test_classify_hydrated_candidate_baseline_only():
+    """Baseline-only matches (e.g. FIFA 23 career mode) remain ELIGIBLE under frozen rules,
+
+    with proposed methodology action PROPOSE_EXCLUSION_NON_EVENT_BASELINE recorded separately.
+    """
+    w_start = datetime.datetime(2022, 12, 18, 0, 0, tzinfo=datetime.timezone.utc)
+    w_end = datetime.datetime(2022, 12, 20, 23, 59, tzinfo=datetime.timezone.utc)
+    aliases = {"Lionel Messi": ["messi"], "Cristiano Ronaldo": ["ronaldo"]}
+    event_terms = ["world cup", "final"]
+    baseline_terms = ["world cup", "fifa", "qatar 2022"]
+
+    cand = {
+        "video_id": "gaming_01",
+        "channel_id": "UC_gaming",
+        "channel_title": "Overlap Daily",
+        "title": "FIFA 23 Create a Club Career Mode! Episode 27",
+        "description": "Playing career mode on the latest fifa game update.",
+        "published_at": "2022-12-19T12:00:00Z",
+        "is_available": True,
+    }
+
+    res = classify_hydrated_candidate(
+        candidate=cand,
+        window_start=w_start,
+        window_end=w_end,
+        player_aliases=aliases,
+        event_terms=event_terms,
+        baseline_terms=baseline_terms,
+        channel_is_validated=True,
+    )
+
+    # Invariant: Frozen methodology eligibility preserved
+    assert res["status"] == "ELIGIBLE"
+    assert res["relevance_tier"] == "BASELINE_ONLY"
+    assert res["is_baseline_only"] is True
+    assert res["matched_baseline_terms"] == ["fifa"]
+    assert res["matched_player_aliases"] == []
+    assert res["matched_event_terms"] == []
+    # Proposed action recorded separately
+    assert res["proposed_methodology_action"] == "PROPOSE_EXCLUSION_NON_EVENT_BASELINE"
+    assert "gaming/unrelated media" in res["audit_note"]
+
+
+def test_classify_hydrated_candidate_implicit_debate():
+    """In-window videos without explicit keywords remain INELIGIBLE under frozen rules,
+
+    but implicit GOAT debate content is flagged with PROPOSE_INCLUSION_IMPLICIT_DEBATE.
+    """
+    w_start = datetime.datetime(2022, 12, 18, 0, 0, tzinfo=datetime.timezone.utc)
+    w_end = datetime.datetime(2022, 12, 20, 23, 59, tzinfo=datetime.timezone.utc)
+    aliases = {"Lionel Messi": ["messi"], "Cristiano Ronaldo": ["ronaldo"]}
+    event_terms = ["world cup", "final"]
+    baseline_terms = ["world cup", "fifa", "qatar 2022"]
+
+    cand = {
+        "video_id": "goat_shorts_01",
+        "channel_id": "UC_espn",
+        "channel_title": "ESPN FC",
+        "title": "The GOAT debate is officially over 🤯 🐐 #shorts",
+        "description": "Post-match reactions and legacy debate.",
+        "published_at": "2022-12-18T22:30:00Z",
+        "is_available": True,
+    }
+
+    res = classify_hydrated_candidate(
+        candidate=cand,
+        window_start=w_start,
+        window_end=w_end,
+        player_aliases=aliases,
+        event_terms=event_terms,
+        baseline_terms=baseline_terms,
+        channel_is_validated=True,
+    )
+
+    # Invariant: Frozen methodology exclusion preserved
+    assert res["status"] == "INELIGIBLE"
+    assert res["exclusion_reason"] == "NO_TARGET_RELEVANCE"
+    assert res["relevance_tier"] == "NO_MATCH"
+    # Proposed action recorded separately for human review
+    assert res["proposed_methodology_action"] == "PROPOSE_INCLUSION_IMPLICIT_DEBATE"
+    assert "GOAT debate" in res["audit_note"]
+
+
+def test_regenerate_from_saved_report_counts():
+    """Replays the saved live candidate coverage report offline (zero quota) and validates exact deduplicated counts."""
+    saved_report_path = os.path.join(
+        os.path.dirname(__file__), "..", "reports", "live_pilot_candidate_coverage_report_v2.json"
+    )
+    if not os.path.exists(saved_report_path):
+        pytest.skip("Saved live report fixture not available for replay test.")
+
+    report = regenerate_from_saved_report(saved_report_path)
+
+    # Telemetry and deduplication assertions
+    dedup = report["deduplication_summary"]
+    assert dedup["total_raw_occurrences"] == 71
+    assert dedup["total_unique_candidates"] == 68
+    assert dedup["total_duplicate_occurrences_collapsed"] == 3
+    assert set(dedup["duplicate_video_ids"]) == {"8PqQzR45AZc", "n-K3ajSqUY8", "VIeV_cAw5Dg"}
+
+    # Overall summary counts derived from unique candidates
+    ov = report["overall_summary"]
+    assert ov["total_raw_occurrences_discovered"] == 71
+    assert ov["total_unique_candidates_evaluated"] == 68
+    assert ov["total_duplicate_occurrences_collapsed"] == 3
+    assert ov["total_eligible_candidates"] == 45
+    assert ov["player_focal_candidates"] == 16
+    assert ov["event_specific_candidates"] == 26
+    assert ov["baseline_only_candidates"] == 2
+    assert ov["broad_generic_uncertain_candidates"] == 1
+
+    # Uncertain inclusions & exclusions audit tables
+    inc_ids = {u["video_id"] for u in report.get("uncertain_inclusions", [])}
+    assert "gZXC0n__OH4" in inc_ids
+    assert "XYw10VvtpJE" in inc_ids
+    assert "TQ_CIbXDxHY" in inc_ids
+
+    exc_ids = {u["video_id"] for u in report.get("uncertain_exclusions", [])}
+    assert "I8JUK83KpuI" in exc_ids
+
+
+def test_regenerate_from_saved_report_synthetic(tmp_path):
+    """Verifies that regenerate_from_saved_report accurately deduplicates and classifies arbitrary reports."""
+    mini_report = {
+        "report_metadata": {"execution_mode": "LIVE_YOUTUBE_API"},
+        "evaluated_candidates": [
+            {
+                "video_id": "vid_1",
+                "channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q",
+                "channel_title": "ESPN FC",
+                "title": "Match discussion",
+                "description": "world cup final",
+                "published_at": "2022-12-18T20:00:00Z",
+                "is_available": True,
+                "duration_seconds": 600,
+                "view_count": "1000",
+                "comment_count": "10",
+                "page_number": 1,
+                "retrieval_index": 1,
+                "discovery_method": "DATE_BOUNDED_SEARCH",
+            },
+            {
+                "video_id": "vid_2",
+                "channel_id": "UCFxG3MxHC1ogUglvJeMHmVQ",
+                "channel_title": "Overlap Daily",
+                "title": "FIFA 23 Career Mode Episode 1",
+                "description": "gaming",
+                "published_at": "2022-12-19T10:00:00Z",
+                "is_available": True,
+                "duration_seconds": 1200,
+                "view_count": "500",
+                "comment_count": "5",
+                "page_number": 1,
+                "retrieval_index": 2,
+                "discovery_method": "DATE_BOUNDED_SEARCH",
+            },
+            {
+                "video_id": "vid_3",
+                "channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q",
+                "channel_title": "ESPN FC",
+                "title": "The GOAT debate is officially over 🤯 🐐 #shorts",
+                "description": "discussion",
+                "published_at": "2022-12-18T21:00:00Z",
+                "is_available": True,
+                "duration_seconds": 45,
+                "view_count": "5000",
+                "comment_count": "50",
+                "page_number": 1,
+                "retrieval_index": 3,
+                "discovery_method": "DATE_BOUNDED_SEARCH",
+            },
+            {
+                "video_id": "vid_1",
+                "channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q",
+                "channel_title": "ESPN FC",
+                "title": "Match discussion (page 2 overlap)",
+                "description": "world cup final",
+                "published_at": "2022-12-18T20:00:00Z",
+                "is_available": True,
+                "duration_seconds": 600,
+                "view_count": "1000",
+                "comment_count": "10",
+                "page_number": 2,
+                "retrieval_index": 4,
+                "discovery_method": "DATE_BOUNDED_SEARCH",
+            },
+        ],
+        "channel_identity_validations": [
+            {"channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q", "status": "VALIDATED", "live_title": "ESPN FC"},
+            {"channel_id": "UCFxG3MxHC1ogUglvJeMHmVQ", "status": "VALIDATED", "live_title": "Overlap Daily"},
+        ],
+        "channel_breakdown": {
+            "UC6c1z7bA__85CIWZ_jpCK-Q": {"channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q", "pages_fetched": 2, "completeness_status": "RETURNED_PAGES_EXHAUSTED", "is_truncated": False, "discovery_method": "DATE_BOUNDED_SEARCH"},
+            "UCFxG3MxHC1ogUglvJeMHmVQ": {"channel_id": "UCFxG3MxHC1ogUglvJeMHmVQ", "pages_fetched": 1, "completeness_status": "RETURNED_PAGES_EXHAUSTED", "is_truncated": False, "discovery_method": "DATE_BOUNDED_SEARCH"},
+        },
+        "telemetry": {"total_api_requests": 11, "actual_quota_units_consumed": 803, "requests_by_endpoint": {}},
+    }
+    report_file = tmp_path / "saved_report.json"
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(mini_report, f)
+
+    report = regenerate_from_saved_report(str(report_file))
+    assert report["deduplication_summary"]["total_raw_occurrences"] == 4
+    assert report["deduplication_summary"]["total_unique_candidates"] == 3
+    assert report["deduplication_summary"]["total_duplicate_occurrences_collapsed"] == 1
+    assert report["deduplication_summary"]["duplicate_video_ids"] == ["vid_1"]
+    assert report["overall_summary"]["total_eligible_candidates"] == 2
+    assert report["overall_summary"]["baseline_only_candidates"] == 1
+    assert len(report["uncertain_inclusions"]) == 1
+    assert len(report["uncertain_exclusions"]) == 1
+
+

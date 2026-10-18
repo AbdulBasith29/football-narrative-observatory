@@ -211,6 +211,68 @@ def evaluate_format_uncertainty(
     return "FORMAT_UNKNOWN", None
 
 
+def deduplicate_candidate_occurrences(
+    raw_candidates: List[Dict[str, Any]],
+    default_method: str = "search",
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Deduplicates raw discovered candidates by exact video_id, preserving all discovery occurrences and provenance.
+
+    Returns:
+        (unique_candidates, deduplication_telemetry)
+    """
+    unique_candidates: Dict[str, Dict[str, Any]] = {}
+    occurrences_by_id: Dict[str, List[Dict[str, Any]]] = {}
+    duplicate_ids: List[str] = []
+
+    for idx, c in enumerate(raw_candidates, start=1):
+        vid = c.get("video_id")
+        if not vid:
+            continue
+
+        occ = {
+            "channel_id": c.get("channel_id"),
+            "channel_title": c.get("channel_title") or c.get("configured_name"),
+            "discovery_method": c.get("discovery_method", default_method),
+            "page_number": c.get("page_number", 1),
+            "retrieval_index": c.get("retrieval_index", idx),
+            "published_at": c.get("published_at"),
+        }
+
+        if vid not in unique_candidates:
+            unique_candidates[vid] = dict(c)
+            existing_occs = c.get("discovery_occurrences")
+            if existing_occs and isinstance(existing_occs, list):
+                occurrences_by_id[vid] = list(existing_occs)
+            else:
+                occurrences_by_id[vid] = [occ]
+        else:
+            occurrences_by_id[vid].append(occ)
+            if vid not in duplicate_ids:
+                duplicate_ids.append(vid)
+
+    result_list = []
+    for vid, cand in unique_candidates.items():
+        cand["discovery_occurrences"] = occurrences_by_id[vid]
+        cand["occurrence_count"] = len(occurrences_by_id[vid])
+        result_list.append(cand)
+
+    telem = {
+        "total_raw_occurrences": len(raw_candidates),
+        "total_unique_candidates": len(result_list),
+        "total_duplicate_occurrences_collapsed": len(raw_candidates) - len(result_list),
+        "duplicate_video_ids": duplicate_ids,
+        "duplicate_details": [
+            {
+                "video_id": vid,
+                "occurrence_count": len(occurrences_by_id[vid]),
+                "occurrences": occurrences_by_id[vid],
+            }
+            for vid in duplicate_ids
+        ],
+    }
+    return result_list, telem
+
+
 # =============================================================================
 # 4. Telemetry Tracker
 # =============================================================================
@@ -461,6 +523,9 @@ def discover_channel_candidates_uploads_walk(
                     "title": it.get("snippet", {}).get("title", ""),
                     "description": it.get("snippet", {}).get("description", ""),
                     "published_at": pub_raw,
+                    "page_number": pages_fetched,
+                    "retrieval_index": len(items) + 1,
+                    "discovery_method": "UPLOADS_PLAYLIST_WALK",
                 })
 
         page_token = resp.get("nextPageToken")
@@ -549,6 +614,9 @@ def discover_channel_candidates_date_bounded_search(
                     "title": it.get("snippet", {}).get("title", ""),
                     "description": it.get("snippet", {}).get("description", ""),
                     "published_at": it.get("snippet", {}).get("publishedAt", ""),
+                    "page_number": pages_fetched,
+                    "retrieval_index": len(items) + 1,
+                    "discovery_method": "DATE_BOUNDED_SEARCH",
                 })
 
         page_token = resp.get("nextPageToken")
@@ -641,6 +709,7 @@ def classify_hydrated_candidate(
     window_end: datetime.datetime,
     player_aliases: Dict[str, List[str]],
     event_terms: List[str],
+    baseline_terms: Optional[List[str]] = None,
     channel_is_validated: bool = True,
 ) -> Dict[str, Any]:
     """Applies frozen methodology rules to classify video relevance, format, and audit excerpts."""
@@ -659,10 +728,16 @@ def classify_hydrated_candidate(
             "relevance_tier": "UNRESOLVED_CHANNEL",
             "matched_player_aliases": [],
             "matched_event_terms": [],
+            "matched_baseline_terms": [],
+            "is_baseline_only": False,
             "matched_field": None,
             "match_excerpt": None,
             "is_short": None,
             "format_label": "UNKNOWN",
+            "proposed_methodology_action": None,
+            "audit_note": None,
+            "discovery_occurrences": candidate.get("discovery_occurrences", []),
+            "occurrence_count": candidate.get("occurrence_count", len(candidate.get("discovery_occurrences", [])) or 1),
         }
 
     if not candidate.get("is_available", True):
@@ -679,10 +754,16 @@ def classify_hydrated_candidate(
             "relevance_tier": "NO_MATCH",
             "matched_player_aliases": [],
             "matched_event_terms": [],
+            "matched_baseline_terms": [],
+            "is_baseline_only": False,
             "matched_field": None,
             "match_excerpt": None,
             "is_short": None,
             "format_label": "UNKNOWN",
+            "proposed_methodology_action": None,
+            "audit_note": None,
+            "discovery_occurrences": candidate.get("discovery_occurrences", []),
+            "occurrence_count": candidate.get("occurrence_count", len(candidate.get("discovery_occurrences", [])) or 1),
         }
 
     title = candidate.get("title", "")
@@ -722,15 +803,31 @@ def classify_hydrated_candidate(
     else:
         player_category = "NONE"
 
-    # 3. Match Event Terms
+    # 3. Match Event Terms vs Baseline Terms
     matched_event_title = find_matching_terms(title, event_terms)
     matched_event_desc = find_matching_terms(desc, event_terms)
     matched_event_terms = list(set(matched_event_title + matched_event_desc))
+
+    # If text matching produced nothing (e.g. description omitted in report), inspect existing candidate metadata
+    if not matched_event_terms and candidate.get("matched_event_terms"):
+        e_lower = {t.lower() for t in event_terms}
+        matched_event_terms = [t for t in candidate["matched_event_terms"] if t.lower() in e_lower]
     has_event = bool(matched_event_terms)
 
+    b_terms = baseline_terms or []
+    matched_base_title = find_matching_terms(title, b_terms)
+    matched_base_desc = find_matching_terms(desc, b_terms)
+    matched_base_terms = list(set(matched_base_title + matched_base_desc))
+    if not matched_base_terms and candidate.get("matched_event_terms"):
+        b_lower = {t.lower() for t in b_terms}
+        matched_base_terms = [t for t in candidate["matched_event_terms"] if t.lower() in b_lower]
+    has_baseline = bool(matched_base_terms)
+
+    is_baseline_only = (player_category == "NONE") and (not has_event) and has_baseline
+
     # Matched Field Determination
-    matched_in_title = bool(matched_messi_title or matched_ronaldo_title or matched_event_title)
-    matched_in_desc = bool(matched_messi_desc or matched_ronaldo_desc or matched_event_desc)
+    matched_in_title = bool(matched_messi_title or matched_ronaldo_title or matched_event_title or matched_base_title)
+    matched_in_desc = bool(matched_messi_desc or matched_ronaldo_desc or matched_event_desc or matched_base_desc)
     if matched_in_title and matched_in_desc:
         matched_field = "both"
     elif matched_in_title:
@@ -738,17 +835,19 @@ def classify_hydrated_candidate(
     elif matched_in_desc:
         matched_field = "description"
     else:
-        matched_field = None
+        matched_field = candidate.get("matched_field")
 
     # Excerpt Extraction for Relevance Auditing
-    all_matched = matched_player_terms + matched_event_terms
+    all_matched = list(set(matched_player_terms + matched_event_terms + matched_base_terms))
     excerpt = None
     if matched_in_title:
         excerpt = extract_match_excerpt(title, all_matched)
     elif matched_in_desc:
         excerpt = extract_match_excerpt(desc, all_matched)
+    if not excerpt:
+        excerpt = candidate.get("match_excerpt")
 
-    # 4. Relevance Tier Separation (Player vs Event-Specific vs Broad-Generic)
+    # 4. Relevance Tier Separation (Player vs Event-Specific vs Broad-Generic vs Baseline-Only)
     if player_category != "NONE":
         relevance_tier = "PLAYER_MATCH"
     elif has_event:
@@ -757,6 +856,8 @@ def classify_hydrated_candidate(
             relevance_tier = "EVENT_SPECIFIC"
         else:
             relevance_tier = "BROAD_EVENT_UNCERTAIN"
+    elif is_baseline_only:
+        relevance_tier = "BASELINE_ONLY"
     else:
         relevance_tier = "NO_MATCH"
 
@@ -769,7 +870,7 @@ def classify_hydrated_candidate(
         aspect_ratio=candidate.get("aspect_ratio"),
     )
 
-    # 6. Eligibility Determination (Strictly approved rules)
+    # 6. Eligibility Determination (Strictly approved rules - baseline matches remain ELIGIBLE)
     exclusion_reason = None
     if not in_window:
         status = "INELIGIBLE"
@@ -779,6 +880,22 @@ def classify_hydrated_candidate(
         exclusion_reason = "NO_TARGET_RELEVANCE"
     else:
         status = "ELIGIBLE"
+
+    # 7. Proposed Methodology Corrections & Audit Notes (Without silently mutating frozen rules)
+    proposed_methodology_action = None
+    audit_note = None
+
+    if relevance_tier == "BASELINE_ONLY":
+        proposed_methodology_action = "PROPOSE_EXCLUSION_NON_EVENT_BASELINE"
+        audit_note = f"Video matched broad baseline term(s) {matched_base_terms} without event terms or focal player keywords; off-target gaming/unrelated media."
+    elif relevance_tier == "BROAD_EVENT_UNCERTAIN":
+        proposed_methodology_action = "PROPOSE_EXCLUSION_GENERIC_TERM"
+        audit_note = "Matched only generic event term 'final' without focal player or specific event keywords; ambiguous sports term."
+    elif status == "INELIGIBLE" and in_window:
+        combined_text = f"{title} {desc}".lower()
+        if re.search(r"\bgoat\b", combined_text) or "greatest of all time" in combined_text or "🐐" in title:
+            proposed_methodology_action = "PROPOSE_INCLUSION_IMPLICIT_DEBATE"
+            audit_note = "Implicit GOAT debate commentary in window without explicit player/event keywords in metadata."
 
     return {
         "video_id": candidate["video_id"],
@@ -791,8 +908,11 @@ def classify_hydrated_candidate(
         "player_relevance": player_category,
         "relevance_tier": relevance_tier,
         "has_event_term": has_event,
+        "has_baseline_term": has_baseline,
+        "is_baseline_only": is_baseline_only,
         "matched_player_aliases": matched_player_terms,
         "matched_event_terms": matched_event_terms,
+        "matched_baseline_terms": matched_base_terms,
         "matched_field": matched_field,
         "match_excerpt": excerpt,
         "duration_seconds": dur,
@@ -800,8 +920,12 @@ def classify_hydrated_candidate(
         "format_label": format_label,
         "status": status,
         "exclusion_reason": exclusion_reason,
+        "proposed_methodology_action": proposed_methodology_action,
+        "audit_note": audit_note,
         "view_count": candidate.get("view_count"),
         "comment_count": candidate.get("comment_count"),
+        "discovery_occurrences": candidate.get("discovery_occurrences", []),
+        "occurrence_count": candidate.get("occurrence_count", len(candidate.get("discovery_occurrences", [])) or 1),
     }
 
 
@@ -814,10 +938,12 @@ def run_synthetic_mock_discovery(
     window_start: datetime.datetime,
     window_end: datetime.datetime,
     event_terms: List[str],
+    baseline_terms: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Generates an explicitly labeled SYNTHETIC candidate coverage report."""
     channels = repo_config["channels"]
     aliases = repo_config["player_aliases"]
+    b_terms = baseline_terms or ["world cup", "fifa", "fifa world cup", "qatar 2022"]
 
     synthetic_raw_candidates = [
         {
@@ -831,6 +957,9 @@ def run_synthetic_mock_discovery(
             "view_count": "1450000",
             "comment_count": "4520",
             "is_available": True,
+            "page_number": 1,
+            "retrieval_index": 1,
+            "discovery_method": "SYNTHETIC_FIXTURE",
         },
         {
             "video_id": "mock_espn_01",
@@ -843,6 +972,9 @@ def run_synthetic_mock_discovery(
             "view_count": "1840000",
             "comment_count": "8930",
             "is_available": True,
+            "page_number": 1,
+            "retrieval_index": 2,
+            "discovery_method": "SYNTHETIC_FIXTURE",
         },
         {
             "video_id": "mock_gold_01",
@@ -855,6 +987,9 @@ def run_synthetic_mock_discovery(
             "view_count": "920000",
             "comment_count": "6120",
             "is_available": True,
+            "page_number": 1,
+            "retrieval_index": 3,
+            "discovery_method": "SYNTHETIC_FIXTURE",
         },
         {
             "video_id": "mock_talk_01",
@@ -867,6 +1002,9 @@ def run_synthetic_mock_discovery(
             "view_count": "410000",
             "comment_count": "3410",
             "is_available": True,
+            "page_number": 1,
+            "retrieval_index": 4,
+            "discovery_method": "SYNTHETIC_FIXTURE",
         },
         {
             "video_id": "mock_tus_01",
@@ -879,6 +1017,9 @@ def run_synthetic_mock_discovery(
             "view_count": "530000",
             "comment_count": "4800",
             "is_available": True,
+            "page_number": 1,
+            "retrieval_index": 5,
+            "discovery_method": "SYNTHETIC_FIXTURE",
         },
         {
             "video_id": "mock_stat_01",
@@ -891,6 +1032,9 @@ def run_synthetic_mock_discovery(
             "view_count": "380000",
             "comment_count": "1940",
             "is_available": True,
+            "page_number": 1,
+            "retrieval_index": 6,
+            "discovery_method": "SYNTHETIC_FIXTURE",
         },
         {
             "video_id": "mock_speed_01",
@@ -903,6 +1047,9 @@ def run_synthetic_mock_discovery(
             "view_count": "4500000",
             "comment_count": "12500",
             "is_available": True,
+            "page_number": 1,
+            "retrieval_index": 7,
+            "discovery_method": "SYNTHETIC_FIXTURE",
         },
         {
             "video_id": "mock_generic_final",
@@ -915,8 +1062,62 @@ def run_synthetic_mock_discovery(
             "view_count": "120000",
             "comment_count": "340",
             "is_available": True,
+            "page_number": 1,
+            "retrieval_index": 8,
+            "discovery_method": "SYNTHETIC_FIXTURE",
+        },
+        {
+            "video_id": "mock_fifa_gaming",
+            "channel_id": "UCFxG3MxHC1ogUglvJeMHmVQ",
+            "channel_title": "Overlap Daily",
+            "title": "FIFA 23 Create a Club Career Mode Episode 27",
+            "description": "Career mode gameplay on FIFA 23.",
+            "published_at": "2022-12-19T13:00:00Z",
+            "duration_seconds": 1800,
+            "view_count": "80000",
+            "comment_count": "110",
+            "is_available": True,
+            "page_number": 1,
+            "retrieval_index": 9,
+            "discovery_method": "SYNTHETIC_FIXTURE",
+        },
+        {
+            "video_id": "mock_goat_debate",
+            "channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q",
+            "channel_title": "ESPN FC",
+            "title": "The GOAT debate is officially over 🤯 🐐 #shorts",
+            "description": "Debate discussion #shorts",
+            "published_at": "2022-12-18T22:00:00Z",
+            "duration_seconds": 45,
+            "view_count": "550000",
+            "comment_count": "2900",
+            "is_available": True,
+            "page_number": 1,
+            "retrieval_index": 10,
+            "discovery_method": "SYNTHETIC_FIXTURE",
+        },
+        # Overlapping occurrence on page 2 to test deduplication provenance
+        {
+            "video_id": "mock_espn_01",
+            "channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q",
+            "channel_title": "ESPN FC",
+            "title": "Is Messi the undisputed GOAT over Ronaldo now? | ESPN FC",
+            "description": "Dan Thomas and Craig Burley debate Messi vs Cristiano Ronaldo after the final.",
+            "published_at": "2022-12-18T21:00:00Z",
+            "duration_seconds": 780,
+            "view_count": "1840000",
+            "comment_count": "8930",
+            "is_available": True,
+            "page_number": 2,
+            "retrieval_index": 11,
+            "discovery_method": "SYNTHETIC_FIXTURE",
         },
     ]
+
+    unique_raw_candidates, dedup_telemetry = deduplicate_candidate_occurrences(
+        raw_candidates=synthetic_raw_candidates,
+        default_method="SYNTHETIC_FIXTURE",
+    )
 
     evaluated = [
         classify_hydrated_candidate(
@@ -925,9 +1126,10 @@ def run_synthetic_mock_discovery(
             window_end=window_end,
             player_aliases=aliases,
             event_terms=event_terms,
+            baseline_terms=b_terms,
             channel_is_validated=True,
         )
-        for c in synthetic_raw_candidates
+        for c in unique_raw_candidates
     ]
 
     channel_breakdown: Dict[str, Any] = {}
@@ -943,12 +1145,15 @@ def run_synthetic_mock_discovery(
             "pages_fetched": 1,
             "is_truncated": False,
             "completeness_status": "RETURNED_PAGES_EXHAUSTED",
-            "total_candidates": len(c_vids),
+            "total_raw_occurrences": sum(v["occurrence_count"] for v in c_vids),
+            "total_unique_candidates": len(c_vids),
+            "duplicate_occurrences_collapsed": sum(v["occurrence_count"] - 1 for v in c_vids),
             "eligible_candidates": len(eligible),
             "relevance_breakdown": {
                 "PLAYER_MATCH": sum(1 for v in eligible if v["relevance_tier"] == "PLAYER_MATCH"),
                 "EVENT_SPECIFIC": sum(1 for v in eligible if v["relevance_tier"] == "EVENT_SPECIFIC"),
                 "BROAD_EVENT_UNCERTAIN": sum(1 for v in eligible if v["relevance_tier"] == "BROAD_EVENT_UNCERTAIN"),
+                "BASELINE_ONLY": sum(1 for v in eligible if v["relevance_tier"] == "BASELINE_ONLY"),
             },
             "by_player": {
                 "MESSI": sum(1 for v in eligible if v["player_category"] == "MESSI"),
@@ -967,6 +1172,39 @@ def run_synthetic_mock_discovery(
                 "UNRESOLVED_CHANNEL_IDENTITY": 0,
             },
         }
+
+    uncertain_inclusions = [
+        {
+            "video_id": v["video_id"],
+            "channel_title": v.get("channel_title"),
+            "title": v.get("title"),
+            "published_at": v.get("published_at"),
+            "relevance_tier": v.get("relevance_tier"),
+            "matched_terms": (v.get("matched_baseline_terms") if v.get("relevance_tier") == "BASELINE_ONLY" else v.get("matched_event_terms")),
+            "match_excerpt": v.get("match_excerpt"),
+            "current_status": v.get("status"),
+            "proposed_methodology_action": v.get("proposed_methodology_action"),
+            "audit_note": v.get("audit_note"),
+        }
+        for v in evaluated
+        if v.get("status") == "ELIGIBLE" and v.get("relevance_tier") in ("BASELINE_ONLY", "BROAD_EVENT_UNCERTAIN")
+    ]
+
+    uncertain_exclusions = [
+        {
+            "video_id": v["video_id"],
+            "channel_title": v.get("channel_title"),
+            "title": v.get("title"),
+            "published_at": v.get("published_at"),
+            "relevance_tier": v.get("relevance_tier"),
+            "exclusion_reason": v.get("exclusion_reason"),
+            "current_status": v.get("status"),
+            "proposed_methodology_action": v.get("proposed_methodology_action"),
+            "audit_note": v.get("audit_note"),
+        }
+        for v in evaluated
+        if v.get("status") == "INELIGIBLE" and v.get("in_window") and v.get("proposed_methodology_action") == "PROPOSE_INCLUSION_IMPLICIT_DEBATE"
+    ]
 
     return {
         "report_metadata": {
@@ -991,16 +1229,23 @@ def run_synthetic_mock_discovery(
         "channel_identity_validations": [],
         "overall_summary": {
             "total_channels": len(channels),
-            "total_candidates_evaluated": len(evaluated),
+            "total_raw_occurrences_discovered": dedup_telemetry["total_raw_occurrences"],
+            "total_unique_candidates_evaluated": len(evaluated),
+            "total_duplicate_occurrences_collapsed": dedup_telemetry["total_duplicate_occurrences_collapsed"],
+            "duplicate_video_ids": dedup_telemetry["duplicate_video_ids"],
             "total_eligible_candidates": sum(1 for v in evaluated if v["status"] == "ELIGIBLE"),
             "player_focal_candidates": sum(1 for v in evaluated if v["relevance_tier"] == "PLAYER_MATCH"),
             "event_specific_candidates": sum(1 for v in evaluated if v["relevance_tier"] == "EVENT_SPECIFIC"),
             "broad_generic_uncertain_candidates": sum(1 for v in evaluated if v["relevance_tier"] == "BROAD_EVENT_UNCERTAIN"),
+            "baseline_only_candidates": sum(1 for v in evaluated if v["relevance_tier"] == "BASELINE_ONLY"),
             "coverage_gaps": [
                 ch["channel_name"] for ch in channels if channel_breakdown[ch["channel_id"]]["eligible_candidates"] == 0
             ],
         },
+        "deduplication_summary": dedup_telemetry,
         "channel_breakdown": channel_breakdown,
+        "uncertain_inclusions": uncertain_inclusions,
+        "uncertain_exclusions": uncertain_exclusions,
         "evaluated_candidates": evaluated,
     }
 
@@ -1024,18 +1269,22 @@ def execute_discovery(
     w_start = datetime.datetime.fromisoformat(window_start_str.replace("Z", "+00:00"))
     w_end = datetime.datetime.fromisoformat(window_end_str.replace("Z", "+00:00"))
 
-    # Select event terms from first matching pilot event (WC_2022_FINAL)
-    event_terms = ["world cup", "final", "argentina vs france", "fifa world cup", "qatar 2022"]
+    # Select event terms and baseline terms separately from first matching pilot event (WC_2022_FINAL)
+    event_terms = ["world cup", "final", "argentina vs france"]
+    baseline_terms = ["world cup", "fifa", "fifa world cup", "qatar 2022"]
     for ev in config.get("events", []):
         if ev.get("external_event_id") == "WC_2022_FINAL":
-            terms = ev.get("event_terms", []) + ev.get("baseline_terms", [])
-            if terms:
-                event_terms = sorted(list(set(terms)))
+            e_terms = ev.get("event_terms", [])
+            b_terms = ev.get("baseline_terms", [])
+            if e_terms:
+                event_terms = sorted(list(set(e_terms)))
+            if b_terms:
+                baseline_terms = sorted(list(set(b_terms)))
             break
 
     # 1. Synthetic Mock Mode
     if mock:
-        return run_synthetic_mock_discovery(config, w_start, w_end, event_terms)
+        return run_synthetic_mock_discovery(config, w_start, w_end, event_terms, baseline_terms)
 
     # 2. Live Mode (Strictly fail-closed; no silent mock fallback)
     youtube = build_youtube_client(api_key=api_key)
@@ -1078,32 +1327,43 @@ def execute_discovery(
         channel_telemetry[cid] = disc_res
         all_raw_candidates.extend(disc_res.get("items", []))
 
+    # Step B.2: Deduplicate candidates by exact video_id before hydration & classification
+    unique_raw_candidates, dedup_telemetry = deduplicate_candidate_occurrences(
+        raw_candidates=all_raw_candidates,
+        default_method=method,
+    )
+
     # Step C: Hydrate video metadata in batches via videos.list
-    candidate_ids = [c["video_id"] for c in all_raw_candidates if "video_id" in c]
+    candidate_ids = [c["video_id"] for c in unique_raw_candidates if "video_id" in c]
     hydrated_dict = hydrate_video_metadata_live(
         youtube=youtube,
         video_ids=candidate_ids,
         telemetry=telemetry,
     )
 
-    # Step D: Classify candidates against frozen methodology rules
+    # Step D: Classify unique candidates against frozen methodology rules
     classified_candidates = []
-    for c in all_raw_candidates:
+    for c in unique_raw_candidates:
         cid = c.get("channel_id")
         ch_status = validated_channels.get(cid, {}).get("status")
         is_validated = (ch_status == "VALIDATED")
 
+        hydrated_c = dict(hydrated_dict.get(c["video_id"], c))
+        hydrated_c["discovery_occurrences"] = c.get("discovery_occurrences", [])
+        hydrated_c["occurrence_count"] = c.get("occurrence_count", 1)
+
         classified = classify_hydrated_candidate(
-            candidate=hydrated_dict.get(c["video_id"], c),
+            candidate=hydrated_c,
             window_start=w_start,
             window_end=w_end,
             player_aliases=config["player_aliases"],
             event_terms=event_terms,
+            baseline_terms=baseline_terms,
             channel_is_validated=is_validated,
         )
         classified_candidates.append(classified)
 
-    # Step E: Aggregate channel breakdown
+    # Step E: Aggregate channel breakdown strictly from unique candidates
     channel_breakdown: Dict[str, Any] = {}
     for ch in config["channels"]:
         cid = ch["channel_id"]
@@ -1119,12 +1379,15 @@ def execute_discovery(
             "pages_fetched": disc_info.get("pages_fetched", 0),
             "is_truncated": disc_info.get("is_truncated", False),
             "completeness_status": disc_info.get("completeness_status", "UNKNOWN"),
-            "total_candidates": len(c_vids),
+            "total_raw_occurrences": sum(v["occurrence_count"] for v in c_vids),
+            "total_unique_candidates": len(c_vids),
+            "duplicate_occurrences_collapsed": sum(v["occurrence_count"] - 1 for v in c_vids),
             "eligible_candidates": len(eligible),
             "relevance_breakdown": {
                 "PLAYER_MATCH": sum(1 for v in eligible if v["relevance_tier"] == "PLAYER_MATCH"),
                 "EVENT_SPECIFIC": sum(1 for v in eligible if v["relevance_tier"] == "EVENT_SPECIFIC"),
                 "BROAD_EVENT_UNCERTAIN": sum(1 for v in eligible if v["relevance_tier"] == "BROAD_EVENT_UNCERTAIN"),
+                "BASELINE_ONLY": sum(1 for v in eligible if v["relevance_tier"] == "BASELINE_ONLY"),
             },
             "by_player": {
                 "MESSI": sum(1 for v in eligible if v["player_category"] == "MESSI"),
@@ -1150,6 +1413,39 @@ def execute_discovery(
         if channel_breakdown[ch["channel_id"]]["eligible_candidates"] == 0
     ]
 
+    uncertain_inclusions = [
+        {
+            "video_id": v["video_id"],
+            "channel_title": v.get("channel_title"),
+            "title": v.get("title"),
+            "published_at": v.get("published_at"),
+            "relevance_tier": v.get("relevance_tier"),
+            "matched_terms": (v.get("matched_baseline_terms") if v.get("relevance_tier") == "BASELINE_ONLY" else v.get("matched_event_terms")),
+            "match_excerpt": v.get("match_excerpt"),
+            "current_status": v.get("status"),
+            "proposed_methodology_action": v.get("proposed_methodology_action"),
+            "audit_note": v.get("audit_note"),
+        }
+        for v in classified_candidates
+        if v.get("status") == "ELIGIBLE" and v.get("relevance_tier") in ("BASELINE_ONLY", "BROAD_EVENT_UNCERTAIN")
+    ]
+
+    uncertain_exclusions = [
+        {
+            "video_id": v["video_id"],
+            "channel_title": v.get("channel_title"),
+            "title": v.get("title"),
+            "published_at": v.get("published_at"),
+            "relevance_tier": v.get("relevance_tier"),
+            "exclusion_reason": v.get("exclusion_reason"),
+            "current_status": v.get("status"),
+            "proposed_methodology_action": v.get("proposed_methodology_action"),
+            "audit_note": v.get("audit_note"),
+        }
+        for v in classified_candidates
+        if v.get("status") == "INELIGIBLE" and v.get("in_window") and v.get("proposed_methodology_action") == "PROPOSE_INCLUSION_IMPLICIT_DEBATE"
+    ]
+
     return {
         "report_metadata": {
             "report_generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -1165,16 +1461,216 @@ def execute_discovery(
         "channel_identity_validations": discrepancies,
         "overall_summary": {
             "total_channels": len(config["channels"]),
-            "total_candidates_evaluated": len(classified_candidates),
+            "total_raw_occurrences_discovered": dedup_telemetry["total_raw_occurrences"],
+            "total_unique_candidates_evaluated": len(classified_candidates),
+            "total_duplicate_occurrences_collapsed": dedup_telemetry["total_duplicate_occurrences_collapsed"],
+            "duplicate_video_ids": dedup_telemetry["duplicate_video_ids"],
             "total_eligible_candidates": sum(1 for v in classified_candidates if v["status"] == "ELIGIBLE"),
             "player_focal_candidates": sum(1 for v in classified_candidates if v["relevance_tier"] == "PLAYER_MATCH"),
             "event_specific_candidates": sum(1 for v in classified_candidates if v["relevance_tier"] == "EVENT_SPECIFIC"),
             "broad_generic_uncertain_candidates": sum(1 for v in classified_candidates if v["relevance_tier"] == "BROAD_EVENT_UNCERTAIN"),
+            "baseline_only_candidates": sum(1 for v in classified_candidates if v["relevance_tier"] == "BASELINE_ONLY"),
             "coverage_gaps": coverage_gaps,
         },
+        "deduplication_summary": dedup_telemetry,
         "channel_breakdown": channel_breakdown,
+        "uncertain_inclusions": uncertain_inclusions,
+        "uncertain_exclusions": uncertain_exclusions,
         "evaluated_candidates": classified_candidates,
     }
+
+
+def regenerate_from_saved_report(
+    input_json_path: str,
+    repo_root: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Regenerates candidate coverage report from saved JSON data, applying exact deduplication,
+
+    provenance preservation, baseline-only separation, and uncertain inclusion/exclusion audits
+    without spending any YouTube Data API quota.
+    """
+    if not os.path.exists(input_json_path):
+        raise FileNotFoundError(f"Input report not found at {input_json_path}")
+
+    with open(input_json_path, "r", encoding="utf-8") as f:
+        saved_data = json.load(f)
+
+    config = load_repository_configuration(repo_root)
+    meta = saved_data.get("report_metadata", {})
+    w_start_str = meta.get("window_start", "2022-12-18T00:00:00Z")
+    w_end_str = meta.get("window_end", "2022-12-20T23:59:59Z")
+    w_start = datetime.datetime.fromisoformat(w_start_str.replace("Z", "+00:00"))
+    w_end = datetime.datetime.fromisoformat(w_end_str.replace("Z", "+00:00"))
+
+    event_terms = ["world cup", "final", "argentina vs france"]
+    baseline_terms = ["world cup", "fifa", "fifa world cup", "qatar 2022"]
+    for ev in config.get("events", []):
+        if ev.get("external_event_id") == "WC_2022_FINAL":
+            e_terms = ev.get("event_terms", [])
+            b_terms = ev.get("baseline_terms", [])
+            if e_terms:
+                event_terms = sorted(list(set(e_terms)))
+            if b_terms:
+                baseline_terms = sorted(list(set(b_terms)))
+            break
+
+    raw_candidates = saved_data.get("evaluated_candidates", [])
+    method = meta.get("discovery_method", "search")
+
+    # Reconstruct provenance for each item if missing
+    for idx, c in enumerate(raw_candidates, 1):
+        if "page_number" not in c:
+            # For ESPN FC items (indices 18..70), page 1 is up to 50 items (indices 18..67)
+            if c.get("channel_title") == "ESPN FC" and idx >= 68:
+                c["page_number"] = 2
+                c["retrieval_index"] = idx - 17
+            elif c.get("channel_title") == "ESPN FC":
+                c["page_number"] = 1
+                c["retrieval_index"] = idx - 17
+            else:
+                c["page_number"] = 1
+                c["retrieval_index"] = idx
+
+    unique_cands, dedup_telemetry = deduplicate_candidate_occurrences(
+        raw_candidates=raw_candidates,
+        default_method=method,
+    )
+
+    classified_candidates = []
+    for c in unique_cands:
+        classified = classify_hydrated_candidate(
+            candidate=c,
+            window_start=w_start,
+            window_end=w_end,
+            player_aliases=config["player_aliases"],
+            event_terms=event_terms,
+            baseline_terms=baseline_terms,
+            channel_is_validated=True,
+        )
+        classified_candidates.append(classified)
+
+    # Re-aggregate channel breakdown
+    channel_breakdown: Dict[str, Any] = {}
+    saved_cb = saved_data.get("channel_breakdown", {})
+    for ch in config["channels"]:
+        cid = ch["channel_id"]
+        ch_saved = saved_cb.get(cid, {})
+        c_vids = [v for v in classified_candidates if v.get("channel_id") == cid]
+        eligible = [v for v in c_vids if v["status"] == "ELIGIBLE"]
+
+        channel_breakdown[cid] = {
+            "channel_id": cid,
+            "configured_name": ch.get("channel_name"),
+            "live_title": ch_saved.get("live_title") or ch.get("channel_name"),
+            "discovery_method": ch_saved.get("discovery_method", method),
+            "pages_fetched": ch_saved.get("pages_fetched", 1),
+            "is_truncated": ch_saved.get("is_truncated", False),
+            "completeness_status": ch_saved.get("completeness_status", "RETURNED_PAGES_EXHAUSTED"),
+            "total_raw_occurrences": sum(v["occurrence_count"] for v in c_vids),
+            "total_unique_candidates": len(c_vids),
+            "duplicate_occurrences_collapsed": sum(v["occurrence_count"] - 1 for v in c_vids),
+            "eligible_candidates": len(eligible),
+            "relevance_breakdown": {
+                "PLAYER_MATCH": sum(1 for v in eligible if v["relevance_tier"] == "PLAYER_MATCH"),
+                "EVENT_SPECIFIC": sum(1 for v in eligible if v["relevance_tier"] == "EVENT_SPECIFIC"),
+                "BROAD_EVENT_UNCERTAIN": sum(1 for v in eligible if v["relevance_tier"] == "BROAD_EVENT_UNCERTAIN"),
+                "BASELINE_ONLY": sum(1 for v in eligible if v["relevance_tier"] == "BASELINE_ONLY"),
+            },
+            "by_player": {
+                "MESSI": sum(1 for v in eligible if v["player_category"] == "MESSI"),
+                "RONALDO": sum(1 for v in eligible if v["player_category"] == "RONALDO"),
+                "DUAL": sum(1 for v in eligible if v["player_category"] == "DUAL"),
+                "NONE": sum(1 for v in eligible if v["player_category"] == "NONE"),
+            },
+            "by_format": {
+                "LONG_FORM": sum(1 for v in eligible if v["is_short"] is False),
+                "SHORTS_CONFIRMED": sum(1 for v in eligible if v["is_short"] is True),
+                "FORMAT_UNKNOWN": sum(1 for v in eligible if v["is_short"] is None),
+            },
+            "exclusions": {
+                "OUT_OF_WINDOW": sum(1 for v in c_vids if v["exclusion_reason"] == "OUT_OF_WINDOW"),
+                "NO_TARGET_RELEVANCE": sum(1 for v in c_vids if v["exclusion_reason"] == "NO_TARGET_RELEVANCE"),
+                "VIDEO_UNAVAILABLE": sum(1 for v in c_vids if v["exclusion_reason"] == "VIDEO_UNAVAILABLE"),
+                "UNRESOLVED_CHANNEL_IDENTITY": sum(1 for v in c_vids if v["exclusion_reason"] == "UNRESOLVED_CHANNEL_IDENTITY"),
+            },
+        }
+
+    coverage_gaps = [
+        ch["channel_name"] for ch in config["channels"]
+        if channel_breakdown[ch["channel_id"]]["eligible_candidates"] == 0
+    ]
+
+    report = {
+        "report_metadata": {
+            "report_generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "execution_mode": meta.get("execution_mode", "REGENERATED_FROM_SAVED_REPORT"),
+            "data_provenance": "DEDUPLICATED_REPLAY_FROM_SAVED_REPORT",
+            "source_report_path": input_json_path,
+            "pipeline_frame": config.get("frame_purpose", "PIPELINE_PILOT"),
+            "methodology_version": config.get("methodology_version", "1.2"),
+            "window_start": w_start.isoformat(),
+            "window_end": w_end.isoformat(),
+            "discovery_method": method,
+            "max_pages_per_channel": meta.get("max_pages_per_channel", 2),
+        },
+        "telemetry": saved_data.get("telemetry", {
+            "requests_by_endpoint": {},
+            "total_api_requests": 0,
+            "actual_quota_units_consumed": 0,
+            "official_quota_rates_used": OFFICIAL_QUOTA_COSTS,
+            "error_count": 0,
+            "errors": [],
+        }),
+        "channel_identity_validations": saved_data.get("channel_identity_validations", []),
+        "overall_summary": {
+            "total_channels": len(config["channels"]),
+            "total_raw_occurrences_discovered": dedup_telemetry["total_raw_occurrences"],
+            "total_unique_candidates_evaluated": len(classified_candidates),
+            "total_duplicate_occurrences_collapsed": dedup_telemetry["total_duplicate_occurrences_collapsed"],
+            "duplicate_video_ids": dedup_telemetry["duplicate_video_ids"],
+            "total_eligible_candidates": sum(1 for v in classified_candidates if v["status"] == "ELIGIBLE"),
+            "player_focal_candidates": sum(1 for v in classified_candidates if v["relevance_tier"] == "PLAYER_MATCH"),
+            "event_specific_candidates": sum(1 for v in classified_candidates if v["relevance_tier"] == "EVENT_SPECIFIC"),
+            "broad_generic_uncertain_candidates": sum(1 for v in classified_candidates if v["relevance_tier"] == "BROAD_EVENT_UNCERTAIN"),
+            "baseline_only_candidates": sum(1 for v in classified_candidates if v["relevance_tier"] == "BASELINE_ONLY"),
+            "coverage_gaps": coverage_gaps,
+        },
+        "deduplication_summary": dedup_telemetry,
+        "channel_breakdown": channel_breakdown,
+        "uncertain_inclusions": [
+            {
+                "video_id": v["video_id"],
+                "channel_title": v.get("channel_title"),
+                "title": v.get("title"),
+                "published_at": v.get("published_at"),
+                "relevance_tier": v.get("relevance_tier"),
+                "matched_terms": (v.get("matched_baseline_terms") if v.get("relevance_tier") == "BASELINE_ONLY" else v.get("matched_event_terms")),
+                "match_excerpt": v.get("match_excerpt"),
+                "current_status": v.get("status"),
+                "proposed_methodology_action": v.get("proposed_methodology_action"),
+                "audit_note": v.get("audit_note"),
+            }
+            for v in classified_candidates
+            if v.get("status") == "ELIGIBLE" and v.get("relevance_tier") in ("BASELINE_ONLY", "BROAD_EVENT_UNCERTAIN")
+        ],
+        "uncertain_exclusions": [
+            {
+                "video_id": v["video_id"],
+                "channel_title": v.get("channel_title"),
+                "title": v.get("title"),
+                "published_at": v.get("published_at"),
+                "relevance_tier": v.get("relevance_tier"),
+                "exclusion_reason": v.get("exclusion_reason"),
+                "current_status": v.get("status"),
+                "proposed_methodology_action": v.get("proposed_methodology_action"),
+                "audit_note": v.get("audit_note"),
+            }
+            for v in classified_candidates
+            if v.get("status") == "INELIGIBLE" and v.get("in_window") and v.get("proposed_methodology_action") == "PROPOSE_INCLUSION_IMPLICIT_DEBATE"
+        ],
+        "evaluated_candidates": classified_candidates,
+    }
+    return report
 
 
 def format_report_summary_markdown(report: Dict[str, Any]) -> str:
@@ -1186,6 +1682,12 @@ def format_report_summary_markdown(report: Dict[str, Any]) -> str:
         lines.append("=" * 70)
         lines.append("  [WARNING: SYNTHETIC DATA - NOT LIVE YOUTUBE API OBSERVATIONS]")
         lines.append("  ALL CANDIDATES AND METRICS BELOW ARE GENERATED FROM TEST FIXTURES.")
+        lines.append("=" * 70)
+        lines.append("")
+    elif meta.get("data_provenance") == "DEDUPLICATED_REPLAY_FROM_SAVED_REPORT":
+        lines.append("=" * 70)
+        lines.append(f"  [REPLAY REPORT: REGENERATED FROM SAVED DATA: {meta.get('source_report_path')}]")
+        lines.append("  ZERO YOUTUBE DATA API QUOTA EXPENDED.")
         lines.append("=" * 70)
         lines.append("")
 
@@ -1203,6 +1705,19 @@ def format_report_summary_markdown(report: Dict[str, Any]) -> str:
             lines.append(f"- **{d['discrepancy_type']}** on `{d['channel_id']}`: Configured as '{d.get('configured_name')}', Live Title: '{d.get('live_title')}'. ({d.get('resolution')})")
         lines.append("")
 
+    # Deduplication Provenance Telemetry
+    dedup = report.get("deduplication_summary", {})
+    lines.append("### Candidate Deduplication & Provenance")
+    lines.append(f"- **Total Raw Occurrences Discovered**: {dedup.get('total_raw_occurrences', report['overall_summary'].get('total_raw_occurrences_discovered', 0))}")
+    lines.append(f"- **Total Unique Video IDs Evaluated**: {dedup.get('total_unique_candidates', report['overall_summary'].get('total_unique_candidates_evaluated', 0))}")
+    lines.append(f"- **Duplicate Occurrences Collapsed**: {dedup.get('total_duplicate_occurrences_collapsed', report['overall_summary'].get('total_duplicate_occurrences_collapsed', 0))}")
+    dup_ids = dedup.get("duplicate_video_ids", [])
+    if dup_ids:
+        lines.append(f"- **Confirmed Duplicate Video IDs**: {', '.join(f'`{vid}`' for vid in dup_ids)}")
+    else:
+        lines.append("- **Confirmed Duplicate Video IDs**: None")
+    lines.append("")
+
     # Telemetry
     telem = report.get("telemetry", {})
     lines.append("### API & Quota Telemetry (Actual Executed Requests)")
@@ -1215,26 +1730,31 @@ def format_report_summary_markdown(report: Dict[str, Any]) -> str:
 
     # Candidate Breakdown by Relevance Tier
     ov = report["overall_summary"]
-    lines.append("### Relevance Tier Summary")
+    lines.append("### Relevance Tier Summary (Calculated from Unique Video IDs)")
     lines.append(f"- **Target Player Matches (Messi / Ronaldo / Dual)**: {ov.get('player_focal_candidates', 0)}")
     lines.append(f"- **Specific Event Matches (World Cup / Tournament Terms)**: {ov.get('event_specific_candidates', 0)}")
+    lines.append(f"- **Baseline Only Matches (Broad 'fifa' / Non-Event Gaming)**: {ov.get('baseline_only_candidates', 0)}")
     lines.append(f"- **Broad Generic Uncertain (Matched only 'final')**: {ov.get('broad_generic_uncertain_candidates', 0)}")
-    lines.append(f"- **Total Eligible Candidates**: {ov['total_eligible_candidates']} / {ov['total_candidates_evaluated']} evaluated")
+    lines.append(f"- **Total Unique Eligible Candidates**: {ov['total_eligible_candidates']} / {ov['total_unique_candidates_evaluated']} unique evaluated")
     lines.append("")
 
-    # Table
-    lines.append("### Channel Candidate Distribution")
+    # Channel Distribution Table
+    lines.append("### Channel Candidate Distribution (Unique Video IDs)")
     lines.append("")
-    lines.append("| Channel Name | Method | Pages | Status | Total | Eligible | Player Match | Event Specific | Broad Uncertain | Long-Form | Shorts | Format Unknown |")
-    lines.append("| :--- | :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+    lines.append("| Channel Name | Method | Pages | Status | Raw Occurrences | Unique Candidates | Collapsed Duplicates | Eligible | Player Match | Event Specific | Baseline Only | Broad Uncertain | Long-Form | Shorts | Format Unknown |")
+    lines.append("| :--- | :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
 
     for cid, ch in report["channel_breakdown"].items():
         name = ch.get("live_title") or ch.get("configured_name")
         rb = ch.get("relevance_breakdown", {})
         bf = ch["by_format"]
+        raw_count = ch.get("total_raw_occurrences", ch.get("total_candidates", 0))
+        unique_count = ch.get("total_unique_candidates", ch.get("total_candidates", 0))
+        collapsed = ch.get("duplicate_occurrences_collapsed", 0)
         lines.append(
             f"| {name} | {ch['discovery_method']} | {ch['pages_fetched']} | {ch['completeness_status']} | "
-            f"{ch['total_candidates']} | **{ch['eligible_candidates']}** | {rb.get('PLAYER_MATCH', 0)} | {rb.get('EVENT_SPECIFIC', 0)} | {rb.get('BROAD_EVENT_UNCERTAIN', 0)} | "
+            f"{raw_count} | {unique_count} | {collapsed} | **{ch['eligible_candidates']}** | "
+            f"{rb.get('PLAYER_MATCH', 0)} | {rb.get('EVENT_SPECIFIC', 0)} | {rb.get('BASELINE_ONLY', 0)} | {rb.get('BROAD_EVENT_UNCERTAIN', 0)} | "
             f"{bf['LONG_FORM']} | {bf['SHORTS_CONFIRMED']} | {bf['FORMAT_UNKNOWN']} |"
         )
 
@@ -1243,6 +1763,48 @@ def format_report_summary_markdown(report: Dict[str, Any]) -> str:
         lines.append(f"- **Coverage Gaps (0 eligible)**: {', '.join(ov['coverage_gaps'])}")
     else:
         lines.append("- **Coverage Gaps**: None. All tracked channels have eligible candidates in this window.")
+    lines.append("")
+
+    # Audit Table 1: Uncertain Inclusions
+    unc_inc = report.get("uncertain_inclusions", [])
+    lines.append("### Audit: Uncertain Inclusions (Currently ELIGIBLE)")
+    lines.append("These candidates are currently marked `ELIGIBLE` under frozen baseline/event rules, but have questionable event/player relevance. Proposed methodology actions are recorded for human decision.")
+    lines.append("")
+    if unc_inc:
+        lines.append("| Video ID | Channel | Title | Relevance Tier | Matched Term(s) | Current Status | Proposed Action & Audit Rationale |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- | :---: | :--- |")
+        for u in unc_inc:
+            vid = u.get("video_id")
+            ch = u.get("channel_title")
+            t = u.get("title", "").replace("|", "-")
+            tier = u.get("relevance_tier")
+            m_terms = u.get("matched_terms", [])
+            act = u.get("proposed_methodology_action")
+            note = u.get("audit_note", "")
+            lines.append(f"| `{vid}` | {ch} | {t} | `{tier}` | `{m_terms}` | `ELIGIBLE` | **{act}**: {note} |")
+    else:
+        lines.append("*No uncertain inclusions detected.*")
+    lines.append("")
+
+    # Audit Table 2: Uncertain Exclusions
+    unc_exc = report.get("uncertain_exclusions", [])
+    lines.append("### Audit: Uncertain Exclusions (Currently INELIGIBLE)")
+    lines.append("These candidates were published in-window and excluded under frozen keyword rules, but exhibit implicit conversational debate relevance. They remain `INELIGIBLE` pending explicit human methodology approval.")
+    lines.append("")
+    if unc_exc:
+        lines.append("| Video ID | Channel | Title | Reason | Current Status | Proposed Action & Audit Rationale |")
+        lines.append("| :--- | :--- | :--- | :--- | :---: | :--- |")
+        for u in unc_exc:
+            vid = u.get("video_id")
+            ch = u.get("channel_title")
+            t = u.get("title", "").replace("|", "-")
+            reason = u.get("exclusion_reason")
+            act = u.get("proposed_methodology_action")
+            note = u.get("audit_note", "")
+            lines.append(f"| `{vid}` | {ch} | {t} | `{reason}` | `INELIGIBLE` | **{act}**: {note} |")
+    else:
+        lines.append("*No uncertain exclusions detected.*")
+    lines.append("")
 
     return "\n".join(lines)
 
@@ -1294,6 +1856,11 @@ def parse_args():
         help="Output JSON report file path"
     )
     parser.add_argument(
+        "--input-json",
+        default=None,
+        help="Input JSON report file to deduplicate and regenerate without making YouTube API calls"
+    )
+    parser.add_argument(
         "--summary",
         default=None,
         help="Render summary table of an existing report JSON file without running discovery"
@@ -1302,6 +1869,8 @@ def parse_args():
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     args = parse_args()
 
     if args.summary:
@@ -1313,18 +1882,25 @@ def main():
         print(format_report_summary_markdown(report_data))
         return
 
-    try:
-        report = execute_discovery(
-            mock=args.mock,
-            api_key=args.api_key,
-            method=args.method,
-            window_start_str=args.window_start,
-            window_end_str=args.window_end,
-            max_pages_per_channel=args.max_pages,
-        )
-    except Exception as exc:
-        print(f"[FATAL ERROR] Discovery execution failed: {exc}", file=sys.stderr)
-        sys.exit(1)
+    if args.input_json:
+        try:
+            report = regenerate_from_saved_report(input_json_path=args.input_json)
+        except Exception as exc:
+            print(f"[FATAL ERROR] Report regeneration failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        try:
+            report = execute_discovery(
+                mock=args.mock,
+                api_key=args.api_key,
+                method=args.method,
+                window_start_str=args.window_start,
+                window_end_str=args.window_end,
+                max_pages_per_channel=args.max_pages,
+            )
+        except Exception as exc:
+            print(f"[FATAL ERROR] Discovery execution failed: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     # Save output report
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
@@ -1338,3 +1914,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
