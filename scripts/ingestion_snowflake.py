@@ -9,6 +9,11 @@ from googleapiclient.discovery import build
 import snowflake.connector
 from snowflake.connector.errors import ProgrammingError
 
+try:
+    from scripts.migration_runner import MigrationRunner
+except ImportError:
+    from migration_runner import MigrationRunner
+
 SALT_VERSION_ID = "v1.0"
 MAX_PAGES_PER_RUN = 5
 
@@ -51,18 +56,15 @@ def setup_snowflake_ddl(conn, target_db="FOOTBALL_NARRATIVE_DEV"):
     ]
     for file in files:
         path = os.path.join(ddl_dir, file)
-        with open(path, 'r') as f:
-            sql_script = f.read().replace('FOOTBALL_NARRATIVE_DEV', target_db)
-            conn.execute_string(sql_script)
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                sql_script = f.read().replace('FOOTBALL_NARRATIVE_DEV', target_db)
+                conn.execute_string(sql_script)
 
     migrations_dir = "infra/snowflake/migrations"
     if os.path.exists(migrations_dir):
-        mig_files = sorted([f for f in os.listdir(migrations_dir) if f.endswith('.sql')])
-        for file in mig_files:
-            path = os.path.join(migrations_dir, file)
-            with open(path, 'r') as f:
-                sql_script = f.read().replace('FOOTBALL_NARRATIVE_DEV', target_db)
-                conn.execute_string(sql_script)
+        runner = MigrationRunner(conn, target_db=target_db, migrations_dir=migrations_dir)
+        runner.run_migrations()
 
 def hash_author_id(author_id: str, hmac_secret: str) -> str:
     h = hmac.new(hmac_secret.encode('utf-8'), author_id.encode('utf-8'), hashlib.sha256)
