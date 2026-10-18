@@ -694,29 +694,38 @@ def test_regenerate_from_saved_report_counts():
     assert dedup["total_duplicate_occurrences_collapsed"] == 3
     assert set(dedup["duplicate_video_ids"]) == {"8PqQzR45AZc", "n-K3ajSqUY8", "VIeV_cAw5Dg"}
 
-    # Overall summary counts derived from unique candidates
+    # Overall summary counts derived from unique candidates with preserved classifications
     ov = report["overall_summary"]
     assert ov["total_raw_occurrences_discovered"] == 71
     assert ov["total_unique_candidates_evaluated"] == 68
     assert ov["total_duplicate_occurrences_collapsed"] == 3
     assert ov["total_eligible_candidates"] == 45
-    assert ov["player_focal_candidates"] == 16
-    assert ov["event_specific_candidates"] == 26
-    assert ov["baseline_only_candidates"] == 2
-    assert ov["broad_generic_uncertain_candidates"] == 1
+    assert ov["player_focal_candidates"] == 23
+    assert ov["event_specific_candidates"] == 22
+    assert ov["by_player"]["MESSI"] == 22
+    assert ov["by_player"]["DUAL"] == 1
+    assert ov["by_player"]["RONALDO"] == 0
+    assert ov["by_player"]["NONE"] == 22
 
-    # Uncertain inclusions & exclusions audit tables
+    # Before / After comparison assertions
+    comp = report["comparison_summary"]
+    assert comp["total_raw_occurrences"] == 71
+    assert comp["total_unique_videos"] == 68
+    assert comp["duplicate_occurrences_removed"] == 3
+    assert comp["classification_changes"] == 0
+    assert len(report["per_video_comparison"]) == 71
+
+    # Inclusions & exclusions audit tables
     inc_ids = {u["video_id"] for u in report.get("uncertain_inclusions", [])}
     assert "gZXC0n__OH4" in inc_ids
     assert "XYw10VvtpJE" in inc_ids
-    assert "TQ_CIbXDxHY" in inc_ids
 
     exc_ids = {u["video_id"] for u in report.get("uncertain_exclusions", [])}
     assert "I8JUK83KpuI" in exc_ids
 
 
 def test_regenerate_from_saved_report_synthetic(tmp_path):
-    """Verifies that regenerate_from_saved_report accurately deduplicates and classifies arbitrary reports."""
+    """Verifies that regenerate_from_saved_report accurately deduplicates and preserves classifications."""
     mini_report = {
         "report_metadata": {"execution_mode": "LIVE_YOUTUBE_API"},
         "evaluated_candidates": [
@@ -725,8 +734,12 @@ def test_regenerate_from_saved_report_synthetic(tmp_path):
                 "channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q",
                 "channel_title": "ESPN FC",
                 "title": "Match discussion",
-                "description": "world cup final",
                 "published_at": "2022-12-18T20:00:00Z",
+                "status": "ELIGIBLE",
+                "relevance_tier": "PLAYER_MATCH",
+                "player_category": "MESSI",
+                "matched_event_terms": ["world cup"],
+                "matched_player_aliases": ["messi"],
                 "is_available": True,
                 "duration_seconds": 600,
                 "view_count": "1000",
@@ -740,8 +753,12 @@ def test_regenerate_from_saved_report_synthetic(tmp_path):
                 "channel_id": "UCFxG3MxHC1ogUglvJeMHmVQ",
                 "channel_title": "Overlap Daily",
                 "title": "FIFA 23 Career Mode Episode 1",
-                "description": "gaming",
                 "published_at": "2022-12-19T10:00:00Z",
+                "status": "ELIGIBLE",
+                "relevance_tier": "EVENT_SPECIFIC",
+                "player_category": "NONE",
+                "matched_event_terms": ["fifa"],
+                "matched_player_aliases": [],
                 "is_available": True,
                 "duration_seconds": 1200,
                 "view_count": "500",
@@ -755,8 +772,14 @@ def test_regenerate_from_saved_report_synthetic(tmp_path):
                 "channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q",
                 "channel_title": "ESPN FC",
                 "title": "The GOAT debate is officially over 🤯 🐐 #shorts",
-                "description": "discussion",
                 "published_at": "2022-12-18T21:00:00Z",
+                "status": "INELIGIBLE",
+                "relevance_tier": "NO_MATCH",
+                "player_category": "NONE",
+                "in_window": True,
+                "exclusion_reason": "NO_TARGET_RELEVANCE",
+                "matched_event_terms": [],
+                "matched_player_aliases": [],
                 "is_available": True,
                 "duration_seconds": 45,
                 "view_count": "5000",
@@ -770,8 +793,12 @@ def test_regenerate_from_saved_report_synthetic(tmp_path):
                 "channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q",
                 "channel_title": "ESPN FC",
                 "title": "Match discussion (page 2 overlap)",
-                "description": "world cup final",
                 "published_at": "2022-12-18T20:00:00Z",
+                "status": "ELIGIBLE",
+                "relevance_tier": "PLAYER_MATCH",
+                "player_category": "MESSI",
+                "matched_event_terms": ["world cup"],
+                "matched_player_aliases": ["messi"],
                 "is_available": True,
                 "duration_seconds": 600,
                 "view_count": "1000",
@@ -801,8 +828,73 @@ def test_regenerate_from_saved_report_synthetic(tmp_path):
     assert report["deduplication_summary"]["total_duplicate_occurrences_collapsed"] == 1
     assert report["deduplication_summary"]["duplicate_video_ids"] == ["vid_1"]
     assert report["overall_summary"]["total_eligible_candidates"] == 2
-    assert report["overall_summary"]["baseline_only_candidates"] == 1
+    assert report["overall_summary"]["player_focal_candidates"] == 1
+    assert report["overall_summary"]["event_specific_candidates"] == 1
+    assert report["overall_summary"]["by_player"]["MESSI"] == 1
+    assert report["comparison_summary"]["classification_changes"] == 0
     assert len(report["uncertain_inclusions"]) == 1
     assert len(report["uncertain_exclusions"]) == 1
+
+
+def test_regenerate_from_saved_report_missing_description_unresolved(tmp_path):
+    """Unclassified candidates missing full descriptions are marked UNRESOLVED rather than guessed."""
+    mini_report = {
+        "report_metadata": {"execution_mode": "LIVE_YOUTUBE_API"},
+        "evaluated_candidates": [
+            {
+                "video_id": "unclassified_vid",
+                "channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q",
+                "channel_title": "ESPN FC",
+                "title": "Unclassified match footage",
+                "published_at": "2022-12-18T20:00:00Z",
+                # No description and no relevance_tier / status
+                "is_available": True,
+            }
+        ],
+        "channel_identity_validations": [],
+        "channel_breakdown": {},
+    }
+    report_file = tmp_path / "unresolved_report.json"
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(mini_report, f)
+
+    report = regenerate_from_saved_report(str(report_file))
+    cand = report["evaluated_candidates"][0]
+    assert cand["status"] == "UNRESOLVED"
+    assert cand["relevance_tier"] == "UNRESOLVED"
+    assert cand["classification_provenance"] == "UNRESOLVED_FULL_DESCRIPTION_UNAVAILABLE"
+
+
+def test_regenerate_from_saved_report_no_invented_provenance(tmp_path):
+    """Missing page numbers and retrieval positions are marked UNKNOWN, never hardcoded."""
+    mini_report = {
+        "report_metadata": {"execution_mode": "LIVE_YOUTUBE_API"},
+        "evaluated_candidates": [
+            {
+                "video_id": "vid_no_provenance",
+                "channel_id": "UC6c1z7bA__85CIWZ_jpCK-Q",
+                "channel_title": "ESPN FC",
+                "title": "Match footage without pagination tags",
+                "published_at": "2022-12-18T20:00:00Z",
+                "status": "ELIGIBLE",
+                "relevance_tier": "EVENT_SPECIFIC",
+                "player_category": "NONE",
+                "is_available": True,
+            }
+        ],
+        "channel_identity_validations": [],
+        "channel_breakdown": {},
+    }
+    report_file = tmp_path / "no_provenance_report.json"
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(mini_report, f)
+
+    report = regenerate_from_saved_report(str(report_file))
+    cand = report["evaluated_candidates"][0]
+    assert cand["page_number"] == "UNKNOWN"
+    assert cand["retrieval_index"] == "UNKNOWN"
+    occ = cand["discovery_occurrences"][0]
+    assert occ["page_number"] == "UNKNOWN"
+    assert occ["retrieval_index"] == "UNKNOWN"
 
 
