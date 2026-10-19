@@ -61,6 +61,11 @@ RUN_SCHEMA_VERSION = "pilot-comment-run/1"
 STORE_SCHEMA_VERSION = "pilot-comment-store/1"
 
 DEFAULT_MAX_COMMENTS_PER_VIDEO = 100
+
+# The API returns some comments with updatedAt exactly 1s before publishedAt (observed in the first
+# pilot run, both values from the same item). Gaps up to this tolerance are reported as warnings with
+# raw values unchanged; larger gaps still fail verification.
+TIMESTAMP_SKEW_TOLERANCE_SECONDS = 1
 API_MAX_RESULTS = 100  # commentThreads.list maxResults upper bound
 
 QUOTA_REASONS = {"quotaExceeded", "rateLimitExceeded", "userRateLimitExceeded", "dailyLimitExceeded"}
@@ -674,7 +679,7 @@ def verify_store(output_root: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
     if not os.path.exists(store_path):
         return {"comments": 0, "duplicate_sample_observations": 0, "sample_observations": 0, "runs": 0,
                 "problems": {"store_missing": [store_path]}, "problem_counts": {"store_missing": 1},
-                "passed": False}
+                "warnings": {}, "warning_counts": {}, "passed": False}
     store = load_store(store_path, must_exist=True)
     video_pub = {v["video_id"]: parse_api_timestamp(v.get("video_published_at")) for v in manifest["videos"]}
     problems: Dict[str, List[Any]] = {
@@ -717,6 +722,7 @@ def verify_store(output_root: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
     runs_dir = os.path.join(output_root, "runs")
     if os.path.isdir(runs_dir):
         problems["run_not_in_store"] = sorted(set(os.listdir(runs_dir)) - set(store_run_ids))
+    warnings: Dict[str, List[Any]] = {"updated_before_published_within_tolerance": []}
     raw_cache: Dict[str, Tuple[str, Optional[Dict[str, Any]]]] = {}
     observation_count = 0
     sample_keys = set()
@@ -730,7 +736,11 @@ def verify_store(output_root: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
         if pub is None or (c.get("latest_updated_at") and upd is None):
             problems["unparseable_timestamps"].append(cid)
         elif upd is not None and upd < pub:
-            problems["updated_before_published"].append(cid)
+            gap = (pub - upd).total_seconds()
+            if gap <= TIMESTAMP_SKEW_TOLERANCE_SECONDS:
+                warnings["updated_before_published_within_tolerance"].append([cid, gap])
+            else:
+                problems["updated_before_published"].append(cid)
         vp = video_pub.get(c.get("manifest_video_id"))
         if c.get("manifest_video_id") not in video_pub:
             problems["video_not_in_manifest"].append(cid)
@@ -788,6 +798,9 @@ def verify_store(output_root: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
         "runs": len(store.get("runs", [])),
         "problems": {k: v for k, v in problems.items()},
         "problem_counts": {k: len(v) for k, v in problems.items()},
+        "warnings": warnings,
+        "warning_counts": {k: len(v) for k, v in warnings.items()},
+        "timestamp_skew_tolerance_seconds": TIMESTAMP_SKEW_TOLERANCE_SECONDS,
         "passed": total_problems == 0,
     }
 
@@ -883,8 +896,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     result = verify_store(args.output_root, manifest)
     run_dups = scan_run_duplicates(args.output_root)
-    print(json.dumps({k: v for k, v in result.items() if k != "problems"}, indent=2))
+    print(json.dumps({k: v for k, v in result.items() if k not in ("problems", "warnings")}, indent=2))
     print("duplicate comment IDs within each run:", json.dumps(run_dups))
+    for name, items in result["warnings"].items():
+        if items:
+            print(f"[WARN] {name}: {items[:10]}{' ...' if len(items) > 10 else ''}")
     for name, items in result["problems"].items():
         if items:
             print(f"[FAIL] {name}: {items[:10]}{' ...' if len(items) > 10 else ''}")

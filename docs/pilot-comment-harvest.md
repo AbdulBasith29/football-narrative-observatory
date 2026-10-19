@@ -82,3 +82,11 @@ Also checks: the latest text version matches the most recent observation; parsea
 `video_id` matches the manifest video; exactly one latest text version; zero duplicate comment IDs
 within each run and no duplicate sample observations; every lineage reference resolves to an existing
 raw file whose SHA-256 matches and whose item at `source_item_position` has that comment ID.
+
+### Timestamp skew tolerance
+
+The first live pilot run (pilot-comments-v1, 1,976 comments) returned 13 comments whose `updatedAt` was
+exactly 1 second before `publishedAt` within the same API item, all published between 2023-08-24 and
+2023-09-18 across 5 videos. Gaps up to `TIMESTAMP_SKEW_TOLERANCE_SECONDS` (1s) are reported as
+`[WARN] updated_before_published_within_tolerance` with the gap, and raw values are never adjusted. Any
+larger gap still fails verification.

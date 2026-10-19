@@ -549,3 +549,49 @@ def test_verify_detects_stale_latest_text_flag(tmp_path):
     result = hpc.verify_store(str(tmp_path), m)
     assert result["problems"]["latest_text_not_last_observed"] == ["c1"]
     assert not result["passed"]
+
+
+# =============================================================================
+# 7. Timestamp skew observed in the first live pilot run
+# =============================================================================
+
+def test_one_second_updated_before_published_is_warning_not_failure(tmp_path):
+    """Pilot run: 13/1976 comments had updatedAt exactly 1s before publishedAt in the same API item."""
+    m = _manifest(vids=("v1",))
+    f = ScriptedFetcher({("v1", None): _page([
+        _thread("skew", "v1", published="2023-08-29T12:51:05Z", updated="2023-08-29T12:51:04Z"),
+        _thread("ok", "v1"),
+    ])})
+    hpc.run_harvest(m, f, str(tmp_path), SECRET, "Abdul", run_id="r1")
+    result = hpc.verify_store(str(tmp_path), m)
+    assert result["passed"], result["problem_counts"]
+    assert result["problems"]["updated_before_published"] == []
+    assert result["warnings"]["updated_before_published_within_tolerance"] == [["skew", 1.0]]
+    assert result["warning_counts"]["updated_before_published_within_tolerance"] == 1
+    # Raw values are kept as returned, never adjusted.
+    c = json.loads((tmp_path / "comment_store.json").read_text())["comments"]["skew"]
+    assert c["published_at"] == "2023-08-29T12:51:05Z" and c["latest_updated_at"] == "2023-08-29T12:51:04Z"
+
+
+def test_gap_beyond_tolerance_still_fails(tmp_path):
+    m = _manifest(vids=("v1",))
+    f = ScriptedFetcher({("v1", None): _page([
+        _thread("skew2", "v1", published="2023-08-29T12:51:05Z", updated="2023-08-29T12:51:03Z"),
+    ])})
+    hpc.run_harvest(m, f, str(tmp_path), SECRET, "Abdul", run_id="r1")
+    result = hpc.verify_store(str(tmp_path), m)
+    assert result["problems"]["updated_before_published"] == ["skew2"]
+    assert result["warnings"]["updated_before_published_within_tolerance"] == []
+    assert not result["passed"]
+
+
+def test_verify_cli_prints_warning_and_passes(tmp_path, capsys):
+    m = _manifest(vids=("v1",))
+    f = ScriptedFetcher({("v1", None): _page([
+        _thread("skew", "v1", published="2023-09-03T16:13:14Z", updated="2023-09-03T16:13:13Z")])})
+    hpc.run_harvest(m, f, str(tmp_path), SECRET, "Abdul", run_id="r1")
+    manifest_path = tmp_path / "m.json"
+    manifest_path.write_text(json.dumps(m))
+    assert hpc.main(["verify", "--manifest", str(manifest_path), "--output-root", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "[WARN] updated_before_published_within_tolerance" in out and "[OK] All checks passed" in out
