@@ -79,6 +79,7 @@ OUTCOME_NOT_ATTEMPTED = "NOT_ATTEMPTED"
 # Pagination availability when a video's collection stopped
 PAGINATION_EXHAUSTED = "EXHAUSTED"
 PAGINATION_MORE_AVAILABLE = "MORE_AVAILABLE_CAP_REACHED"
+PAGINATION_REQUEST_CAP = "MORE_AVAILABLE_REQUEST_CAP_REACHED"
 PAGINATION_UNKNOWN = "UNKNOWN"
 
 Fetcher = Callable[[Dict[str, Any]], Tuple[Optional[int], bytes]]
@@ -208,6 +209,12 @@ def verify_manifest_integrity(manifest: Dict[str, Any]) -> None:
     body = {k: v for k, v in manifest.items() if k != "manifest_sha256"}
     if not recorded or canonical_json_hash(body) != recorded:
         raise ValueError("Manifest content hash mismatch: the manifest was edited after generation. Rebuild it.")
+    budget = manifest.get("budget", {})
+    per_video = budget.get("max_requests_per_video")
+    expected_per_video = -(-manifest["scope"]["max_comments_per_video"] // API_MAX_RESULTS)
+    if (not isinstance(per_video, int) or per_video < 1 or per_video != expected_per_video
+            or budget.get("max_total_requests") != per_video * len(manifest.get("videos", []))):
+        raise ValueError("Manifest request budget is inconsistent with its scope and video count.")
 
 
 # =============================================================================
@@ -314,8 +321,11 @@ def harvest_video(
     run_id: str,
     max_comments: int,
     hmac_secret: str,
+    max_requests: int,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Collects up to max_comments newest top-level comments for one video.
+    """Collects up to max_comments newest top-level comments for one video, issuing at most max_requests
+    requests. The request cap is enforced independently of the comment count, so short pages cannot
+    push a video past its budget.
 
     Returns (video_outcome, page_records, parsed_observations). Raw bytes are written before parsing.
     """
@@ -328,6 +338,8 @@ def harvest_video(
     error_code: Optional[str] = None
     pagination = PAGINATION_UNKNOWN
     pages_succeeded = 0
+    if max_requests < 1:
+        raise ValueError("max_requests must be at least 1")
 
     while True:
         page_number = len(pages) + 1
@@ -413,6 +425,9 @@ def harvest_video(
             # A token with an empty page: stop rather than loop; availability is unknown.
             pagination = PAGINATION_UNKNOWN
             break
+        if len(pages) >= max_requests:
+            pagination = PAGINATION_REQUEST_CAP
+            break
         page_token = next_token
 
     if outcome is None:
@@ -438,7 +453,7 @@ def merge_into_store(store: Dict[str, Any], observations: List[Dict[str, Any]], 
     - engagement_snapshots / sample_observations: one per observation
     """
     comments = store.setdefault("comments", {})
-    stats = {"new_comments": 0, "existing_comments": 0, "new_text_versions": 0,
+    stats = {"new_comments": 0, "existing_comments": 0, "new_text_versions": 0, "text_reverts": 0,
              "updated_at_changes": 0, "duplicate_ids_within_run": 0}
     seen_in_run = set()
 
@@ -471,18 +486,27 @@ def merge_into_store(store: Dict[str, Any], observations: List[Dict[str, Any]], 
         elif not repeat_in_run and entry["first_observed_run_id"] != run_id:
             stats["existing_comments"] += 1
 
-        if not any(v["text_hash"] == obs["text_hash"] for v in entry["text_versions"]):
-            for v in entry["text_versions"]:
-                v["is_latest_version"] = False
-            entry["text_versions"].append({
+        # One version per distinct text hash; the latest flag follows the most recent observation, so a
+        # revert (A -> B -> A) re-flags the existing A version instead of leaving B marked latest.
+        version = next((v for v in entry["text_versions"] if v["text_hash"] == obs["text_hash"]), None)
+        if version is None:
+            version = {
                 "text_hash": obs["text_hash"],
                 "text": obs["text"],
                 "updated_at": obs["updated_at"],
                 "observed_at": obs["observed_at"],
                 "run_id": run_id,
-                "is_latest_version": True,
-            })
+                "is_latest_version": False,
+            }
+            entry["text_versions"].append(version)
             stats["new_text_versions"] += 1
+        elif not version["is_latest_version"]:
+            stats["text_reverts"] += 1
+        for v in entry["text_versions"]:
+            v["is_latest_version"] = v is version
+        version["last_observed_at"] = obs["observed_at"]
+        version["last_observed_run_id"] = run_id
+        entry["latest_text_hash"] = obs["text_hash"]
 
         last_updated = entry.get("latest_updated_at")
         if last_updated is not None and obs["updated_at"] != last_updated:
@@ -504,12 +528,15 @@ def merge_into_store(store: Dict[str, Any], observations: List[Dict[str, Any]], 
             "page_number": obs["page_number"],
             "source_item_position": obs["source_item_position"],
             "observed_at": obs["observed_at"],
+            "text_hash": obs["text_hash"],
         })
 
     return stats
 
 
-def load_store(store_path: str) -> Dict[str, Any]:
+def load_store(store_path: str, must_exist: bool = False) -> Dict[str, Any]:
+    if must_exist and not os.path.exists(store_path):
+        raise FileNotFoundError(f"Comment store not found: {store_path}")
     if os.path.exists(store_path):
         with open(store_path, "r", encoding="utf-8") as f:
             store = json.load(f)
@@ -551,6 +578,8 @@ def run_harvest(
     store["manifest_sha256"] = manifest["manifest_sha256"]
 
     max_comments = manifest["scope"]["max_comments_per_video"]
+    max_requests_per_video = manifest["budget"]["max_requests_per_video"]
+    max_total_requests = manifest["budget"]["max_total_requests"]
     videos = manifest["videos"][:video_limit] if video_limit else manifest["videos"]
     started_at = utc_now_iso()
 
@@ -558,15 +587,21 @@ def run_harvest(
     all_pages: List[Dict[str, Any]] = []
     all_obs: List[Dict[str, Any]] = []
     quota_stop = False
+    budget_stop = False
     for video in videos:
-        if quota_stop:
+        remaining_requests = max_total_requests - len(all_pages)
+        if remaining_requests < 1:
+            budget_stop = True
+        if quota_stop or budget_stop:
             video_outcomes.append({
                 "video_id": video["video_id"], "outcome": OUTCOME_NOT_ATTEMPTED,
-                "error_code": "STOPPED_AFTER_QUOTA_LIMIT", "pagination_availability": PAGINATION_UNKNOWN,
+                "error_code": "STOPPED_AFTER_QUOTA_LIMIT" if quota_stop else "RUN_REQUEST_BUDGET_EXHAUSTED",
+                "pagination_availability": PAGINATION_UNKNOWN,
                 "pages_requested": 0, "pages_succeeded": 0, "comments_collected": 0,
             })
             continue
-        outcome, pages, obs = harvest_video(video, fetcher, run_dir, run_id, max_comments, hmac_secret)
+        outcome, pages, obs = harvest_video(video, fetcher, run_dir, run_id, max_comments, hmac_secret,
+                                            min(max_requests_per_video, remaining_requests))
         video_outcomes.append(outcome)
         all_pages.extend(pages)
         all_obs.extend(obs)
@@ -596,7 +631,7 @@ def run_harvest(
         "scope_accepted_by": scope_accepted_by.strip(),
         "started_at": started_at,
         "completed_at": utc_now_iso(),
-        "run_status": "STOPPED_QUOTA_LIMIT" if quota_stop else (
+        "run_status": "STOPPED_QUOTA_LIMIT" if quota_stop else "STOPPED_REQUEST_BUDGET" if budget_stop else (
             "COMPLETED" if all(vo["outcome"] in (OUTCOME_COLLECTED, OUTCOME_EMPTY, OUTCOME_COMMENTS_DISABLED,
                                                  OUTCOME_VIDEO_NOT_FOUND) for vo in video_outcomes)
             else "COMPLETED_WITH_ERRORS"),
@@ -606,6 +641,8 @@ def run_harvest(
             "requests_by_endpoint": {"commentThreads.list": requests},
             "quota_units_consumed_estimate": requests * OFFICIAL_QUOTA_COSTS["commentThreads.list"],
             "budget_max_quota_units": manifest["budget"]["max_quota_units"],
+            "budget_max_total_requests": max_total_requests,
+            "budget_max_requests_per_video": max_requests_per_video,
         },
         "outcome_counts": outcome_counts,
         "comments_observed": len(all_obs),
@@ -628,8 +665,17 @@ def run_harvest(
 # =============================================================================
 
 def verify_store(output_root: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
-    """Offline checks the user can run after a harvest. Returns a dict of check results."""
-    store = load_store(os.path.join(output_root, "comment_store.json"))
+    """Offline checks the user can run after a harvest. Returns a dict of check results.
+
+    Fails (passed=False) when the store is missing, records no runs, was built from a different
+    manifest, or references runs whose records are missing on disk.
+    """
+    store_path = os.path.join(output_root, "comment_store.json")
+    if not os.path.exists(store_path):
+        return {"comments": 0, "duplicate_sample_observations": 0, "sample_observations": 0, "runs": 0,
+                "problems": {"store_missing": [store_path]}, "problem_counts": {"store_missing": 1},
+                "passed": False}
+    store = load_store(store_path, must_exist=True)
     video_pub = {v["video_id"]: parse_api_timestamp(v.get("video_published_at")) for v in manifest["videos"]}
     problems: Dict[str, List[Any]] = {
         "unparseable_timestamps": [],
@@ -642,7 +688,35 @@ def verify_store(output_root: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
         "lineage_item_not_found": [],
         "multiple_latest_text_versions": [],
         "store_key_mismatch": [],
+        "latest_text_not_last_observed": [],
+        "store_manifest_mismatch": [],
+        "no_runs_recorded": [],
+        "run_record_missing": [],
+        "run_parsed_file_missing": [],
+        "run_manifest_mismatch": [],
+        "run_not_in_store": [],
+        "observation_run_not_in_store": [],
     }
+    if store.get("manifest_sha256") != manifest.get("manifest_sha256"):
+        problems["store_manifest_mismatch"].append(
+            {"store": store.get("manifest_sha256"), "manifest": manifest.get("manifest_sha256")})
+    store_run_ids = [r.get("run_id") for r in store.get("runs", [])]
+    if not store_run_ids:
+        problems["no_runs_recorded"].append(store_path)
+    for rid in store_run_ids:
+        run_dir = os.path.join(output_root, "runs", rid)
+        run_json = os.path.join(run_dir, "run.json")
+        if not os.path.exists(run_json):
+            problems["run_record_missing"].append(rid)
+        else:
+            with open(run_json, "r", encoding="utf-8") as f:
+                if json.load(f).get("manifest_sha256") != manifest.get("manifest_sha256"):
+                    problems["run_manifest_mismatch"].append(rid)
+        if not os.path.exists(os.path.join(run_dir, "parsed_comments.jsonl")):
+            problems["run_parsed_file_missing"].append(rid)
+    runs_dir = os.path.join(output_root, "runs")
+    if os.path.isdir(runs_dir):
+        problems["run_not_in_store"] = sorted(set(os.listdir(runs_dir)) - set(store_run_ids))
     raw_cache: Dict[str, Tuple[str, Optional[Dict[str, Any]]]] = {}
     observation_count = 0
     sample_keys = set()
@@ -664,11 +738,20 @@ def verify_store(output_root: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
             problems["comment_before_video_published"].append(cid)
         if c.get("video_id") != c.get("manifest_video_id"):
             problems["video_id_mismatch"].append(cid)
-        if sum(1 for v in c.get("text_versions", []) if v.get("is_latest_version")) != 1:
+        latest = [v for v in c.get("text_versions", []) if v.get("is_latest_version")]
+        if len(latest) != 1:
             problems["multiple_latest_text_versions"].append(cid)
+        observations = c.get("sample_observations", [])
+        if latest and observations and len(latest) == 1:
+            last = max(observations, key=lambda so: (so.get("observed_at") or "", so.get("page_number", 0),
+                                                     so.get("source_item_position", 0)))
+            if last.get("text_hash") is not None and latest[0]["text_hash"] != last["text_hash"]:
+                problems["latest_text_not_last_observed"].append(cid)
 
         for so in c.get("sample_observations", []):
             observation_count += 1
+            if so["run_id"] not in store_run_ids:
+                problems["observation_run_not_in_store"].append([cid, so["run_id"]])
             key = (so["run_id"], so["raw_file"], so["source_item_position"])
             if key in sample_keys:
                 duplicate_sample_observations += 1

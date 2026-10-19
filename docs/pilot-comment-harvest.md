@@ -51,12 +51,20 @@ Per run, under `<output-root>/runs/<run_id>/`:
 
 Per-video outcomes are distinct: `COLLECTED`, `EMPTY`, `COMMENTS_DISABLED`, `VIDEO_NOT_FOUND`,
 `QUOTA_LIMIT` / `PARTIAL_QUOTA_LIMIT` (stops the run; remaining videos `NOT_ATTEMPTED`), `ERROR` /
-`PARTIAL_ERROR` (e.g. `HTTP_403` for non-quota forbidden). `pagination_availability` is `EXHAUSTED`
-or `MORE_AVAILABLE_CAP_REACHED`. Exit code is 0 only for `COMPLETED`.
+`PARTIAL_ERROR` (e.g. `HTTP_403` for non-quota forbidden). `pagination_availability` is `EXHAUSTED`,
+`MORE_AVAILABLE_CAP_REACHED` (comment cap) or `MORE_AVAILABLE_REQUEST_CAP_REACHED` (request cap).
+Exit code is 0 only for `COMPLETED`.
+
+The manifest's request budget is enforced independently of the comment count: each video gets at most
+`max_requests_per_video` requests and the run at most `max_total_requests`, even if pages come back
+short with continuation tokens. If the run budget is ever exhausted, remaining videos are
+`NOT_ATTEMPTED` (`RUN_REQUEST_BUDGET_EXHAUSTED`) and the run is `STOPPED_REQUEST_BUDGET`.
 
 `<output-root>/comment_store.json` accumulates runs at the warehouse grains: one identity per
 `comment_id`, text versions per `(comment_id, text_hash)`, engagement snapshots and sample
 observations per observation. Reruns add new comments and new text versions without duplicating IDs.
+The latest-text flag follows the most recent observation, so a revert (A → B → A) re-flags the
+existing A version rather than adding a duplicate or leaving B marked latest.
 One output root per manifest; mixing manifests is refused.
 
 ## 3. Verify (offline)
@@ -67,7 +75,10 @@ python scripts/harvest_pilot_comments.py verify \
   --output-root reports/comment_pilot/pilot-comments-v1
 ```
 
-Checks: parseable timestamps; `updated_at >= published_at`; no comment published before its video;
+Fails if the store is missing, records no runs, or was built from a different manifest; if a recorded
+run's `run.json` or `parsed_comments.jsonl` is missing or names a different manifest; if a run
+directory exists that the store does not record; or if an observation references an unrecorded run.
+Also checks: the latest text version matches the most recent observation; parseable timestamps; `updated_at >= published_at`; no comment published before its video;
 `video_id` matches the manifest video; exactly one latest text version; zero duplicate comment IDs
 within each run and no duplicate sample observations; every lineage reference resolves to an existing
 raw file whose SHA-256 matches and whose item at `source_item_position` has that comment ID.

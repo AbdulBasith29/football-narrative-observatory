@@ -269,7 +269,7 @@ def test_rerun_adds_new_and_updated_comments_without_duplicate_ids(tmp_path):
         _thread("c1", "v1", text="first"),
     ])})
     rec2 = hpc.run_harvest(m, run2, str(tmp_path), SECRET, "Abdul", run_id="r2")
-    assert rec2["store_merge"] == {"new_comments": 1, "existing_comments": 2, "new_text_versions": 2,
+    assert rec2["store_merge"] == {"new_comments": 1, "existing_comments": 2, "new_text_versions": 2, "text_reverts": 0,
                                    "updated_at_changes": 1, "duplicate_ids_within_run": 0}
 
     store = json.loads((tmp_path / "comment_store.json").read_text())
@@ -394,3 +394,158 @@ def test_live_fetcher_with_real_client_library_keeps_verbatim_bytes():
     fetch = hpc.make_live_fetcher(yt)
     assert fetch({"part": "snippet", "videoId": "v1", "maxResults": 100}) == (200, ok)
     assert fetch({"part": "snippet", "videoId": "v1"}) == (403, err)
+
+
+# =============================================================================
+# 6. External-review regressions
+# =============================================================================
+
+def test_request_budget_enforced_independently_of_comment_count(tmp_path):
+    """Short pages with continuation tokens must not push a video past its request budget."""
+    m = _manifest(vids=("v1", "v2"), max_comments=100)  # budget: 1 request/video, 2 total
+    script = {}
+    for vid in ("v1", "v2"):
+        script[(vid, None)] = _page([_thread(f"{vid}-c0", vid)], "T1")
+        for i in range(1, 100):
+            script[(vid, f"T{i}")] = _page([_thread(f"{vid}-c{i}", vid)], f"T{i + 1}")
+    f = ScriptedFetcher(script)
+    rec = hpc.run_harvest(m, f, str(tmp_path), SECRET, "Abdul", run_id="r1")
+    assert len(f.calls) == 2  # previously up to 100 requests per video
+    assert all("pageToken" not in c for c in f.calls)
+    for o in rec["video_outcomes"]:
+        assert o["outcome"] == hpc.OUTCOME_COLLECTED
+        assert o["pages_requested"] == 1 and o["comments_collected"] == 1
+        assert o["pagination_availability"] == hpc.PAGINATION_REQUEST_CAP
+    assert rec["telemetry"]["requests_by_endpoint"]["commentThreads.list"] <= m["budget"]["max_total_requests"]
+
+
+def test_request_budget_multi_page_cap(tmp_path):
+    m = _manifest(vids=("v1",), max_comments=250)  # 3 requests/video
+    f = ScriptedFetcher({("v1", None): _page([_thread("a", "v1")], "T1"),
+                         ("v1", "T1"): _page([_thread("b", "v1")], "T2"),
+                         ("v1", "T2"): _page([_thread("c", "v1")], "T3"),
+                         ("v1", "T3"): _page([_thread("d", "v1")], "T4")})
+    rec = hpc.run_harvest(m, f, str(tmp_path), SECRET, "Abdul", run_id="r1")
+    assert len(f.calls) == 3
+    assert rec["video_outcomes"][0]["pagination_availability"] == hpc.PAGINATION_REQUEST_CAP
+
+
+def test_harvest_video_rejects_non_positive_request_cap(tmp_path):
+    with pytest.raises(ValueError):
+        hpc.harvest_video({"video_id": "v1"}, ScriptedFetcher({}), str(tmp_path), "r1", 100, SECRET, 0)
+
+
+def test_manifest_with_inconsistent_budget_is_rejected():
+    m = _manifest(vids=("v1",))
+    m["budget"]["max_requests_per_video"] = 50
+    m["manifest_sha256"] = hpc.canonical_json_hash({k: v for k, v in m.items() if k != "manifest_sha256"})
+    with pytest.raises(ValueError, match="budget"):
+        hpc.verify_manifest_integrity(m)
+
+
+def test_verify_fails_when_store_missing(tmp_path):
+    result = hpc.verify_store(str(tmp_path), _manifest())
+    assert not result["passed"]
+    assert result["problem_counts"]["store_missing"] == 1
+    with pytest.raises(FileNotFoundError):
+        hpc.load_store(str(tmp_path / "comment_store.json"), must_exist=True)
+
+
+def test_verify_cli_fails_when_store_missing(tmp_path):
+    manifest_path = tmp_path / "m.json"
+    manifest_path.write_text(json.dumps(_manifest()))
+    assert hpc.main(["verify", "--manifest", str(manifest_path), "--output-root", str(tmp_path / "none")]) == 1
+
+
+def _harvest_one(tmp_path, run_id="r1"):
+    m = _manifest(vids=("v1",))
+    f = ScriptedFetcher({("v1", None): _page([_thread("c1", "v1")])})
+    hpc.run_harvest(m, f, str(tmp_path), SECRET, "Abdul", run_id=run_id)
+    return m
+
+
+def test_verify_fails_when_store_has_no_runs(tmp_path):
+    m = _manifest(vids=("v1",))
+    (tmp_path / "comment_store.json").write_text(json.dumps(
+        {"schema_version": hpc.STORE_SCHEMA_VERSION, "manifest_sha256": m["manifest_sha256"], "runs": [], "comments": {}}))
+    result = hpc.verify_store(str(tmp_path), m)
+    assert not result["passed"] and result["problem_counts"]["no_runs_recorded"] == 1
+
+
+def test_verify_fails_when_run_record_or_parsed_file_missing(tmp_path):
+    m = _harvest_one(tmp_path)
+    assert hpc.verify_store(str(tmp_path), m)["passed"]
+    (tmp_path / "runs" / "r1" / "run.json").unlink()
+    (tmp_path / "runs" / "r1" / "parsed_comments.jsonl").unlink()
+    result = hpc.verify_store(str(tmp_path), m)
+    assert result["problems"]["run_record_missing"] == ["r1"]
+    assert result["problems"]["run_parsed_file_missing"] == ["r1"]
+    assert not result["passed"]
+
+
+def test_verify_fails_when_whole_run_directory_missing(tmp_path):
+    import shutil
+    m = _harvest_one(tmp_path)
+    shutil.rmtree(tmp_path / "runs" / "r1")
+    result = hpc.verify_store(str(tmp_path), m)
+    assert result["problems"]["run_record_missing"] == ["r1"]
+    assert result["problem_counts"]["lineage_file_missing"] == 1
+    assert not result["passed"]
+
+
+def test_verify_flags_orphan_run_and_unknown_observation_run(tmp_path):
+    m = _harvest_one(tmp_path)
+    (tmp_path / "runs" / "orphan").mkdir()
+    store_path = tmp_path / "comment_store.json"
+    store = json.loads(store_path.read_text())
+    store["comments"]["c1"]["sample_observations"][0]["run_id"] = "ghost"
+    store_path.write_text(json.dumps(store))
+    result = hpc.verify_store(str(tmp_path), m)
+    assert result["problems"]["run_not_in_store"] == ["orphan"]
+    assert result["problems"]["observation_run_not_in_store"] == [["c1", "ghost"]]
+    assert not result["passed"]
+
+
+def test_verify_checks_store_and_run_manifest_hash(tmp_path):
+    m = _harvest_one(tmp_path)
+    other = _manifest(vids=("v1", "v2"))
+    result = hpc.verify_store(str(tmp_path), other)
+    assert result["problem_counts"]["store_manifest_mismatch"] == 1
+    assert result["problems"]["run_manifest_mismatch"] == ["r1"]
+    assert not result["passed"]
+
+    store_path = tmp_path / "comment_store.json"
+    store = json.loads(store_path.read_text())
+    store["manifest_sha256"] = "0" * 64
+    store_path.write_text(json.dumps(store))
+    assert hpc.verify_store(str(tmp_path), m)["problem_counts"]["store_manifest_mismatch"] == 1
+
+
+def test_text_revert_a_b_a_restores_latest_version(tmp_path):
+    m = _manifest(vids=("v1",))
+    for run_id, text in (("r1", "A"), ("r2", "B"), ("r3", "A")):
+        f = ScriptedFetcher({("v1", None): _page([_thread("c1", "v1", text=text)])})
+        rec = hpc.run_harvest(m, f, str(tmp_path), SECRET, "Abdul", run_id=run_id)
+    assert rec["store_merge"]["text_reverts"] == 1 and rec["store_merge"]["new_text_versions"] == 0
+
+    c1 = json.loads((tmp_path / "comment_store.json").read_text())["comments"]["c1"]
+    assert [v["text"] for v in c1["text_versions"]] == ["A", "B"]  # one version per distinct hash
+    assert [v["is_latest_version"] for v in c1["text_versions"]] == [True, False]
+    assert c1["latest_text_hash"] == hpc.sha256_bytes(b"A")
+    assert c1["text_versions"][0]["last_observed_run_id"] == "r3"
+    assert hpc.verify_store(str(tmp_path), m)["passed"]
+
+
+def test_verify_detects_stale_latest_text_flag(tmp_path):
+    m = _manifest(vids=("v1",))
+    for run_id, text in (("r1", "A"), ("r2", "B")):
+        f = ScriptedFetcher({("v1", None): _page([_thread("c1", "v1", text=text)])})
+        hpc.run_harvest(m, f, str(tmp_path), SECRET, "Abdul", run_id=run_id)
+    store_path = tmp_path / "comment_store.json"
+    store = json.loads(store_path.read_text())
+    versions = store["comments"]["c1"]["text_versions"]
+    versions[0]["is_latest_version"], versions[1]["is_latest_version"] = True, False  # the pre-fix A->B->A state
+    store_path.write_text(json.dumps(store))
+    result = hpc.verify_store(str(tmp_path), m)
+    assert result["problems"]["latest_text_not_last_observed"] == ["c1"]
+    assert not result["passed"]
