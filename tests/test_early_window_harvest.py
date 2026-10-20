@@ -353,3 +353,13 @@ def test_cli_estimate_and_manifest(tmp_path, capsys):
                      "--window-hours", "72", "--max-requests-per-video", "5", "--output", str(out_path)]) == 0
     m = json.loads(out_path.read_text())
     assert m["scope"]["mode"] == hpc.SCOPE_EARLY_WINDOW and m["cost_estimate"]["planned_max_requests"] == 4
+
+
+def test_event_id_for_legacy_report_and_conflict():
+    legacy = _report([_candidate("a")], event_id=None)
+    m = hpc.build_early_window_manifest(legacy, "r", "h", "wc-early", 72, 5, event_id="WC_2022_FINAL")
+    assert m["event_id"] == "WC_2022_FINAL" and m["event_id_source"] == "MANIFEST_ARGUMENT"
+    m2 = hpc.build_early_window_manifest(_report([_candidate("a")]), "r", "h", "x", 72, 5)
+    assert m2["event_id"] == "TRANSFER_AL_NASSR_2023" and m2["event_id_source"] == "DISCOVERY_REPORT"
+    with pytest.raises(ValueError, match="conflicts"):
+        hpc.build_early_window_manifest(_report([_candidate("a")]), "r", "h", "x", 72, 5, event_id="WC_2022_FINAL")

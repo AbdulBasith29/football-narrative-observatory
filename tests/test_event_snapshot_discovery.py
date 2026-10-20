@@ -6,7 +6,7 @@ Validates:
    2023 Ballon d'Or events; unknown events fail closed.
 2. Legacy behaviour (no event) keeps the WC_2022_FINAL terms and calendar-day window.
 3. Report metadata records event_id, occurred_at and how the window was derived (mock mode, offline).
-4. Discovery cost upper bounds use official per-endpoint rates.
+4. Discovery cost upper bounds use official per-endpoint rates and separate quota buckets.
 5. The snapshot configuration parses, references configured events, and leaves collection
    parameters unset until reviewed.
 6. The CLI refuses to overwrite an existing report before any API call, and --estimate-only makes none.
@@ -111,25 +111,32 @@ def test_live_discovery_passes_event_terms_and_window():
 def test_estimate_discovery_cost():
     search = dpc.estimate_discovery_cost(7, 2, "search")
     assert search["requests_upper_bound"] == {"channels.list": 1, "search.list": 14, "videos.list": 14}
-    assert search["quota_units_upper_bound"] == 1 + 1400 + 14
+    assert search["quota_by_bucket_upper_bound"] == {"default": 15, "search.list": 14}
+    assert search["share_of_default_daily_quota"]["search.list"] == pytest.approx(0.14)
     uploads = dpc.estimate_discovery_cost(7, 2, "uploads_playlist")
-    assert uploads["quota_units_upper_bound"] == 1 + 14 + 14
+    assert uploads["quota_by_bucket_upper_bound"] == {"default": 29, "search.list": 0}
 
 
 def test_snapshot_config_is_consistent(config):
     with open(SNAPSHOT_CONFIG, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     snaps = {s["snapshot_id"]: s for s in data["snapshots"]}
-    assert set(snaps) == {"WC_2022_FINAL_PILOT_V1", "AL_NASSR_2023_PILOT_V1", "BALLON_DOR_2023_PILOT_V1"}
+    assert set(snaps) == {"WC_2022_FINAL_PILOT_V1", "WC_2022_FINAL_EARLY_V1", "AL_NASSR_2023_PILOT_V1",
+                          "BALLON_DOR_2023_PILOT_V1"}
     configured = {ev["external_event_id"] for ev in config["events"]}
     for snap in snaps.values():
         assert snap["event_id"] in configured
-        assert snap["discovery"]["method"] == "search"
+        assert snap["discovery"]["method"] in ("search", "none")
+    wc_early = snaps["WC_2022_FINAL_EARLY_V1"]
+    assert wc_early["status"] == "PROPOSED" and wc_early["discovery"]["method"] == "none"
+    assert wc_early["discovery"]["report_output"] == snaps["WC_2022_FINAL_PILOT_V1"]["discovery"]["report_output"]
+    assert wc_early["collection"]["mode"] == "EARLY_WINDOW" and wc_early["collection"]["max_requests_per_video"] is None
+    assert wc_early["collection"]["manifest_version"] != snaps["WC_2022_FINAL_PILOT_V1"]["collection"]["manifest_version"]
     for sid in ("AL_NASSR_2023_PILOT_V1", "BALLON_DOR_2023_PILOT_V1"):
         coll = snaps[sid]["collection"]
         assert snaps[sid]["status"] == "PROPOSED" and coll["mode"] == "EARLY_WINDOW"
         assert coll["window_hours"] is None and coll["max_requests_per_video"] is None  # set only after review
-    outputs = [s["discovery"]["report_output"] for s in snaps.values()]
+    outputs = [s["discovery"]["report_output"] for s in snaps.values() if s["discovery"]["method"] != "none"]
     assert len(outputs) == len(set(outputs))
 
 
@@ -159,7 +166,8 @@ def test_cli_estimate_only_makes_no_api_calls(capsys):
          patch.object(dpc, "build_youtube_client", side_effect=AssertionError("no API client in estimate mode")):
         dpc.main()
     out = capsys.readouterr().out
-    assert "TRANSFER_AL_NASSR_2023" in out and "quota_units<=1415" in out
+    assert "TRANSFER_AL_NASSR_2023" in out
+    assert "search.list bucket: <= 14 calls of 100/day default" in out and "default bucket:     <= 15 units" in out
 
 
 def test_cli_refuses_overwrite_before_api_calls(tmp_path):
@@ -179,3 +187,11 @@ def test_replay_preserves_event_metadata(tmp_path):
     replayed = dpc.regenerate_from_saved_report(str(src))
     assert replayed["report_metadata"]["event_id"] == "BALLON_DOR_2023"
     assert "LATE_POST_EVENT" in replayed["report_metadata"]["window_derivation"]
+
+
+def test_reuse_snapshot_cannot_run_discovery():
+    class Args:
+        snapshot, snapshot_config, event_id, method, max_pages, output = (
+            "WC_2022_FINAL_EARLY_V1", SNAPSHOT_CONFIG, None, None, None, None)
+    with pytest.raises(ValueError, match="must not run discovery"):
+        dpc.apply_snapshot_defaults(Args())

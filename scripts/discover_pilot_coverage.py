@@ -55,13 +55,36 @@ except ImportError:
 # 1. Official YouTube Data API Quota Reference (Official Google Documentation)
 # =============================================================================
 
+# Source: https://developers.google.com/youtube/v3/determine_quota_cost (page last updated 2026-10-15,
+# checked 2026-10-20). search.list now has its own bucket: a default of 100 calls/day at 1 unit per call.
+# Every other method used here draws on the shared default bucket of 10,000 units/day. Invalid requests
+# still cost at least 1. A project's actual allocation can differ: check the Cloud console Quotas page.
 OFFICIAL_QUOTA_COSTS = {
     "channels.list": 1,
     "playlistItems.list": 1,
     "videos.list": 1,
-    "search.list": 100,
+    "search.list": 1,
     "commentThreads.list": 1,
 }
+SEARCH_BUCKET = "search.list"
+DEFAULT_BUCKET = "default"
+QUOTA_BUCKET_BY_ENDPOINT = {"search.list": SEARCH_BUCKET}
+DEFAULT_DAILY_QUOTA = {DEFAULT_BUCKET: 10000, SEARCH_BUCKET: 100}
+QUOTA_REFERENCE = {
+    "url": "https://developers.google.com/youtube/v3/determine_quota_cost",
+    "page_last_updated": "2026-10-15",
+    "checked_on": "2026-10-20",
+    "note": "Default allocations; the project's actual quota may differ (Cloud console > Quotas).",
+}
+
+
+def quota_by_bucket(requests_by_endpoint: Dict[str, int]) -> Dict[str, int]:
+    """Splits request counts into the separately limited quota buckets (units per bucket)."""
+    buckets = {DEFAULT_BUCKET: 0, SEARCH_BUCKET: 0}
+    for endpoint, count in requests_by_endpoint.items():
+        bucket = QUOTA_BUCKET_BY_ENDPOINT.get(endpoint, DEFAULT_BUCKET)
+        buckets[bucket] += count * OFFICIAL_QUOTA_COSTS.get(endpoint, 1)
+    return buckets
 
 # Broad/generic event terms that warrant relevance tier separation
 GENERIC_EVENT_TERMS = {"final"}
@@ -318,18 +341,21 @@ class DiscoveryTelemetry:
         return sum(self.requests_by_endpoint.values())
 
     def calculate_actual_quota_units(self) -> int:
-        total = 0
-        for ep, count in self.requests_by_endpoint.items():
-            cost = OFFICIAL_QUOTA_COSTS.get(ep, 1)
-            total += count * cost
-        return total
+        """Units drawn from the shared default bucket (search.list is counted separately)."""
+        return quota_by_bucket(self.requests_by_endpoint)[DEFAULT_BUCKET]
+
+    def calculate_search_calls(self) -> int:
+        return quota_by_bucket(self.requests_by_endpoint)[SEARCH_BUCKET]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "requests_by_endpoint": dict(self.requests_by_endpoint),
             "total_api_requests": self.total_requests(),
             "actual_quota_units_consumed": self.calculate_actual_quota_units(),
+            "search_list_calls_consumed": self.calculate_search_calls(),
+            "quota_by_bucket": quota_by_bucket(self.requests_by_endpoint),
             "official_quota_rates_used": OFFICIAL_QUOTA_COSTS,
+            "quota_reference": QUOTA_REFERENCE,
             "error_count": len(self.errors),
             "errors": self.errors,
         }
@@ -1313,9 +1339,9 @@ def resolve_event(config: Dict[str, Any], event_id: str) -> Dict[str, Any]:
     }
 
 
-def estimate_discovery_cost(n_channels: int, max_pages_per_channel: int, method: str) -> Dict[str, int]:
-    """Upper bound on discovery quota: identity check, every allowed page per channel, and hydration
-    of every possible candidate (50 results per page, 50 IDs per videos.list call)."""
+def estimate_discovery_cost(n_channels: int, max_pages_per_channel: int, method: str) -> Dict[str, Any]:
+    """Upper bound on discovery quota per bucket: identity check, every allowed page per channel, and
+    hydration of every possible candidate (50 results per page, 50 IDs per videos.list call)."""
     page_endpoint = "search.list" if method == "search" else "playlistItems.list"
     pages = n_channels * max_pages_per_channel
     requests = {
@@ -1323,9 +1349,12 @@ def estimate_discovery_cost(n_channels: int, max_pages_per_channel: int, method:
         page_endpoint: pages,
         "videos.list": pages,
     }
+    buckets = quota_by_bucket(requests)
     return {
         "requests_upper_bound": requests,
-        "quota_units_upper_bound": sum(OFFICIAL_QUOTA_COSTS[ep] * n for ep, n in requests.items()),
+        "quota_by_bucket_upper_bound": buckets,
+        "share_of_default_daily_quota": {b: buckets[b] / DEFAULT_DAILY_QUOTA[b] for b in buckets},
+        "quota_reference": QUOTA_REFERENCE,
     }
 
 
@@ -1969,7 +1998,9 @@ def format_report_summary_markdown(report: Dict[str, Any]) -> str:
     telem = report.get("telemetry", {})
     lines.append("### API & Quota Telemetry (Actual Executed Requests)")
     lines.append(f"- **Total API Requests**: {telem.get('total_api_requests', 0)}")
-    lines.append(f"- **Actual Quota Units Consumed**: {telem.get('actual_quota_units_consumed', 0)}")
+    lines.append(f"- **Actual Quota Units Consumed (default bucket)**: {telem.get('actual_quota_units_consumed', 0)}")
+    if "search_list_calls_consumed" in telem:
+        lines.append(f"- **search.list Calls (separate bucket)**: {telem['search_list_calls_consumed']}")
     lines.append(f"- **Calls Breakdown**: {telem.get('requests_by_endpoint', {})}")
     if telem.get("error_count", 0) > 0:
         lines.append(f"- **Errors Encountered**: {telem.get('error_count')} (inspect report JSON for details)")
@@ -2078,7 +2109,8 @@ def parse_args():
         "--method",
         choices=["uploads_playlist", "search"],
         default=None,
-        help="Discovery method: 'search' (date-bounded; 100 quota units/call) or 'uploads_playlist' (1 quota unit/call)"
+        help="Discovery method: 'search' (date-bounded; 1 call from the separate search.list bucket, default 100/day) "
+             "or 'uploads_playlist' (1 unit/call from the default bucket)"
     )
     parser.add_argument(
         "--event-id",
@@ -2151,6 +2183,9 @@ def apply_snapshot_defaults(args) -> None:
     if args.snapshot:
         snap = load_snapshot(args.snapshot_config, args.snapshot)
         disc = snap.get("discovery", {})
+        if disc.get("method") not in ("search", "uploads_playlist"):
+            raise ValueError(f"Snapshot {args.snapshot} has discovery method {disc.get('method')!r}; it reuses an "
+                             "existing report and must not run discovery")
         if args.event_id and args.event_id != snap.get("event_id"):
             raise ValueError(f"--event-id {args.event_id} conflicts with snapshot event {snap.get('event_id')}")
         args.event_id = snap.get("event_id")
@@ -2190,7 +2225,12 @@ def main():
         print(f"window={w_start} -> {w_end} ({derivation})")
         print(f"event_terms={resolved['event_terms']} baseline_terms={resolved['baseline_terms']}")
         print(f"channels={len(config['channels'])} method={args.method} max_pages_per_channel={args.max_pages}")
-        print(f"discovery upper bound: requests={cost['requests_upper_bound']} quota_units<={cost['quota_units_upper_bound']}")
+        b = cost["quota_by_bucket_upper_bound"]
+        print(f"discovery upper bound: requests={cost['requests_upper_bound']}")
+        print(f"  search.list bucket: <= {b[SEARCH_BUCKET]} calls of {DEFAULT_DAILY_QUOTA[SEARCH_BUCKET]}/day default")
+        print(f"  default bucket:     <= {b[DEFAULT_BUCKET]} units of {DEFAULT_DAILY_QUOTA[DEFAULT_BUCKET]}/day default")
+        print(f"  rates: {QUOTA_REFERENCE['url']} (last updated {QUOTA_REFERENCE['page_last_updated']}); "
+              "confirm the project's allocation in the Cloud console")
         print(f"report would be written to: {args.output}")
         return
 

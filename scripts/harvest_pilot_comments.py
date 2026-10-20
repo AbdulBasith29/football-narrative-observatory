@@ -71,6 +71,9 @@ DEFAULT_MAX_COMMENTS_PER_VIDEO = 100
 TIMESTAMP_SKEW_TOLERANCE_SECONDS = 1
 API_MAX_RESULTS = 100  # commentThreads.list maxResults upper bound
 
+QUOTA_RATE_NOTE = ("commentThreads.list: 1 unit from the default 10,000/day bucket per the official quota calculator "
+                   "(last updated 2026-10-15); confirm the project's allocation in the Cloud console.")
+
 QUOTA_REASONS = {"quotaExceeded", "rateLimitExceeded", "userRateLimitExceeded", "dailyLimitExceeded"}
 
 # Per-video outcomes
@@ -213,7 +216,7 @@ def build_manifest(
             "max_total_requests": pages_per_video * len(videos),
             "quota_units_per_request": OFFICIAL_QUOTA_COSTS["commentThreads.list"],
             "max_quota_units": pages_per_video * len(videos) * OFFICIAL_QUOTA_COSTS["commentThreads.list"],
-            "quota_rate_note": "Verify commentThreads.list cost against current official docs/project allocation.",
+            "quota_rate_note": QUOTA_RATE_NOTE,
         },
         "videos": videos,
     }
@@ -283,6 +286,7 @@ def build_early_window_manifest(
     window_hours: int,
     max_requests_per_video: int,
     relevance_tier: str = "PLAYER_MATCH",
+    event_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Builds an EARLY_WINDOW manifest: for each video, top-level comments published within
     window_hours of that video's own publication timestamp, under an explicit request budget."""
@@ -291,6 +295,9 @@ def build_early_window_manifest(
         raise ValueError(f"Source report frame is {meta.get('pipeline_frame')!r}; pilot manifests require PIPELINE_PILOT")
     if meta.get("execution_mode") != "LIVE_YOUTUBE_API":
         raise ValueError(f"Source report execution_mode is {meta.get('execution_mode')!r}; never build from synthetic data")
+    report_event = meta.get("event_id")
+    if event_id and report_event and event_id != report_event:
+        raise ValueError(f"event_id {event_id!r} conflicts with the report's event_id {report_event!r}")
     if not isinstance(window_hours, int) or not 1 <= window_hours <= 24 * 365:
         raise ValueError("window_hours must be a positive integer number of hours")
     if not isinstance(max_requests_per_video, int) or not 1 <= max_requests_per_video <= 10000:
@@ -315,7 +322,8 @@ def build_early_window_manifest(
         "schema_version": MANIFEST_SCHEMA_VERSION_V2,
         "manifest_version": manifest_version,
         "frame_purpose": "PIPELINE_PILOT",
-        "event_id": meta.get("event_id"),
+        "event_id": report_event or event_id,
+        "event_id_source": "DISCOVERY_REPORT" if report_event else ("MANIFEST_ARGUMENT" if event_id else None),
         "created_at": utc_now_iso(),
         "source_report": {
             "path": source_report_path.replace("\\", "/"),
@@ -347,7 +355,7 @@ def build_early_window_manifest(
             "max_total_requests": max_requests_per_video * len(videos),
             "quota_units_per_request": OFFICIAL_QUOTA_COSTS["commentThreads.list"],
             "max_quota_units": max_requests_per_video * len(videos) * OFFICIAL_QUOTA_COSTS["commentThreads.list"],
-            "quota_rate_note": "Verify commentThreads.list cost against current official docs/project allocation.",
+            "quota_rate_note": QUOTA_RATE_NOTE,
         },
         "cost_estimate": estimate_early_window_cost(videos, max_requests_per_video),
         "videos": videos,
@@ -1272,6 +1280,8 @@ def parse_args(argv: Optional[List[str]] = None):
                    help="newest mode only")
     m.add_argument("--window-hours", type=int, default=None, help="early-window mode: hours after each video's upload")
     m.add_argument("--max-requests-per-video", type=int, default=None, help="early-window mode: request cap per video")
+    m.add_argument("--event-id", default=None,
+                   help="early-window mode: record the event for legacy reports without event_id (must match if present)")
     m.add_argument("--output", required=True, help="Manifest JSON output path (refuses to overwrite)")
 
     e = sub.add_parser("estimate", help="Offline early-window cost estimate from a discovery report (no API calls)")
@@ -1341,7 +1351,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print("early-window mode needs --window-hours and --max-requests-per-video", file=sys.stderr)
                 return 1
             manifest = build_early_window_manifest(report, args.report, sha256_bytes(report_bytes),
-                                                   args.manifest_version, args.window_hours, args.max_requests_per_video)
+                                                   args.manifest_version, args.window_hours, args.max_requests_per_video,
+                                                   event_id=args.event_id)
         else:
             manifest = build_manifest(report, args.report, sha256_bytes(report_bytes),
                                       args.manifest_version, args.max_comments_per_video)

@@ -35,9 +35,12 @@ python scripts/discover_pilot_coverage.py --snapshot AL_NASSR_2023_PILOT_V1 --es
 python scripts/discover_pilot_coverage.py --snapshot BALLON_DOR_2023_PILOT_V1 --estimate-only
 ```
 
-Each prints the resolved event, window, terms and an upper bound: 1 `channels.list`, 14 `search.list`
-(100 units each) and 14 `videos.list` = **at most 1,415 quota units per event**. Search is used
-because the uploads-playlist walk would need thousands of pages to reach 2023.
+Each prints the resolved event, window, terms and an upper bound per quota bucket. Per the official
+quota calculator (last updated 2026-10-15), `search.list` has its own bucket (default 100 calls/day, 1
+per call), and everything else shares the default 10,000 units/day. Per event: **at most 14
+`search.list` calls** plus **at most 15 default-bucket units** (1 `channels.list` + 14 `videos.list`).
+Confirm the project's actual allocation in the Cloud console Quotas page. Search is used because the
+uploads-playlist walk would need thousands of pages to reach 2023.
 
 ## 2. Discovery (live, after the plan is approved)
 
@@ -133,3 +136,7 @@ expire; an expired token shows up as an `INCOMPLETE_ERROR` for that video.
 - Read the audit sample for each video: relevance, language, spam and abuse.
 - Compare the player mix and channel mix with the discovery report.
 - Record quota actually used (from `run.json`) against the estimate.
+
+## Proposal: early-window collection for the existing World Cup videos
+
+See `docs/proposals/wc-2022-early-window.md` (status: PROPOSED, not run).
