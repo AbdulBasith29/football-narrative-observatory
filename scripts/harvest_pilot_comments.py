@@ -56,7 +56,10 @@ except ImportError:
 # Must match scripts/ingestion_snowflake.py so local hashes join to CORE.DIM_AUTHOR later.
 SALT_VERSION_ID = "v1.0"
 
-MANIFEST_SCHEMA_VERSION = "pilot-comment-manifest/1"
+MANIFEST_SCHEMA_VERSION = "pilot-comment-manifest/1"      # NEWEST_N scope (pilot-comments-v1)
+MANIFEST_SCHEMA_VERSION_V2 = "pilot-comment-manifest/2"   # carries an explicit scope mode
+SCOPE_NEWEST_N = "NEWEST_N"
+SCOPE_EARLY_WINDOW = "EARLY_WINDOW"
 RUN_SCHEMA_VERSION = "pilot-comment-run/1"
 STORE_SCHEMA_VERSION = "pilot-comment-store/1"
 
@@ -86,6 +89,19 @@ PAGINATION_EXHAUSTED = "EXHAUSTED"
 PAGINATION_MORE_AVAILABLE = "MORE_AVAILABLE_CAP_REACHED"
 PAGINATION_REQUEST_CAP = "MORE_AVAILABLE_REQUEST_CAP_REACHED"
 PAGINATION_UNKNOWN = "UNKNOWN"
+
+# Early-window coverage: whether the window's comment count is complete or budget-truncated.
+# Only COMPLETE_* statuses may be read as the full set of surviving top-level comments in the window.
+COVERAGE_COMPLETE_ALL_PAGES = "COMPLETE_ALL_PAGES"
+COVERAGE_COMPLETE_WINDOW_PASSED = "COMPLETE_WINDOW_PASSED"
+COVERAGE_TRUNCATED_BEFORE_WINDOW = "BUDGET_TRUNCATED_BEFORE_WINDOW"
+COVERAGE_TRUNCATED_WITHIN_WINDOW = "BUDGET_TRUNCATED_WITHIN_WINDOW"
+COVERAGE_INCOMPLETE_ERROR = "INCOMPLETE_ERROR"
+COVERAGE_UNAVAILABLE = "UNAVAILABLE"
+COVERAGE_NOT_ATTEMPTED = "NOT_ATTEMPTED"
+COMPLETE_COVERAGE = {COVERAGE_COMPLETE_ALL_PAGES, COVERAGE_COMPLETE_WINDOW_PASSED}
+RESUMABLE_COVERAGE = {COVERAGE_TRUNCATED_BEFORE_WINDOW, COVERAGE_TRUNCATED_WITHIN_WINDOW}
+OUTCOME_SKIPPED_COMPLETE = "SKIPPED_COMPLETE_IN_PRIOR_RUN"
 
 Fetcher = Callable[[Dict[str, Any]], Tuple[Optional[int], bytes]]
 
@@ -205,9 +221,152 @@ def build_manifest(
     return body
 
 
+def _select_eligible(report: Dict[str, Any], relevance_tier: str) -> List[Dict[str, Any]]:
+    seen = set()
+    selected = []
+    for cand in report.get("evaluated_candidates", []):
+        if cand.get("status") != "ELIGIBLE" or cand.get("relevance_tier") != relevance_tier:
+            continue
+        vid = cand.get("video_id")
+        if not vid or vid in seen:
+            continue
+        seen.add(vid)
+        selected.append(cand)
+    return sorted(selected, key=lambda c: c["video_id"])
+
+
+def _parse_count(value: Any) -> Optional[int]:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def estimate_early_window_cost(videos: List[Dict[str, Any]], max_requests_per_video: int) -> Dict[str, Any]:
+    """Estimates commentThreads.list requests for early-window retrieval from discovery-time counts.
+
+    commentThreads.list returns newest first, so reaching a video's earliest comments means paging
+    through every newer one: full retrieval costs about ceil(top-level comments / 100) requests.
+    commentCount includes replies, so ceil(commentCount / 100) is an upper bound. Videos without a
+    count (hidden or disabled) are assumed to use the full cap.
+    """
+    per_video = []
+    for v in videos:
+        count = _parse_count(v.get("comment_count_at_discovery"))
+        full = max(1, -(-count // API_MAX_RESULTS)) if count is not None else None
+        planned = min(full, max_requests_per_video) if full is not None else max_requests_per_video
+        per_video.append({
+            "video_id": v["video_id"],
+            "comment_count_at_discovery": count,
+            "requests_for_full_retrieval_upper_bound": full,
+            "planned_max_requests": planned,
+            "expected_budget_truncation": full is None or full > max_requests_per_video,
+        })
+    known = [p for p in per_video if p["requests_for_full_retrieval_upper_bound"] is not None]
+    return {
+        "max_requests_per_video": max_requests_per_video,
+        "planned_max_requests": sum(p["planned_max_requests"] for p in per_video),
+        "full_retrieval_requests_upper_bound_known_counts": sum(p["requests_for_full_retrieval_upper_bound"] for p in known),
+        "videos_with_unknown_comment_count": len(per_video) - len(known),
+        "videos_expected_budget_truncated": sum(1 for p in per_video if p["expected_budget_truncation"]),
+        "quota_units_per_request": OFFICIAL_QUOTA_COSTS["commentThreads.list"],
+        "basis": "statistics.commentCount at discovery time (includes replies; upper bound on top-level pages)",
+        "per_video": per_video,
+    }
+
+
+def build_early_window_manifest(
+    report: Dict[str, Any],
+    source_report_path: str,
+    source_report_sha256: str,
+    manifest_version: str,
+    window_hours: int,
+    max_requests_per_video: int,
+    relevance_tier: str = "PLAYER_MATCH",
+) -> Dict[str, Any]:
+    """Builds an EARLY_WINDOW manifest: for each video, top-level comments published within
+    window_hours of that video's own publication timestamp, under an explicit request budget."""
+    meta = report.get("report_metadata", {})
+    if meta.get("pipeline_frame") != "PIPELINE_PILOT":
+        raise ValueError(f"Source report frame is {meta.get('pipeline_frame')!r}; pilot manifests require PIPELINE_PILOT")
+    if meta.get("execution_mode") != "LIVE_YOUTUBE_API":
+        raise ValueError(f"Source report execution_mode is {meta.get('execution_mode')!r}; never build from synthetic data")
+    if not isinstance(window_hours, int) or not 1 <= window_hours <= 24 * 365:
+        raise ValueError("window_hours must be a positive integer number of hours")
+    if not isinstance(max_requests_per_video, int) or not 1 <= max_requests_per_video <= 10000:
+        raise ValueError("max_requests_per_video must be between 1 and 10000")
+
+    videos = []
+    for cand in _select_eligible(report, relevance_tier):
+        if parse_api_timestamp(cand.get("published_at")) is None:
+            raise ValueError(f"Video {cand['video_id']} has no parseable published_at; the window cannot be anchored")
+        videos.append({
+            "video_id": cand["video_id"],
+            "channel_id": cand.get("channel_id"),
+            "channel_title": cand.get("channel_title"),
+            "title": cand.get("title"),
+            "video_published_at": cand.get("published_at"),
+            "player_category": cand.get("player_category") or cand.get("player_relevance") or "UNKNOWN",
+            "relevance_tier": cand.get("relevance_tier"),
+            "comment_count_at_discovery": _parse_count(cand.get("comment_count")),
+        })
+
+    body = {
+        "schema_version": MANIFEST_SCHEMA_VERSION_V2,
+        "manifest_version": manifest_version,
+        "frame_purpose": "PIPELINE_PILOT",
+        "event_id": meta.get("event_id"),
+        "created_at": utc_now_iso(),
+        "source_report": {
+            "path": source_report_path.replace("\\", "/"),
+            "sha256": source_report_sha256,
+            "report_generated_at": meta.get("report_generated_at"),
+            "window_start": meta.get("window_start"),
+            "window_end": meta.get("window_end"),
+        },
+        "selection_rule": {"status": "ELIGIBLE", "relevance_tier": relevance_tier},
+        "scope": {
+            "mode": SCOPE_EARLY_WINDOW,
+            "endpoint": "commentThreads.list",
+            "part": "snippet",
+            "comment_level": "TOP_LEVEL_ONLY",
+            "order": "time",
+            "text_format": "plainText",
+            "window_anchor": "VIDEO_PUBLISHED_AT",
+            "window_hours": window_hours,
+            "max_requests_per_video": max_requests_per_video,
+            "interpretation": (
+                "Top-level comments still retrievable at harvest time that were published within "
+                f"{window_hours}h of each video's publication. Counts are complete only for videos whose "
+                "coverage is COMPLETE_*; budget-truncated videos are partial and are not total discussion volume."
+            ),
+        },
+        "budget": {
+            "videos": len(videos),
+            "max_requests_per_video": max_requests_per_video,
+            "max_total_requests": max_requests_per_video * len(videos),
+            "quota_units_per_request": OFFICIAL_QUOTA_COSTS["commentThreads.list"],
+            "max_quota_units": max_requests_per_video * len(videos) * OFFICIAL_QUOTA_COSTS["commentThreads.list"],
+            "quota_rate_note": "Verify commentThreads.list cost against current official docs/project allocation.",
+        },
+        "cost_estimate": estimate_early_window_cost(videos, max_requests_per_video),
+        "videos": videos,
+    }
+    body["manifest_sha256"] = canonical_json_hash(body)
+    return body
+
+
+def manifest_scope_mode(manifest: Dict[str, Any]) -> str:
+    return manifest.get("scope", {}).get("mode", SCOPE_NEWEST_N)
+
+
 def verify_manifest_integrity(manifest: Dict[str, Any]) -> None:
-    if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+    if manifest.get("schema_version") not in (MANIFEST_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION_V2):
         raise ValueError(f"Unsupported manifest schema_version {manifest.get('schema_version')!r}")
+    mode = manifest_scope_mode(manifest)
+    if (manifest["schema_version"] == MANIFEST_SCHEMA_VERSION) != (mode == SCOPE_NEWEST_N) or \
+            mode not in (SCOPE_NEWEST_N, SCOPE_EARLY_WINDOW):
+        raise ValueError(f"Manifest schema_version and scope mode {mode!r} do not match")
     if manifest.get("frame_purpose") != "PIPELINE_PILOT":
         raise ValueError("Manifest frame_purpose must be PIPELINE_PILOT")
     recorded = manifest.get("manifest_sha256")
@@ -216,7 +375,12 @@ def verify_manifest_integrity(manifest: Dict[str, Any]) -> None:
         raise ValueError("Manifest content hash mismatch: the manifest was edited after generation. Rebuild it.")
     budget = manifest.get("budget", {})
     per_video = budget.get("max_requests_per_video")
-    expected_per_video = -(-manifest["scope"]["max_comments_per_video"] // API_MAX_RESULTS)
+    if mode == SCOPE_EARLY_WINDOW:
+        expected_per_video = manifest["scope"].get("max_requests_per_video")
+        if not isinstance(manifest["scope"].get("window_hours"), int) or manifest["scope"]["window_hours"] < 1:
+            raise ValueError("Early-window manifest needs a positive integer window_hours")
+    else:
+        expected_per_video = -(-manifest["scope"]["max_comments_per_video"] // API_MAX_RESULTS)
     if (not isinstance(per_video, int) or per_video < 1 or per_video != expected_per_video
             or budget.get("max_total_requests") != per_video * len(manifest.get("videos", []))):
         raise ValueError("Manifest request budget is inconsistent with its scope and video count.")
@@ -319,6 +483,58 @@ def _write_json(path: str, obj: Any) -> None:
     os.replace(tmp, path)
 
 
+def request_page(
+    fetcher: Fetcher,
+    params: Dict[str, Any],
+    run_dir: str,
+    run_id: str,
+    video_id: str,
+    page_number: int,
+    pages_succeeded: int,
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[str], Optional[str]]:
+    """Issues one commentThreads.list request, writing the verbatim body and a metadata sidecar before
+    parsing. Returns (page_record, payload, error_outcome, error_code); payload is None on error."""
+    requested_at = utc_now_iso()
+    status, body = fetcher(params)
+    retrieved_at = utc_now_iso()
+
+    raw_rel = f"raw/{video_id}/page_{page_number:03d}.json"
+    meta_path = os.path.join(run_dir, f"raw/{video_id}/page_{page_number:03d}.meta.json")
+    _write_bytes(os.path.join(run_dir, raw_rel), body)
+    page_record = {
+        "run_id": run_id,
+        "video_id": video_id,
+        "page_number": page_number,
+        "endpoint": "commentThreads.list",
+        "request_parameters": params,
+        "requested_at": requested_at,
+        "retrieved_at": retrieved_at,
+        "http_status": status,
+        "raw_file": raw_rel,
+        "payload_sha256": sha256_bytes(body),
+        "payload_bytes": len(body),
+    }
+
+    if status != 200:
+        outcome, error_code = classify_error_response(status, body, pages_succeeded)
+        page_record["error_code"] = error_code
+        page_record["error_reasons"] = extract_error_reasons(body)
+        _write_json(meta_path, page_record)
+        return page_record, None, outcome, error_code
+
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        page_record["error_code"] = "UNPARSEABLE_RESPONSE"
+        _write_json(meta_path, page_record)
+        return page_record, None, (OUTCOME_PARTIAL_ERROR if pages_succeeded else OUTCOME_ERROR), "UNPARSEABLE_RESPONSE"
+
+    page_record["item_count"] = len(payload.get("items", []) or [])
+    page_record["next_page_token_returned"] = payload.get("nextPageToken")
+    _write_json(meta_path, page_record)
+    return page_record, payload, None, None
+
+
 def harvest_video(
     video: Dict[str, Any],
     fetcher: Fetcher,
@@ -358,50 +574,16 @@ def harvest_video(
         if page_token:
             params["pageToken"] = page_token
 
-        requested_at = utc_now_iso()
-        status, body = fetcher(params)
-        retrieved_at = utc_now_iso()
-
-        raw_rel = f"raw/{video_id}/page_{page_number:03d}.json"
-        _write_bytes(os.path.join(run_dir, raw_rel), body)
-        page_record = {
-            "run_id": run_id,
-            "video_id": video_id,
-            "page_number": page_number,
-            "endpoint": "commentThreads.list",
-            "request_parameters": params,
-            "requested_at": requested_at,
-            "retrieved_at": retrieved_at,
-            "http_status": status,
-            "raw_file": raw_rel,
-            "payload_sha256": sha256_bytes(body),
-            "payload_bytes": len(body),
-        }
-
-        if status != 200:
-            outcome, error_code = classify_error_response(status, body, pages_succeeded)
-            page_record["error_code"] = error_code
-            page_record["error_reasons"] = extract_error_reasons(body)
-            _write_json(os.path.join(run_dir, f"raw/{video_id}/page_{page_number:03d}.meta.json"), page_record)
-            pages.append(page_record)
+        page_record, payload, err_outcome, err_code = request_page(
+            fetcher, params, run_dir, run_id, video_id, page_number, pages_succeeded)
+        pages.append(page_record)
+        if payload is None:
+            outcome, error_code = err_outcome, err_code
             break
-
-        try:
-            payload = json.loads(body.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            outcome = OUTCOME_PARTIAL_ERROR if pages_succeeded else OUTCOME_ERROR
-            error_code = "UNPARSEABLE_RESPONSE"
-            page_record["error_code"] = error_code
-            _write_json(os.path.join(run_dir, f"raw/{video_id}/page_{page_number:03d}.meta.json"), page_record)
-            pages.append(page_record)
-            break
-
+        raw_rel = page_record["raw_file"]
+        retrieved_at = page_record["retrieved_at"]
         items = payload.get("items", []) or []
         next_token = payload.get("nextPageToken")
-        page_record["item_count"] = len(items)
-        page_record["next_page_token_returned"] = next_token
-        _write_json(os.path.join(run_dir, f"raw/{video_id}/page_{page_number:03d}.meta.json"), page_record)
-        pages.append(page_record)
         pages_succeeded += 1
 
         for position, item in enumerate(items):
@@ -450,6 +632,162 @@ def harvest_video(
     return video_outcome, pages, observations
 
 
+def early_window_bounds(video: Dict[str, Any], window_hours: int) -> Tuple[datetime.datetime, datetime.datetime]:
+    start = parse_api_timestamp(video.get("video_published_at"))
+    if start is None:
+        raise ValueError(f"Video {video.get('video_id')} has no parseable video_published_at")
+    return start, start + datetime.timedelta(hours=window_hours)
+
+
+def _item_published_at(item: Dict[str, Any]) -> Optional[str]:
+    return item.get("snippet", {}).get("topLevelComment", {}).get("snippet", {}).get("publishedAt")
+
+
+def in_early_window(published_at: Optional[str], start: datetime.datetime, end: datetime.datetime) -> bool:
+    ts = parse_api_timestamp(published_at)
+    return ts is not None and start <= ts < end
+
+
+def harvest_video_early_window(
+    video: Dict[str, Any],
+    fetcher: Fetcher,
+    run_dir: str,
+    run_id: str,
+    hmac_secret: str,
+    window_hours: int,
+    max_requests: int,
+    resume: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Pages a video's top-level comments (newest first) until its early window is fully covered, the
+    pages run out, or the request budget is spent.
+
+    Every retrieved comment is kept and flagged in_early_window; raw pages are written before parsing,
+    and a checkpoint (next page token + frontier) is written after every successful page so a
+    budget-truncated video can be resumed. `resume` is a prior run's checkpoint for this video.
+    """
+    if max_requests < 1:
+        raise ValueError("max_requests must be at least 1")
+    video_id = video["video_id"]
+    window_start, window_end = early_window_bounds(video, window_hours)
+    checkpoint_path = os.path.join(run_dir, "checkpoints", f"{video_id}.json")
+
+    pages: List[Dict[str, Any]] = []
+    observations: List[Dict[str, Any]] = []
+    page_token = resume.get("next_page_token") if resume else None
+    frontier = parse_api_timestamp(resume.get("frontier_published_at")) if resume else None
+    pages_succeeded = 0
+    outcome: Optional[str] = None
+    error_code: Optional[str] = None
+    coverage: Optional[str] = None
+    next_token: Optional[str] = page_token
+
+    def write_checkpoint(status: str) -> Dict[str, Any]:
+        cp = {
+            "video_id": video_id,
+            "run_id": run_id,
+            "window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "pages_succeeded_this_run": pages_succeeded,
+            "last_page_number": len(pages),
+            "next_page_token": next_token,
+            "frontier_published_at": frontier.isoformat() if frontier else None,
+            "coverage_status": status,
+            "resumed_from_run_id": resume.get("run_id") if resume else None,
+            "updated_at": utc_now_iso(),
+        }
+        _write_json(checkpoint_path, cp)
+        return cp
+
+    while True:
+        page_number = len(pages) + 1
+        params: Dict[str, Any] = {"part": "snippet", "videoId": video_id, "maxResults": API_MAX_RESULTS,
+                                  "order": "time", "textFormat": "plainText"}
+        if page_token:
+            params["pageToken"] = page_token
+        page_record, payload, err_outcome, err_code = request_page(
+            fetcher, params, run_dir, run_id, video_id, page_number, pages_succeeded)
+        pages.append(page_record)
+        if payload is None:
+            outcome, error_code = err_outcome, err_code
+            break
+        pages_succeeded += 1
+        items = payload.get("items", []) or []
+        next_token = payload.get("nextPageToken")
+
+        # A first-page item older than the one after it is likely pinned; it must not move the frontier.
+        pinned_position = None
+        if page_number == 1 and not resume and len(items) >= 2:
+            first, second = (parse_api_timestamp(_item_published_at(items[i])) for i in (0, 1))
+            if first and second and first < second:
+                pinned_position = 0
+
+        for position, item in enumerate(items):
+            parsed = parse_comment_thread(item, hmac_secret)
+            parsed.update({
+                "manifest_video_id": video_id,
+                "run_id": run_id,
+                "raw_file": page_record["raw_file"],
+                "payload_sha256": page_record["payload_sha256"],
+                "page_number": page_number,
+                "source_item_position": position,
+                "observed_at": page_record["retrieved_at"],
+                "in_early_window": in_early_window(parsed["published_at"], window_start, window_end),
+                "likely_pinned": position == pinned_position,
+            })
+            observations.append(parsed)
+            ts = parse_api_timestamp(parsed["published_at"])
+            if ts is not None and position != pinned_position and (frontier is None or ts < frontier):
+                frontier = ts
+
+        if not next_token:
+            coverage = COVERAGE_COMPLETE_ALL_PAGES
+            break
+        if frontier is not None and frontier < window_start:
+            coverage = COVERAGE_COMPLETE_WINDOW_PASSED
+            break
+        if not items:
+            outcome, error_code = (OUTCOME_PARTIAL_ERROR if pages_succeeded > 1 else OUTCOME_ERROR), "EMPTY_PAGE_WITH_TOKEN"
+            break
+        write_checkpoint("IN_PROGRESS")
+        if len(pages) >= max_requests:
+            coverage = (COVERAGE_TRUNCATED_WITHIN_WINDOW if frontier is not None and frontier < window_end
+                        else COVERAGE_TRUNCATED_BEFORE_WINDOW)
+            break
+        page_token = next_token
+
+    if outcome in (OUTCOME_COMMENTS_DISABLED, OUTCOME_VIDEO_NOT_FOUND):
+        coverage = COVERAGE_UNAVAILABLE
+    elif outcome is not None:
+        coverage = COVERAGE_INCOMPLETE_ERROR
+    else:
+        outcome = OUTCOME_COLLECTED if observations or resume else OUTCOME_EMPTY
+    checkpoint = write_checkpoint(coverage)
+
+    in_window = sum(1 for o in observations if o["in_early_window"])
+    video_outcome = {
+        "video_id": video_id,
+        "outcome": outcome,
+        "error_code": error_code,
+        "coverage_status": coverage,
+        "window_count_is_complete": coverage in COMPLETE_COVERAGE,
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+        "frontier_published_at": checkpoint["frontier_published_at"],
+        "window_covered_from": (max(frontier, window_start).isoformat()
+                                if coverage == COVERAGE_TRUNCATED_WITHIN_WINDOW and frontier else None),
+        "next_page_token_saved": bool(checkpoint["next_page_token"]) and coverage in RESUMABLE_COVERAGE,
+        "resumed_from_run_id": checkpoint["resumed_from_run_id"],
+        "pages_requested": len(pages),
+        "pages_succeeded": pages_succeeded,
+        "comments_collected": len(observations),
+        "in_window_comments_observed": in_window,
+        "out_of_window_comments_observed": len(observations) - in_window,
+        "pagination_availability": PAGINATION_EXHAUSTED if coverage == COVERAGE_COMPLETE_ALL_PAGES else (
+            PAGINATION_REQUEST_CAP if coverage in RESUMABLE_COVERAGE else PAGINATION_UNKNOWN),
+    }
+    return video_outcome, pages, observations
+
+
 def merge_into_store(store: Dict[str, Any], observations: List[Dict[str, Any]], run_id: str) -> Dict[str, int]:
     """Merges parsed observations into the local store at warehouse-aligned grains.
 
@@ -480,6 +818,8 @@ def merge_into_store(store: Dict[str, Any], observations: List[Dict[str, Any]], 
                 "author_hash": obs["author_hash"],
                 "salt_version_id": obs["salt_version_id"],
                 "is_reply": False,
+                "in_early_window": obs.get("in_early_window"),
+                "likely_pinned": bool(obs.get("likely_pinned")),
                 "first_observed_at": obs["observed_at"],
                 "first_observed_run_id": run_id,
                 "text_versions": [],
@@ -559,9 +899,17 @@ def run_harvest(
     scope_accepted_by: str,
     run_id: Optional[str] = None,
     video_limit: Optional[int] = None,
+    resume_from_run: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Executes one bounded harvest run over the manifest. No Snowflake access."""
+    """Executes one bounded harvest run over the manifest. No Snowflake access.
+
+    For EARLY_WINDOW manifests, `resume_from_run` continues budget-truncated videos from that run's
+    saved page tokens and skips videos it already covered completely.
+    """
     verify_manifest_integrity(manifest)
+    mode = manifest_scope_mode(manifest)
+    if resume_from_run and mode != SCOPE_EARLY_WINDOW:
+        raise ValueError("--resume-from-run is only supported for EARLY_WINDOW manifests")
     if not hmac_secret:
         raise RuntimeError("HMAC_SECRET is required so author IDs are hashed before anything is parsed.")
     if not scope_accepted_by or not scope_accepted_by.strip():
@@ -582,7 +930,23 @@ def run_harvest(
         )
     store["manifest_sha256"] = manifest["manifest_sha256"]
 
-    max_comments = manifest["scope"]["max_comments_per_video"]
+    prior_checkpoints: Dict[str, Dict[str, Any]] = {}
+    if resume_from_run:
+        prior_dir = os.path.join(output_root, "runs", resume_from_run)
+        if resume_from_run not in [r.get("run_id") for r in store.get("runs", [])] or \
+                not os.path.exists(os.path.join(prior_dir, "run.json")):
+            raise ValueError(f"Cannot resume: run {resume_from_run!r} is not recorded in this output root")
+        with open(os.path.join(prior_dir, "run.json"), "r", encoding="utf-8") as f:
+            if json.load(f).get("manifest_sha256") != manifest["manifest_sha256"]:
+                raise ValueError("Cannot resume: the prior run used a different manifest")
+        cp_dir = os.path.join(prior_dir, "checkpoints")
+        for name in (os.listdir(cp_dir) if os.path.isdir(cp_dir) else []):
+            with open(os.path.join(cp_dir, name), "r", encoding="utf-8") as f:
+                cp = json.load(f)
+            prior_checkpoints[cp["video_id"]] = cp
+
+    max_comments = manifest["scope"].get("max_comments_per_video")
+    window_hours = manifest["scope"].get("window_hours")
     max_requests_per_video = manifest["budget"]["max_requests_per_video"]
     max_total_requests = manifest["budget"]["max_total_requests"]
     videos = manifest["videos"][:video_limit] if video_limit else manifest["videos"]
@@ -597,16 +961,38 @@ def run_harvest(
         remaining_requests = max_total_requests - len(all_pages)
         if remaining_requests < 1:
             budget_stop = True
-        if quota_stop or budget_stop:
+        prior = prior_checkpoints.get(video["video_id"])
+        if mode == SCOPE_EARLY_WINDOW and prior and prior.get("coverage_status") in COMPLETE_COVERAGE:
             video_outcomes.append({
+                "video_id": video["video_id"], "outcome": OUTCOME_SKIPPED_COMPLETE, "error_code": None,
+                "coverage_status": prior["coverage_status"], "window_count_is_complete": True,
+                "skipped_because_run_id": prior.get("run_id"), "pagination_availability": PAGINATION_UNKNOWN,
+                "pages_requested": 0, "pages_succeeded": 0, "comments_collected": 0,
+            })
+            continue
+        if quota_stop or budget_stop:
+            not_attempted = {
                 "video_id": video["video_id"], "outcome": OUTCOME_NOT_ATTEMPTED,
                 "error_code": "STOPPED_AFTER_QUOTA_LIMIT" if quota_stop else "RUN_REQUEST_BUDGET_EXHAUSTED",
                 "pagination_availability": PAGINATION_UNKNOWN,
                 "pages_requested": 0, "pages_succeeded": 0, "comments_collected": 0,
-            })
+            }
+            if mode == SCOPE_EARLY_WINDOW:
+                not_attempted.update({"coverage_status": COVERAGE_NOT_ATTEMPTED, "window_count_is_complete": False})
+            video_outcomes.append(not_attempted)
             continue
-        outcome, pages, obs = harvest_video(video, fetcher, run_dir, run_id, max_comments, hmac_secret,
-                                            min(max_requests_per_video, remaining_requests))
+        request_cap = min(max_requests_per_video, remaining_requests)
+        if mode == SCOPE_EARLY_WINDOW:
+            resumable = prior and prior.get("coverage_status") in RESUMABLE_COVERAGE and prior.get("next_page_token")
+            resume = prior if resumable else None
+            outcome, pages, obs = harvest_video_early_window(video, fetcher, run_dir, run_id, hmac_secret,
+                                                             window_hours, request_cap, resume)
+            store.setdefault("video_coverage", {})[video["video_id"]] = {
+                k: outcome[k] for k in ("coverage_status", "window_count_is_complete", "window_start", "window_end",
+                                        "frontier_published_at", "window_covered_from", "resumed_from_run_id")}
+            store["video_coverage"][video["video_id"]]["run_id"] = run_id
+        else:
+            outcome, pages, obs = harvest_video(video, fetcher, run_dir, run_id, max_comments, hmac_secret, request_cap)
         video_outcomes.append(outcome)
         all_pages.extend(pages)
         all_obs.extend(obs)
@@ -625,6 +1011,22 @@ def run_harvest(
         outcome_counts[vo["outcome"]] = outcome_counts.get(vo["outcome"], 0) + 1
 
     requests = len(all_pages)
+    coverage_counts: Dict[str, int] = {}
+    for vo in video_outcomes:
+        if "coverage_status" in vo:
+            coverage_counts[vo["coverage_status"]] = coverage_counts.get(vo["coverage_status"], 0) + 1
+    ok_outcomes = {OUTCOME_COLLECTED, OUTCOME_EMPTY, OUTCOME_COMMENTS_DISABLED, OUTCOME_VIDEO_NOT_FOUND,
+                   OUTCOME_SKIPPED_COMPLETE}
+    if quota_stop:
+        run_status = "STOPPED_QUOTA_LIMIT"
+    elif budget_stop:
+        run_status = "STOPPED_REQUEST_BUDGET"
+    elif not all(vo["outcome"] in ok_outcomes for vo in video_outcomes):
+        run_status = "COMPLETED_WITH_ERRORS"
+    elif any(vo.get("coverage_status") in RESUMABLE_COVERAGE for vo in video_outcomes):
+        run_status = "COMPLETED_BUDGET_TRUNCATED"
+    else:
+        run_status = "COMPLETED"
     run_record = {
         "schema_version": RUN_SCHEMA_VERSION,
         "run_id": run_id,
@@ -636,10 +1038,9 @@ def run_harvest(
         "scope_accepted_by": scope_accepted_by.strip(),
         "started_at": started_at,
         "completed_at": utc_now_iso(),
-        "run_status": "STOPPED_QUOTA_LIMIT" if quota_stop else "STOPPED_REQUEST_BUDGET" if budget_stop else (
-            "COMPLETED" if all(vo["outcome"] in (OUTCOME_COLLECTED, OUTCOME_EMPTY, OUTCOME_COMMENTS_DISABLED,
-                                                 OUTCOME_VIDEO_NOT_FOUND) for vo in video_outcomes)
-            else "COMPLETED_WITH_ERRORS"),
+        "scope_mode": mode,
+        "resumed_from_run_id": resume_from_run,
+        "run_status": run_status,
         "videos_in_manifest": len(manifest["videos"]),
         "videos_in_run": len(videos),
         "telemetry": {
@@ -650,7 +1051,10 @@ def run_harvest(
             "budget_max_requests_per_video": max_requests_per_video,
         },
         "outcome_counts": outcome_counts,
+        "coverage_counts": coverage_counts,
         "comments_observed": len(all_obs),
+        "in_window_comments_observed": (sum(1 for o in all_obs if o.get("in_early_window"))
+                                        if mode == SCOPE_EARLY_WINDOW else None),
         "store_merge": merge_stats,
         "video_outcomes": video_outcomes,
         "pages": all_pages,
@@ -701,6 +1105,10 @@ def verify_store(output_root: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
         "run_manifest_mismatch": [],
         "run_not_in_store": [],
         "observation_run_not_in_store": [],
+        "window_flag_mismatch": [],
+        "coverage_video_not_in_manifest": [],
+        "coverage_checkpoint_missing": [],
+        "coverage_checkpoint_mismatch": [],
     }
     if store.get("manifest_sha256") != manifest.get("manifest_sha256"):
         problems["store_manifest_mismatch"].append(
@@ -790,6 +1198,29 @@ def verify_store(output_root: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
                                       or items[pos].get("id")) != cid):
                 problems["lineage_item_not_found"].append([cid, so["raw_file"], pos])
 
+    if manifest_scope_mode(manifest) == SCOPE_EARLY_WINDOW:
+        hours = manifest["scope"]["window_hours"]
+        bounds = {v["video_id"]: early_window_bounds(v, hours) for v in manifest["videos"]}
+        for cid, c in store.get("comments", {}).items():
+            b = bounds.get(c.get("manifest_video_id"))
+            if b is not None and c.get("in_early_window") != in_early_window(c.get("published_at"), *b):
+                problems["window_flag_mismatch"].append(cid)
+        for vid, cov in store.get("video_coverage", {}).items():
+            if vid not in bounds:
+                problems["coverage_video_not_in_manifest"].append(vid)
+                continue
+            cp_path = os.path.join(output_root, "runs", cov.get("run_id", ""), "checkpoints", f"{vid}.json")
+            if not os.path.exists(cp_path):
+                problems["coverage_checkpoint_missing"].append(vid)
+                continue
+            with open(cp_path, "r", encoding="utf-8") as f:
+                cp = json.load(f)
+            status = cov.get("coverage_status")
+            if (cp.get("coverage_status") != status
+                    or cov.get("window_count_is_complete") != (status in COMPLETE_COVERAGE)
+                    or (status in RESUMABLE_COVERAGE and not cp.get("next_page_token"))):
+                problems["coverage_checkpoint_mismatch"].append(vid)
+
     total_problems = sum(len(v) for v in problems.values()) + duplicate_sample_observations
     return {
         "comments": len(store.get("comments", {})),
@@ -835,8 +1266,18 @@ def parse_args(argv: Optional[List[str]] = None):
     m = sub.add_parser("manifest", help="Build a versioned collection manifest from a verified discovery report")
     m.add_argument("--report", required=True, help="Verified discovery report JSON")
     m.add_argument("--manifest-version", required=True, help="Version label, e.g. pilot-comments-v1")
-    m.add_argument("--max-comments-per-video", type=int, default=DEFAULT_MAX_COMMENTS_PER_VIDEO)
+    m.add_argument("--mode", choices=["newest", "early-window"], default="newest",
+                   help="newest: newest N comments per video; early-window: comments within --window-hours of upload")
+    m.add_argument("--max-comments-per-video", type=int, default=DEFAULT_MAX_COMMENTS_PER_VIDEO,
+                   help="newest mode only")
+    m.add_argument("--window-hours", type=int, default=None, help="early-window mode: hours after each video's upload")
+    m.add_argument("--max-requests-per-video", type=int, default=None, help="early-window mode: request cap per video")
     m.add_argument("--output", required=True, help="Manifest JSON output path (refuses to overwrite)")
+
+    e = sub.add_parser("estimate", help="Offline early-window cost estimate from a discovery report (no API calls)")
+    e.add_argument("--report", required=True)
+    e.add_argument("--max-requests-per-video", type=int, nargs="+", required=True,
+                   help="One or more candidate caps to compare, e.g. 5 10 20 50")
 
     h = sub.add_parser("harvest", help="Run a bounded harvest (live YouTube API; local output only)")
     h.add_argument("--manifest", required=True)
@@ -844,11 +1285,21 @@ def parse_args(argv: Optional[List[str]] = None):
     h.add_argument("--scope-accepted-by", required=True, help="Name of the person who accepted the manifest scope")
     h.add_argument("--video-limit", type=int, default=None, help="Harvest only the first N manifest videos (smoke test)")
     h.add_argument("--api-key", default=None, help="Override YOUTUBE_API_KEY")
+    h.add_argument("--resume-from-run", default=None,
+                   help="early-window only: continue budget-truncated videos from this run's saved page tokens")
 
     v = sub.add_parser("verify", help="Offline timestamp/duplicate/lineage checks on a harvest output root")
     v.add_argument("--manifest", required=True)
     v.add_argument("--output-root", required=True)
     return parser.parse_args(argv)
+
+
+def _count_by(items: List[Dict[str, Any]], key: Callable[[Dict[str, Any]], Any]) -> Dict[Any, int]:
+    counts: Dict[Any, int] = {}
+    for item in items:
+        k = key(item)
+        counts[k] = counts.get(k, 0) + 1
+    return counts
 
 
 def _load_json(path: str) -> Dict[str, Any]:
@@ -861,20 +1312,48 @@ def main(argv: Optional[List[str]] = None) -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     args = parse_args(argv)
 
+    if args.command == "estimate":
+        report = _load_json(args.report)
+        meta = report.get("report_metadata", {})
+        cands = _select_eligible(report, "PLAYER_MATCH")
+        videos = [{"video_id": c["video_id"], "comment_count_at_discovery": c.get("comment_count")} for c in cands]
+        players = _count_by(cands, lambda c: c.get("player_category") or c.get("player_relevance") or "UNKNOWN")
+        channels = _count_by(cands, lambda c: c.get("channel_title") or "UNKNOWN")
+        print(f"event_id={meta.get('event_id')} eligible PLAYER_MATCH videos={len(videos)}")
+        print(f"players={dict(sorted(players.items()))} channels={dict(sorted(channels.items()))}")
+        print("cap/video  planned_max_requests  full_retrieval_upper_bound  expected_truncated  unknown_counts")
+        for cap in args.max_requests_per_video:
+            est = estimate_early_window_cost(videos, cap)
+            print(f"{cap:>9}  {est['planned_max_requests']:>20}  {est['full_retrieval_requests_upper_bound_known_counts']:>26}  "
+                  f"{est['videos_expected_budget_truncated']:>18}  {est['videos_with_unknown_comment_count']:>14}")
+        print("Basis: commentCount at discovery (includes replies), so these are upper bounds on top-level pages.")
+        return 0
+
     if args.command == "manifest":
         if os.path.exists(args.output):
             print(f"Refusing to overwrite existing manifest: {args.output}", file=sys.stderr)
             return 1
         with open(args.report, "rb") as f:
             report_bytes = f.read()
-        manifest = build_manifest(
-            json.loads(report_bytes.decode("utf-8")), args.report, sha256_bytes(report_bytes),
-            args.manifest_version, args.max_comments_per_video,
-        )
+        report = json.loads(report_bytes.decode("utf-8"))
+        if args.mode == "early-window":
+            if args.window_hours is None or args.max_requests_per_video is None:
+                print("early-window mode needs --window-hours and --max-requests-per-video", file=sys.stderr)
+                return 1
+            manifest = build_early_window_manifest(report, args.report, sha256_bytes(report_bytes),
+                                                   args.manifest_version, args.window_hours, args.max_requests_per_video)
+        else:
+            manifest = build_manifest(report, args.report, sha256_bytes(report_bytes),
+                                      args.manifest_version, args.max_comments_per_video)
         _write_json(args.output, manifest)
         b = manifest["budget"]
         print(f"[OK] Manifest {manifest['manifest_version']} written to {args.output}")
-        print(f"     videos={b['videos']} max_requests={b['max_total_requests']} max_quota_units={b['max_quota_units']}")
+        print(f"     mode={manifest_scope_mode(manifest)} videos={b['videos']} max_requests={b['max_total_requests']} "
+              f"max_quota_units={b['max_quota_units']}")
+        if "cost_estimate" in manifest:
+            est = manifest["cost_estimate"]
+            print(f"     estimated_requests<={est['planned_max_requests']} expected_budget_truncated_videos="
+                  f"{est['videos_expected_budget_truncated']} unknown_comment_counts={est['videos_with_unknown_comment_count']}")
         print(f"     manifest_sha256={manifest['manifest_sha256']}")
         return 0
 
@@ -885,14 +1364,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         fetcher = make_live_fetcher(build_youtube_client(args.api_key))
         record = run_harvest(
             manifest, fetcher, args.output_root, os.getenv("HMAC_SECRET", ""),
-            args.scope_accepted_by, video_limit=args.video_limit,
+            args.scope_accepted_by, video_limit=args.video_limit, resume_from_run=args.resume_from_run,
         )
         print(f"[OK] Run {record['run_id']} status={record['run_status']}")
         print(f"     requests={record['telemetry']['requests_by_endpoint']['commentThreads.list']} "
               f"comments_observed={record['comments_observed']}")
         print(f"     outcomes={json.dumps(record['outcome_counts'])}")
         print(f"     store_merge={json.dumps(record['store_merge'])}")
-        return 0 if record["run_status"] == "COMPLETED" else 2
+        if record["coverage_counts"]:
+            print(f"     coverage={json.dumps(record['coverage_counts'])} "
+                  f"in_window_comments_observed={record['in_window_comments_observed']}")
+            if record["run_status"] == "COMPLETED_BUDGET_TRUNCATED":
+                print("     [NOTE] Some videos are budget-truncated: their window counts are partial, not total volume.")
+        return 0 if record["run_status"] in ("COMPLETED", "COMPLETED_BUDGET_TRUNCATED") else 2
 
     result = verify_store(args.output_root, manifest)
     run_dups = scan_run_duplicates(args.output_root)
