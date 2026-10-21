@@ -19,7 +19,7 @@ final, so the snapshots are not perfectly symmetric.
 ```powershell
 python scripts/explore_comment_pilot.py `
   --manifest reports/comment_pilot/manifest_pilot-comments-v1.json `
-  --output-root reports/comment_pilot/pilot-comments-v1
+  --output-root reports/comment_pilot/pilot-comments-v1 --event-id WC_2022_FINAL
 start reports/comment_pilot/pilot-comments-v1/explorer.html
 ```
 
@@ -27,6 +27,20 @@ The page shows verification status (including the 13 one-second timestamp warnin
 publication months, time from upload to comment, channels, per-video coverage and a fixed audit sample
 of up to 10 comments per video. Every count is labelled as retrieved comments with its coverage; none is
 total discussion volume.
+
+`--event-id` is needed only for the v1 manifest, which does not record its event; v2 manifests carry
+it, and a conflicting `--event-id` is rejected. With an event, the explorer adds **event-relative
+phases** from `config/event_windows.yml`:
+- each phase's exact UTC boundaries (From inclusive, To exclusive);
+- an `OUTSIDE_CONFIGURED_WINDOWS` row, split into before / after;
+- counts shown separately for videos with complete and partial collection;
+- the phase of each comment in the audit sample.
+
+Phase descriptions come from the configured offsets only. A phase is described as "before", "after" or
+"spans" kickoff (WC_2022_FINAL) or event start (other events). Nothing is labelled "during the match"
+or "post-match", because the config has no match-end time; the EVENT window, for example, runs from
+1h before to 6h after kickoff. The video-relative view (time since each video's upload, including the
+first 72 hours used for early-window collection) is a separate section.
 
 ## 1. Discovery plan (no API calls)
 

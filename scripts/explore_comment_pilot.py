@@ -12,6 +12,10 @@ Governing Invariants:
    budget-truncated videos are shown as partial; nothing is presented as total discussion volume.
 3. Privacy: shows comment text (local file under gitignored reports/) but never author identifiers.
 4. No narrative classification or sentiment.
+5. Two separate time frames: video-relative (time since each video's upload) and event-relative phases
+   from config/event_windows.yml. Phase descriptions come from the configured offsets only (before /
+   after / spanning the anchor time); periods are never called "during the match" or "post-match",
+   because the configuration has no match-end time.
 """
 
 from __future__ import annotations
@@ -26,12 +30,22 @@ import os
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
+import yaml
+
 try:
     import harvest_pilot_comments as hpc
 except ImportError:
     from scripts import harvest_pilot_comments as hpc
 
 SAMPLE_PER_VIDEO = 10
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DEFAULT_EVENT_CONFIG = os.path.join(REPO_ROOT, "config", "event_windows.yml")
+# Name for an event's occurred_at in phase descriptions. Only events whose occurred_at is a kickoff get
+# "kickoff" (WC_2022_FINAL: 2022-12-18T15:00Z); everything else is described relative to occurred_at.
+EVENT_ANCHOR_TERMS = {"WC_2022_FINAL": "kickoff"}
+DEFAULT_ANCHOR_TERM = "event start (occurred_at)"
+OUTSIDE_PHASE = "OUTSIDE_CONFIGURED_WINDOWS"
+UNPARSEABLE_PHASE = "UNPARSEABLE_TIMESTAMP"
 AGE_BUCKETS = [  # (label, upper bound in hours since the video was published; None = no bound)
     ("< 1 day", 24), ("1–3 days", 72), ("3–7 days", 168), ("1–4 weeks", 24 * 30),
     ("1–12 months", 24 * 365), ("> 1 year", None),
@@ -123,8 +137,88 @@ def deterministic_sample(comments: List[Dict[str, Any]], k: int) -> List[Dict[st
     return sorted(comments, key=lambda c: hashlib.sha256(c["comment_id"].encode("utf-8")).hexdigest())[:k]
 
 
-def build_explorer_data(manifest: Dict[str, Any], output_root: str) -> Dict[str, Any]:
+def _format_offset(hours: float) -> str:
+    text = f"{hours:+g}h"
+    if abs(hours) >= 48 and hours % 24 == 0:
+        text += f" ({hours / 24:+g}d)"
+    return text
+
+
+def load_event_phases(event_id: str, config_path: str = DEFAULT_EVENT_CONFIG) -> Dict[str, Any]:
+    """Builds event-relative phases with exact UTC boundaries from config/event_windows.yml.
+
+    Each phase is [start, end): start inclusive, end exclusive. The description is derived from the
+    offsets alone: entirely before, entirely after, or spanning the anchor time.
+    """
+    with open(config_path, "r", encoding="utf-8") as f:
+        events = (yaml.safe_load(f) or {}).get("events", [])
+    event = next((e for e in events if e.get("external_event_id") == event_id), None)
+    if event is None:
+        raise ValueError(f"Event {event_id!r} not found in {config_path}")
+    occurred = hpc.parse_api_timestamp(event.get("occurred_at"))
+    if occurred is None:
+        raise ValueError(f"Event {event_id!r} has no parseable occurred_at")
+    anchor = EVENT_ANCHOR_TERMS.get(event_id, DEFAULT_ANCHOR_TERM)
+    phases = []
+    for w in event.get("windows", []):
+        start_h, end_h = w["relative_offset_start_hours"], w["relative_offset_end_hours"]
+        if end_h <= start_h:
+            raise ValueError(f"Window {w['window_type']} of {event_id} has end <= start")
+        relation = (f"before {anchor}" if end_h <= 0 else f"after {anchor}" if start_h >= 0 else f"spans {anchor}")
+        phases.append({
+            "window_type": w["window_type"],
+            "start_offset_hours": start_h,
+            "end_offset_hours": end_h,
+            "start": occurred + datetime.timedelta(hours=start_h),
+            "end": occurred + datetime.timedelta(hours=end_h),
+            "relation": relation,
+            "description": f"{_format_offset(start_h)} to {_format_offset(end_h)} relative to {anchor}; {relation}",
+        })
+    ordered = sorted(phases, key=lambda p: p["start"])
+    overlaps = [(a["window_type"], b["window_type"]) for a, b in zip(ordered, ordered[1:]) if b["start"] < a["end"]]
+    gaps = [(a["window_type"], b["window_type"]) for a, b in zip(ordered, ordered[1:]) if b["start"] > a["end"]]
+    return {
+        "event_id": event_id,
+        "event_name": event.get("event_name"),
+        "occurred_at": occurred,
+        "anchor": anchor,
+        "phases": phases,
+        "first_start": ordered[0]["start"] if ordered else None,
+        "last_end": max(p["end"] for p in phases) if phases else None,
+        "overlapping_windows": overlaps,
+        "gaps_between_windows": gaps,
+    }
+
+
+def assign_phase(published_at: Optional[str], event_phases: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+    """Returns (phase, side). phase is a window_type, OUTSIDE_PHASE or UNPARSEABLE_PHASE; side is
+    'before' / 'after' / 'between' for OUTSIDE_PHASE. The first configured window that contains the
+    timestamp wins if windows ever overlap."""
+    ts = hpc.parse_api_timestamp(published_at)
+    if ts is None:
+        return UNPARSEABLE_PHASE, None
+    for phase in event_phases["phases"]:
+        if phase["start"] <= ts < phase["end"]:
+            return phase["window_type"], None
+    if event_phases["first_start"] is not None and ts < event_phases["first_start"]:
+        return OUTSIDE_PHASE, "before"
+    if event_phases["last_end"] is not None and ts >= event_phases["last_end"]:
+        return OUTSIDE_PHASE, "after"
+    return OUTSIDE_PHASE, "between"
+
+
+def resolve_event_id(manifest: Dict[str, Any], event_id: Optional[str]) -> Optional[str]:
+    recorded = manifest.get("event_id")
+    if event_id and recorded and event_id != recorded:
+        raise ValueError(f"--event-id {event_id!r} conflicts with the manifest's event_id {recorded!r}")
+    return recorded or event_id
+
+
+def build_explorer_data(manifest: Dict[str, Any], output_root: str, event_id: Optional[str] = None,
+                        event_config_path: str = DEFAULT_EVENT_CONFIG) -> Dict[str, Any]:
     hpc.verify_manifest_integrity(manifest)
+    resolved_event = resolve_event_id(manifest, event_id)
+    event_phases = load_event_phases(resolved_event, event_config_path) if resolved_event else None
     verification = hpc.verify_store(output_root, manifest)
     store = hpc.load_store(os.path.join(output_root, "comment_store.json"), must_exist=True)
     run_records = load_run_records(output_root, store)
@@ -161,8 +255,21 @@ def build_explorer_data(manifest: Dict[str, Any], output_root: str) -> Dict[str,
     monthly: Dict[str, List[int]] = collections.defaultdict(lambda: [0, 0])  # [complete, partial]
     age_counts: Dict[str, List[int]] = {label: [0, 0] for label, _ in AGE_BUCKETS}
     pub_by_vid = {v["video_id"]: v.get("video_published_at") for v in manifest["videos"]}
+    phase_counts: Dict[str, List[int]] = {}
+    outside_sides: Dict[str, List[int]] = {"before": [0, 0], "between": [0, 0], "after": [0, 0]}
+    if event_phases:
+        phase_counts = {p["window_type"]: [0, 0] for p in event_phases["phases"]}
+        phase_counts[OUTSIDE_PHASE] = [0, 0]
+        phase_counts[UNPARSEABLE_PHASE] = [0, 0]
+    comment_phase: Dict[str, str] = {}
     for c in store.get("comments", {}).values():
         idx = 0 if c.get("manifest_video_id") in complete_ids else 1
+        if event_phases:
+            phase, side = assign_phase(c.get("published_at"), event_phases)
+            phase_counts[phase][idx] += 1
+            if side:
+                outside_sides[side][idx] += 1
+            comment_phase[c["comment_id"]] = phase if not side else f"{phase} ({side})"
         if c.get("published_at"):
             monthly[c["published_at"][:7]][idx] += 1
         bucket = age_bucket(hours_between(pub_by_vid.get(c.get("manifest_video_id")), c.get("published_at")))
@@ -189,6 +296,10 @@ def build_explorer_data(manifest: Dict[str, Any], output_root: str) -> Dict[str,
         "total_comments": len(store.get("comments", {})),
         "date_range": (all_pubs[0], all_pubs[-1]) if all_pubs else (None, None),
         "comment_lookup": store.get("comments", {}),
+        "event_phases": event_phases,
+        "phase_counts": phase_counts,
+        "outside_sides": outside_sides,
+        "comment_phase": comment_phase,
     }
 
 
@@ -214,7 +325,7 @@ h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:17px; margin:32px 0 8px; }
 .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:16px 0; }
 .kpi { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:10px 12px; }
 .kpi b { display:block; font-size:20px; } .kpi span { color:var(--muted); font-size:12px; }
-.scroll { overflow-x:auto; }
+.scroll { overflow-x:auto; } table.wide { min-width:1000px; } td.ts { white-space:nowrap; } td.desc { min-width:240px; }
 table { border-collapse:collapse; width:100%; background:var(--card); }
 th, td { border-bottom:1px solid var(--line); padding:6px 8px; text-align:left; vertical-align:top; }
 th { font-weight:600; font-size:12px; color:var(--muted); } td.num, th.num { text-align:right; }
@@ -280,6 +391,53 @@ def _month_range(first: str, last: str) -> List[str]:
     return out
 
 
+def _utc(ts: Optional[datetime.datetime]) -> str:
+    return ts.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if ts else ""
+
+
+def render_phase_section(data: Dict[str, Any]) -> str:
+    ev = data["event_phases"]
+    out = ["<h2>Event-relative phases</h2>"]
+    if not ev:
+        out.append("<p class='muted'>No event selected, so no event-relative phases are shown. Re-run with "
+                   "<span class='mono'>--event-id</span> (for example WC_2022_FINAL).</p>")
+        return "".join(out)
+    out.append(f"<p class='muted'>Phases come from config/event_windows.yml for {_esc(ev['event_id'])}, anchored on "
+               f"occurred_at = {_esc(_utc(ev['occurred_at']))} (described here as “{_esc(ev['anchor'])}”). Each phase "
+               "includes its From time and excludes its To time. Descriptions use only the configured offsets; no "
+               "period is labelled “during the match” or “post-match”. Counts are retrieved comments, shown "
+               "separately for videos with complete and partial collection, and are not total discussion volume.</p>")
+    if ev["overlapping_windows"]:
+        out.append(f"<div class='banner warn'>Configured windows overlap: {_esc(ev['overlapping_windows'])}. "
+                   "A comment is counted in the first matching window in configuration order.</div>")
+    out.append("<div class='scroll'><table class='wide'><tr><th>Phase (config window_type)</th><th>Description</th>"
+               "<th>From (UTC, inclusive)</th><th>To (UTC, exclusive)</th><th class='num'>From complete-collection videos</th>"
+               "<th class='num'>From partial-collection videos</th></tr>")
+    counts = data["phase_counts"]
+    for p in ev["phases"]:
+        c, pt = counts[p["window_type"]]
+        out.append(f"<tr><td class='mono'>{_esc(p['window_type'])}</td><td class='desc'>{_esc(p['description'])}</td>"
+                   f"<td class='mono ts'>{_esc(_utc(p['start']))}</td><td class='mono ts'>{_esc(_utc(p['end']))}</td>"
+                   f"<td class='num'>{c}</td><td class='num'>{pt}</td></tr>")
+    sides = data["outside_sides"]
+    side_text = "; ".join(f"{side}: {sides[side][0]} complete / {sides[side][1]} partial"
+                          for side in ("before", "between", "after") if sum(sides[side]))
+    c, pt = counts[OUTSIDE_PHASE]
+    out.append(f"<tr><td class='mono'>{OUTSIDE_PHASE}</td><td>Outside every configured window"
+               f"{_esc(' (' + side_text + ')') if side_text else ''}</td>"
+               f"<td class='mono ts'>before {_esc(_utc(ev['first_start']))}</td><td class='mono ts'>or from "
+               f"{_esc(_utc(ev['last_end']))}</td><td class='num'>{c}</td><td class='num'>{pt}</td></tr>")
+    if sum(counts[UNPARSEABLE_PHASE]):
+        c, pt = counts[UNPARSEABLE_PHASE]
+        out.append(f"<tr><td class='mono'>{UNPARSEABLE_PHASE}</td><td>published_at could not be parsed</td><td></td>"
+                   f"<td></td><td class='num'>{c}</td><td class='num'>{pt}</td></tr>")
+    out.append("</table></div>")
+    if ev["gaps_between_windows"]:
+        out.append(f"<p class='muted'>Gaps between configured windows: {_esc(ev['gaps_between_windows'])} "
+                   "(counted as outside, “between”).</p>")
+    return "".join(out)
+
+
 def render_html(data: Dict[str, Any]) -> str:
     m, ver, mode = data["manifest"], data["verification"], data["mode"]
     videos = data["videos"]
@@ -291,7 +449,10 @@ def render_html(data: Dict[str, Any]) -> str:
            f"<title>Comment Pilot Explorer</title><style>{CSS}</style></head><body><main>"]
 
     out.append(f"<h1>Comment pilot explorer — {_esc(m['manifest_version'])}</h1>")
-    out.append(f"<div class='muted'>Event: {_esc(m.get('event_id') or 'not recorded in manifest (v1)')} · "
+    ev = data["event_phases"]
+    event_text = (ev["event_id"] + ("" if m.get("event_id") else " (from --event-id; not recorded in v1 manifest)")
+                  if ev else "none selected (pass --event-id for event-relative phases)")
+    out.append(f"<div class='muted'>Event: {_esc(event_text)} · "
                f"mode {_esc(mode)} · manifest <span class='mono'>{_esc(m['manifest_sha256'][:16])}…</span> · "
                f"generated {_esc(datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))}</div>")
 
@@ -339,7 +500,12 @@ def render_html(data: Dict[str, Any]) -> str:
         series = [(mo, *data["monthly"].get(mo, [0, 0])) for mo in months]
         out.append(f"<div class='scroll'>{_stacked_bar_svg(series, month_tick_labels(months))}</div>")
 
-    out.append("<h2>Time from video upload to comment</h2>" + legend)
+    out.append(render_phase_section(data))
+
+    out.append("<h2>Video-relative: time from each video's upload to comment</h2>")
+    out.append("<p class='muted'>Measured from each video's own upload time, independent of the event phases above. "
+               "The “first 72 hours after upload” window used for early-window collection is the first two "
+               "buckets here.</p>" + legend)
     out.append(_stacked_bar_svg([(label, *data["age_counts"][label]) for label, _ in AGE_BUCKETS]))
 
     out.append("<h2>Channels</h2><div class='scroll'><table><tr><th>Channel</th><th class='num'>Videos</th>"
@@ -352,7 +518,7 @@ def render_html(data: Dict[str, Any]) -> str:
     window_head = "<th class='num'>In window</th>" if mode == hpc.SCOPE_EARLY_WINDOW else ""
     out.append("<h2>Videos</h2><div class='scroll'><table><tr><th>Video</th><th>Channel</th><th>Player</th>"
                "<th>Uploaded</th><th class='num'>Retrieved</th>" + window_head +
-               "<th class='num'>Within 72h of upload</th><th>Comment dates</th><th>Coverage</th></tr>")
+               "<th class='num'>First 72h after upload (video-relative)</th><th>Comment dates</th><th>Coverage</th></tr>")
     for v in sorted(videos, key=lambda x: x.get("video_published_at") or ""):
         pill = "complete" if v["coverage_complete"] else "partial"
         window_cell = f"<td class='num'>{v['in_window']}</td>" if mode == hpc.SCOPE_EARLY_WINDOW else ""
@@ -393,6 +559,8 @@ def render_html(data: Dict[str, Any]) -> str:
                 flags.append("likely pinned")
             if len(c.get("text_versions", [])) > 1:
                 flags.append(f"{len(c['text_versions'])} text versions")
+            if c["comment_id"] in data["comment_phase"]:
+                flags.append(f"phase {data['comment_phase'][c['comment_id']]}")
             meta = f"{_date(c.get('published_at'))} · {c['comment_id']}" + (f" · {', '.join(flags)}" if flags else "")
             out.append(f"<div class='comment'><div class='muted mono'>{_esc(meta)}</div>{_esc(latest_text(c))}</div>")
         out.append("</details>")
@@ -414,11 +582,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--out", default=None, help="HTML output path (default: <output-root>/explorer.html)")
+    parser.add_argument("--event-id", default=None,
+                        help="Event for event-relative phases when the manifest has none (v1); must match if present")
+    parser.add_argument("--event-config", default=DEFAULT_EVENT_CONFIG, help="Event windows config path")
     args = parser.parse_args(argv)
 
     with open(args.manifest, "r", encoding="utf-8") as f:
         manifest = json.load(f)
-    data = build_explorer_data(manifest, args.output_root)
+    try:
+        data = build_explorer_data(manifest, args.output_root, args.event_id, args.event_config)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
     out_path = args.out or os.path.join(args.output_root, "explorer.html")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(render_html(data))
@@ -426,6 +601,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[OK] Explorer written to {out_path}")
     print(f"     comments={data['total_comments']} videos={len(data['videos'])} verification_passed={ver['passed']} "
           f"timestamp_warnings={ver['warning_counts'].get('updated_before_published_within_tolerance', 0)}")
+    if data["event_phases"]:
+        summary = {k: v for k, v in data["phase_counts"].items() if sum(v)}
+        print(f"     event={data['event_phases']['event_id']} phase_counts[complete, partial]={json.dumps(summary)}")
     return 0
 
 

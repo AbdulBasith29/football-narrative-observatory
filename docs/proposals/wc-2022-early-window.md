@@ -98,8 +98,10 @@ kickoff (`occurred_at` 2022-12-18T15:00Z) using the phases already defined in
 The 18–20 December calendar window used earlier spans PRE_EVENT (00:00–14:00 on the 18th), EVENT,
 EARLY_POST_EVENT and part of LATE_POST_EVENT, which is why it cannot be called post-final reaction.
 
-**Recommended before collection (offline code change, pending approval):** add these phase labels to the
-explorer's counts and audit sample, so pre-final comments are never presented as reaction.
+**Implemented in the explorer** (`--event-id WC_2022_FINAL` for the v1 manifest): phase counts with exact
+UTC boundaries, an outside-window row, complete and partial collection shown separately, and the phase
+of each audit-sample comment. Descriptions say before / after / spans kickoff, never "during the match"
+or "post-match".
 
 ## Limits
 
