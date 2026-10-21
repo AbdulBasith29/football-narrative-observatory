@@ -1,0 +1,73 @@
+# config/discovery/pilot_event_snapshots.yml
+# Status: PROPOSED — pending review. Not research methodology; PIPELINE_PILOT snapshots only.
+#
+# Each snapshot is a separate pilot collection for one event in config/event_windows.yml, using the
+# PIPELINE_PILOT channel frame (config/frames/pipeline_pilot.yml). Snapshots are never merged into a
+# research dataset. Longer-term scope under discussion: 2022-2026.
+#
+# Discovery window rule (scripts/discover_pilot_coverage.py: resolve_event): from the start of the
+# event's EVENT window to the end of its LATE_POST_EVENT window, i.e. occurred_at - 1h to
+# occurred_at + 72h with the current event definitions. WC_2022_FINAL was discovered earlier with the
+# legacy calendar-day window 2022-12-18..2022-12-20 and is listed for reference only.
+#
+# Discovery method: date-bounded search. The uploads-playlist walk starts from each channel's newest
+# upload, so reaching 2023 would need thousands of pages; search is the only practical method here.
+# Quota (official calculator, last updated 2026-10-15): search.list has its own bucket, default 100
+# calls/day at 1 per call; other methods share the default 10,000 units/day. Confirm the project's
+# allocation in the Cloud console.
+#
+# Comment collection: EARLY_WINDOW mode, anchored on each video's own publication timestamp.
+# window_hours and max_requests_per_video are set only after reviewing the discovered candidates and
+# `harvest_pilot_comments.py estimate`; until then they stay null and no manifest can be built from them.
+
+snapshots:
+  - snapshot_id: WC_2022_FINAL_PILOT_V1
+    event_id: WC_2022_FINAL
+    status: COLLECTED
+    discovery:
+      method: search
+      max_pages_per_channel: 2
+      report_output: reports/live_pilot_candidate_coverage_report_verified.json
+      window_note: "legacy calendar-day window 2022-12-18T00:00:00Z..2022-12-20T23:59:59Z"
+    collection:
+      mode: NEWEST_N
+      max_comments_per_video: 100
+      manifest_version: pilot-comments-v1
+
+  - snapshot_id: WC_2022_FINAL_EARLY_V1
+    event_id: WC_2022_FINAL
+    status: PROPOSED                # docs/proposals/wc-2022-early-window.md; no new discovery
+    discovery:
+      method: none                  # reuses the verified WC report; existing manifest and data untouched
+      report_output: reports/live_pilot_candidate_coverage_report_verified.json
+    collection:
+      mode: EARLY_WINDOW
+      window_hours: 72
+      max_requests_per_video: null  # <= 50 (ceiling); set from `harvest_pilot_comments.py estimate`
+      manifest_version: wc-2022-early-v1
+
+  - snapshot_id: AL_NASSR_2023_PILOT_V1
+    event_id: TRANSFER_AL_NASSR_2023
+    status: PROPOSED
+    discovery:
+      method: search
+      max_pages_per_channel: 2
+      report_output: reports/event_snapshots/AL_NASSR_2023_PILOT_V1/discovery_report.json
+    collection:
+      mode: EARLY_WINDOW
+      window_hours: null            # proposed 72 (matches LATE_POST_EVENT end); decide after discovery
+      max_requests_per_video: null  # decide from `harvest_pilot_comments.py estimate`
+      manifest_version: al-nassr-2023-early-v1
+
+  - snapshot_id: BALLON_DOR_2023_PILOT_V1
+    event_id: BALLON_DOR_2023
+    status: PROPOSED
+    discovery:
+      method: search
+      max_pages_per_channel: 2
+      report_output: reports/event_snapshots/BALLON_DOR_2023_PILOT_V1/discovery_report.json
+    collection:
+      mode: EARLY_WINDOW
+      window_hours: null
+      max_requests_per_video: null
+      manifest_version: ballon-dor-2023-early-v1

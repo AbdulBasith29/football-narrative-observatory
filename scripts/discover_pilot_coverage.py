@@ -55,13 +55,36 @@ except ImportError:
 # 1. Official YouTube Data API Quota Reference (Official Google Documentation)
 # =============================================================================
 
+# Source: https://developers.google.com/youtube/v3/determine_quota_cost (page last updated 2026-10-15,
+# checked 2026-10-20). search.list now has its own bucket: a default of 100 calls/day at 1 unit per call.
+# Every other method used here draws on the shared default bucket of 10,000 units/day. Invalid requests
+# still cost at least 1. A project's actual allocation can differ: check the Cloud console Quotas page.
 OFFICIAL_QUOTA_COSTS = {
     "channels.list": 1,
     "playlistItems.list": 1,
     "videos.list": 1,
-    "search.list": 100,
+    "search.list": 1,
     "commentThreads.list": 1,
 }
+SEARCH_BUCKET = "search.list"
+DEFAULT_BUCKET = "default"
+QUOTA_BUCKET_BY_ENDPOINT = {"search.list": SEARCH_BUCKET}
+DEFAULT_DAILY_QUOTA = {DEFAULT_BUCKET: 10000, SEARCH_BUCKET: 100}
+QUOTA_REFERENCE = {
+    "url": "https://developers.google.com/youtube/v3/determine_quota_cost",
+    "page_last_updated": "2026-10-15",
+    "checked_on": "2026-10-20",
+    "note": "Default allocations; the project's actual quota may differ (Cloud console > Quotas).",
+}
+
+
+def quota_by_bucket(requests_by_endpoint: Dict[str, int]) -> Dict[str, int]:
+    """Splits request counts into the separately limited quota buckets (units per bucket)."""
+    buckets = {DEFAULT_BUCKET: 0, SEARCH_BUCKET: 0}
+    for endpoint, count in requests_by_endpoint.items():
+        bucket = QUOTA_BUCKET_BY_ENDPOINT.get(endpoint, DEFAULT_BUCKET)
+        buckets[bucket] += count * OFFICIAL_QUOTA_COSTS.get(endpoint, 1)
+    return buckets
 
 # Broad/generic event terms that warrant relevance tier separation
 GENERIC_EVENT_TERMS = {"final"}
@@ -318,18 +341,21 @@ class DiscoveryTelemetry:
         return sum(self.requests_by_endpoint.values())
 
     def calculate_actual_quota_units(self) -> int:
-        total = 0
-        for ep, count in self.requests_by_endpoint.items():
-            cost = OFFICIAL_QUOTA_COSTS.get(ep, 1)
-            total += count * cost
-        return total
+        """Units drawn from the shared default bucket (search.list is counted separately)."""
+        return quota_by_bucket(self.requests_by_endpoint)[DEFAULT_BUCKET]
+
+    def calculate_search_calls(self) -> int:
+        return quota_by_bucket(self.requests_by_endpoint)[SEARCH_BUCKET]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "requests_by_endpoint": dict(self.requests_by_endpoint),
             "total_api_requests": self.total_requests(),
             "actual_quota_units_consumed": self.calculate_actual_quota_units(),
+            "search_list_calls_consumed": self.calculate_search_calls(),
+            "quota_by_bucket": quota_by_bucket(self.requests_by_endpoint),
             "official_quota_rates_used": OFFICIAL_QUOTA_COSTS,
+            "quota_reference": QUOTA_REFERENCE,
             "error_count": len(self.errors),
             "errors": self.errors,
         }
@@ -1271,7 +1297,69 @@ def run_synthetic_mock_discovery(
 
 
 # =============================================================================
-# 8. Main Orchestrator (Live & Mock)
+# 8. Event Resolution & Discovery Cost Bounds
+# =============================================================================
+
+# Proposed discovery window rule for event snapshots (pending review): from the start of the EVENT
+# window to the end of the LATE_POST_EVENT window in config/event_windows.yml, i.e. occurred_at - 1h
+# to occurred_at + 72h for the current definitions. The WC_2022_FINAL pilot report used calendar days
+# 2022-12-18..2022-12-20 instead; that legacy default is kept when no event is selected.
+DISCOVERY_WINDOW_FROM = "EVENT"
+DISCOVERY_WINDOW_TO = "LATE_POST_EVENT"
+LEGACY_WINDOW_START = "2022-12-18T00:00:00Z"
+LEGACY_WINDOW_END = "2022-12-20T23:59:59Z"
+
+
+def resolve_event(config: Dict[str, Any], event_id: str) -> Dict[str, Any]:
+    """Returns event terms and the derived discovery window for one configured event."""
+    event = next((ev for ev in config.get("events", []) if ev.get("external_event_id") == event_id), None)
+    if event is None:
+        known = [ev.get("external_event_id") for ev in config.get("events", [])]
+        raise ValueError(f"Unknown event_id {event_id!r}; configured events: {known}")
+    occurred = datetime.datetime.fromisoformat(event["occurred_at"].replace("Z", "+00:00"))
+    windows = {w["window_type"]: w for w in event.get("windows", [])}
+    if DISCOVERY_WINDOW_FROM not in windows or DISCOVERY_WINDOW_TO not in windows:
+        raise ValueError(f"Event {event_id} lacks {DISCOVERY_WINDOW_FROM}/{DISCOVERY_WINDOW_TO} windows")
+    start = occurred + datetime.timedelta(hours=windows[DISCOVERY_WINDOW_FROM]["relative_offset_start_hours"])
+    end = occurred + datetime.timedelta(hours=windows[DISCOVERY_WINDOW_TO]["relative_offset_end_hours"])
+    if not event.get("event_terms"):
+        raise ValueError(f"Event {event_id} has no event_terms")
+    return {
+        "event_id": event_id,
+        "event_name": event.get("event_name"),
+        "occurred_at": event["occurred_at"],
+        "event_terms": sorted(set(event["event_terms"])),
+        "baseline_terms": sorted(set(event.get("baseline_terms", []))),
+        "window_start": start,
+        "window_end": end,
+        "window_derivation": (f"{DISCOVERY_WINDOW_FROM}.relative_offset_start_hours="
+                              f"{windows[DISCOVERY_WINDOW_FROM]['relative_offset_start_hours']} to "
+                              f"{DISCOVERY_WINDOW_TO}.relative_offset_end_hours="
+                              f"{windows[DISCOVERY_WINDOW_TO]['relative_offset_end_hours']} around occurred_at"),
+    }
+
+
+def estimate_discovery_cost(n_channels: int, max_pages_per_channel: int, method: str) -> Dict[str, Any]:
+    """Upper bound on discovery quota per bucket: identity check, every allowed page per channel, and
+    hydration of every possible candidate (50 results per page, 50 IDs per videos.list call)."""
+    page_endpoint = "search.list" if method == "search" else "playlistItems.list"
+    pages = n_channels * max_pages_per_channel
+    requests = {
+        "channels.list": -(-n_channels // 50),
+        page_endpoint: pages,
+        "videos.list": pages,
+    }
+    buckets = quota_by_bucket(requests)
+    return {
+        "requests_upper_bound": requests,
+        "quota_by_bucket_upper_bound": buckets,
+        "share_of_default_daily_quota": {b: buckets[b] / DEFAULT_DAILY_QUOTA[b] for b in buckets},
+        "quota_reference": QUOTA_REFERENCE,
+    }
+
+
+# =============================================================================
+# 9. Main Orchestrator (Live & Mock)
 # =============================================================================
 
 def execute_discovery(
@@ -1279,32 +1367,38 @@ def execute_discovery(
     mock: bool = False,
     api_key: Optional[str] = None,
     method: str = "search",
-    window_start_str: str = "2022-12-18T00:00:00Z",
-    window_end_str: str = "2022-12-20T23:59:59Z",
+    window_start_str: Optional[str] = None,
+    window_end_str: Optional[str] = None,
     max_pages_per_channel: int = 2,
+    event_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Orchestrates candidate video discovery without performing any Snowflake writes."""
+    """Orchestrates candidate video discovery without performing any Snowflake writes.
+
+    With event_id, terms come from that event in config/event_windows.yml and, unless explicit window
+    strings are given, the window is derived by resolve_event(). Without event_id the legacy
+    WC_2022_FINAL behaviour (terms and calendar-day window) is unchanged.
+    """
     config = load_repository_configuration(repo_root)
 
-    w_start = datetime.datetime.fromisoformat(window_start_str.replace("Z", "+00:00"))
-    w_end = datetime.datetime.fromisoformat(window_end_str.replace("Z", "+00:00"))
-
-    # Select event terms and baseline terms separately from first matching pilot event (WC_2022_FINAL)
-    event_terms = ["world cup", "final", "argentina vs france"]
-    baseline_terms = ["world cup", "fifa", "fifa world cup", "qatar 2022"]
-    for ev in config.get("events", []):
-        if ev.get("external_event_id") == "WC_2022_FINAL":
-            e_terms = ev.get("event_terms", [])
-            b_terms = ev.get("baseline_terms", [])
-            if e_terms:
-                event_terms = sorted(list(set(e_terms)))
-            if b_terms:
-                baseline_terms = sorted(list(set(b_terms)))
-            break
+    resolved = resolve_event(config, event_id or "WC_2022_FINAL")
+    event_terms, baseline_terms = resolved["event_terms"], resolved["baseline_terms"]
+    if event_id and window_start_str is None and window_end_str is None:
+        w_start, w_end = resolved["window_start"], resolved["window_end"]
+        window_derivation = resolved["window_derivation"]
+    else:
+        window_start_str = window_start_str or LEGACY_WINDOW_START
+        window_end_str = window_end_str or LEGACY_WINDOW_END
+        w_start = datetime.datetime.fromisoformat(window_start_str.replace("Z", "+00:00"))
+        w_end = datetime.datetime.fromisoformat(window_end_str.replace("Z", "+00:00"))
+        window_derivation = "EXPLICIT_ARGUMENTS" if event_id else "LEGACY_WC_2022_CALENDAR_DAYS"
+    event_metadata = {"event_id": event_id, "event_occurred_at": resolved["occurred_at"] if event_id else None,
+                      "window_derivation": window_derivation}
 
     # 1. Synthetic Mock Mode
     if mock:
-        return run_synthetic_mock_discovery(config, w_start, w_end, event_terms, baseline_terms)
+        report = run_synthetic_mock_discovery(config, w_start, w_end, event_terms, baseline_terms)
+        report["report_metadata"].update(event_metadata)
+        return report
 
     # 2. Live Mode (Strictly fail-closed; no silent mock fallback)
     youtube = build_youtube_client(api_key=api_key)
@@ -1476,6 +1570,7 @@ def execute_discovery(
             "window_end": w_end.isoformat(),
             "discovery_method": method,
             "max_pages_per_channel": max_pages_per_channel,
+            **event_metadata,
         },
         "telemetry": telemetry.to_dict(),
         "channel_identity_validations": discrepancies,
@@ -1753,6 +1848,9 @@ def regenerate_from_saved_report(
             "window_end": w_end.isoformat(),
             "discovery_method": method,
             "max_pages_per_channel": meta.get("max_pages_per_channel", 2),
+            "event_id": meta.get("event_id"),
+            "event_occurred_at": meta.get("event_occurred_at"),
+            "window_derivation": meta.get("window_derivation", "UNKNOWN"),
         },
         "telemetry": saved_data.get("telemetry", {
             "requests_by_endpoint": {},
@@ -1900,7 +1998,9 @@ def format_report_summary_markdown(report: Dict[str, Any]) -> str:
     telem = report.get("telemetry", {})
     lines.append("### API & Quota Telemetry (Actual Executed Requests)")
     lines.append(f"- **Total API Requests**: {telem.get('total_api_requests', 0)}")
-    lines.append(f"- **Actual Quota Units Consumed**: {telem.get('actual_quota_units_consumed', 0)}")
+    lines.append(f"- **Actual Quota Units Consumed (default bucket)**: {telem.get('actual_quota_units_consumed', 0)}")
+    if "search_list_calls_consumed" in telem:
+        lines.append(f"- **search.list Calls (separate bucket)**: {telem['search_list_calls_consumed']}")
     lines.append(f"- **Calls Breakdown**: {telem.get('requests_by_endpoint', {})}")
     if telem.get("error_count", 0) > 0:
         lines.append(f"- **Errors Encountered**: {telem.get('error_count')} (inspect report JSON for details)")
@@ -1987,7 +2087,7 @@ def format_report_summary_markdown(report: Dict[str, Any]) -> str:
 
 
 # =============================================================================
-# 9. CLI Interface
+# 10. CLI Interface
 # =============================================================================
 
 def parse_args():
@@ -2008,29 +2108,52 @@ def parse_args():
     parser.add_argument(
         "--method",
         choices=["uploads_playlist", "search"],
-        default="search",
-        help="Discovery method: 'search' (date-bounded; 100 quota units/call) or 'uploads_playlist' (1 quota unit/call)"
+        default=None,
+        help="Discovery method: 'search' (date-bounded; 1 call from the separate search.list bucket, default 100/day) "
+             "or 'uploads_playlist' (1 unit/call from the default bucket)"
+    )
+    parser.add_argument(
+        "--event-id",
+        default=None,
+        help="Event from config/event_windows.yml (e.g. TRANSFER_AL_NASSR_2023). Supplies event/baseline terms "
+             "and, unless --window-start/--window-end are given, the derived discovery window."
+    )
+    parser.add_argument(
+        "--snapshot",
+        default=None,
+        help="Snapshot ID from --snapshot-config; fills --event-id, --method, --max-pages and --output"
+    )
+    parser.add_argument(
+        "--snapshot-config",
+        default="config/discovery/pilot_event_snapshots.yml",
+        help="Snapshot configuration file (default: config/discovery/pilot_event_snapshots.yml)"
+    )
+    parser.add_argument(
+        "--estimate-only",
+        action="store_true",
+        default=False,
+        help="Print the resolved event, window and upper-bound discovery quota cost, then exit without API calls"
     )
     parser.add_argument(
         "--window-start",
-        default="2022-12-18T00:00:00Z",
-        help="Event window start ISO timestamp (default: 2022-12-18T00:00:00Z)"
+        default=None,
+        help="Window start ISO timestamp (default: derived from --event-id, else 2022-12-18T00:00:00Z)"
     )
     parser.add_argument(
         "--window-end",
-        default="2022-12-20T23:59:59Z",
-        help="Event window end ISO timestamp (default: 2022-12-20T23:59:59Z)"
+        default=None,
+        help="Window end ISO timestamp (default: derived from --event-id, else 2022-12-20T23:59:59Z)"
     )
     parser.add_argument(
         "--max-pages",
         type=int,
-        default=2,
+        default=None,
         help="Maximum pagination pages per channel (default: 2)"
     )
     parser.add_argument(
         "--output",
-        default="reports/pilot_candidate_coverage_report.json",
-        help="Output JSON report file path"
+        default=None,
+        help="Output JSON report file path (default: reports/pilot_candidate_coverage_report.json)"
     )
     parser.add_argument(
         "--input-json",
@@ -2045,10 +2168,71 @@ def parse_args():
     return parser.parse_args()
 
 
+def load_snapshot(config_path: str, snapshot_id: str) -> Dict[str, Any]:
+    """Reads one discovery snapshot definition from the snapshot configuration file."""
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    for snap in data.get("snapshots", []):
+        if snap.get("snapshot_id") == snapshot_id:
+            return snap
+    raise ValueError(f"Snapshot {snapshot_id!r} not found in {config_path}")
+
+
+def apply_snapshot_defaults(args) -> None:
+    """Fills unset CLI options from --snapshot, then applies the legacy defaults. Explicit flags win."""
+    if args.snapshot:
+        snap = load_snapshot(args.snapshot_config, args.snapshot)
+        disc = snap.get("discovery", {})
+        if disc.get("method") not in ("search", "uploads_playlist"):
+            raise ValueError(f"Snapshot {args.snapshot} has discovery method {disc.get('method')!r}; it reuses an "
+                             "existing report and must not run discovery")
+        if args.event_id and args.event_id != snap.get("event_id"):
+            raise ValueError(f"--event-id {args.event_id} conflicts with snapshot event {snap.get('event_id')}")
+        args.event_id = snap.get("event_id")
+        args.method = args.method or disc.get("method")
+        args.max_pages = args.max_pages or disc.get("max_pages_per_channel")
+        args.output = args.output or disc.get("report_output")
+    args.method = args.method or "search"
+    args.max_pages = args.max_pages or 2
+    args.output = args.output or "reports/pilot_candidate_coverage_report.json"
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     args = parse_args()
+    try:
+        apply_snapshot_defaults(args)
+    except (OSError, ValueError) as exc:
+        print(f"[FATAL ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.estimate_only and not args.summary and os.path.exists(args.output):
+        print(f"[FATAL ERROR] Refusing to overwrite existing report: {args.output} "
+              "(choose a new --output; checked before any API call)", file=sys.stderr)
+        sys.exit(1)
+
+    if args.estimate_only:
+        config = load_repository_configuration()
+        resolved = resolve_event(config, args.event_id or "WC_2022_FINAL")
+        if args.event_id and not (args.window_start or args.window_end):
+            w_start, w_end, derivation = resolved["window_start"], resolved["window_end"], resolved["window_derivation"]
+        else:
+            w_start, w_end = args.window_start or LEGACY_WINDOW_START, args.window_end or LEGACY_WINDOW_END
+            derivation = "EXPLICIT_ARGUMENTS" if args.event_id else "LEGACY_WC_2022_CALENDAR_DAYS"
+        cost = estimate_discovery_cost(len(config["channels"]), args.max_pages, args.method)
+        print(f"event_id={args.event_id or 'WC_2022_FINAL (legacy default)'} occurred_at={resolved['occurred_at']}")
+        print(f"window={w_start} -> {w_end} ({derivation})")
+        print(f"event_terms={resolved['event_terms']} baseline_terms={resolved['baseline_terms']}")
+        print(f"channels={len(config['channels'])} method={args.method} max_pages_per_channel={args.max_pages}")
+        b = cost["quota_by_bucket_upper_bound"]
+        print(f"discovery upper bound: requests={cost['requests_upper_bound']}")
+        print(f"  search.list bucket: <= {b[SEARCH_BUCKET]} calls of {DEFAULT_DAILY_QUOTA[SEARCH_BUCKET]}/day default")
+        print(f"  default bucket:     <= {b[DEFAULT_BUCKET]} units of {DEFAULT_DAILY_QUOTA[DEFAULT_BUCKET]}/day default")
+        print(f"  rates: {QUOTA_REFERENCE['url']} (last updated {QUOTA_REFERENCE['page_last_updated']}); "
+              "confirm the project's allocation in the Cloud console")
+        print(f"report would be written to: {args.output}")
+        return
 
     if args.summary:
         if not os.path.exists(args.summary):
@@ -2074,14 +2258,15 @@ def main():
                 window_start_str=args.window_start,
                 window_end_str=args.window_end,
                 max_pages_per_channel=args.max_pages,
+                event_id=args.event_id,
             )
         except Exception as exc:
             print(f"[FATAL ERROR] Discovery execution failed: {exc}", file=sys.stderr)
             sys.exit(1)
 
     # Save output report
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as f:
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    with open(args.output, "x", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
     # Output markdown summary

@@ -145,12 +145,16 @@ def test_telemetry_tracking_and_quota_costs():
     telem.record_request("videos.list")
     telem.record_request("search.list")
 
-    # channels.list (1) + 2 * playlistItems.list (2) + videos.list (1) + search.list (100) = 104
-    assert telem.calculate_actual_quota_units() == 104
+    # Official calculator (last updated 2026-10-15): search.list has its own bucket (1 per call, 100/day
+    # default); channels.list (1) + 2 * playlistItems.list (2) + videos.list (1) = 4 default-bucket units.
+    assert telem.calculate_actual_quota_units() == 4
+    assert telem.calculate_search_calls() == 1
     assert telem.total_requests() == 5
     d = telem.to_dict()
     assert d["total_api_requests"] == 5
-    assert d["actual_quota_units_consumed"] == 104
+    assert d["actual_quota_units_consumed"] == 4
+    assert d["search_list_calls_consumed"] == 1
+    assert d["quota_by_bucket"] == {"default": 4, "search.list": 1}
 
 
 # =============================================================================

@@ -90,3 +90,7 @@ exactly 1 second before `publishedAt` within the same API item, all published be
 2023-09-18 across 5 videos. Gaps up to `TIMESTAMP_SKEW_TOLERANCE_SECONDS` (1s) are reported as
 `[WARN] updated_before_published_within_tolerance` with the gap, and raw values are never adjusted. Any
 larger gap still fails verification.
+
+## Related
+
+- Early-window collection, event snapshots and the local explorer: `docs/pilot-event-snapshots.md`.
