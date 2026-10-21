@@ -109,6 +109,33 @@ def coverage_label(mode: str, outcome: Optional[Dict[str, Any]], store_cov: Opti
     return "Unknown pagination", False
 
 
+PREPUB_LABELS = {
+    hpc.PREPUB_COMPLETE: "all retrieved",
+    hpc.PREPUB_NONE_RETRIEVABLE: "none retrievable (all pages retrieved)",
+    hpc.PREPUB_PARTIAL_STOPPED: "partial: paging stopped at the window start",
+    hpc.PREPUB_PARTIAL: "partial",
+    hpc.PREPUB_NOT_REACHED: "not reached",
+    hpc.PREPUB_UNAVAILABLE: "unavailable",
+}
+
+
+def pre_publication_status(mode: str, outcome: Optional[Dict[str, Any]], store_cov: Optional[Dict[str, Any]],
+                           count: int) -> Optional[str]:
+    """Coverage of comments published before the video's publishedAt, reported separately from the
+    configured (publication-anchored) window. Derived for runs that predate the stored field."""
+    if outcome is None:
+        return None
+    if mode == hpc.SCOPE_EARLY_WINDOW:
+        cov = store_cov or {}
+        return cov.get("pre_publication_coverage") or hpc.pre_publication_coverage(
+            cov.get("coverage_status") or outcome.get("coverage_status"), count)
+    if outcome.get("outcome") in (hpc.OUTCOME_COMMENTS_DISABLED, hpc.OUTCOME_VIDEO_NOT_FOUND):
+        return hpc.PREPUB_UNAVAILABLE
+    if outcome.get("pagination_availability") == hpc.PAGINATION_EXHAUSTED:
+        return hpc.pre_publication_coverage(hpc.COVERAGE_COMPLETE_ALL_PAGES, count)
+    return hpc.PREPUB_PARTIAL if count else hpc.PREPUB_NOT_REACHED
+
+
 def hours_between(start: Optional[str], end: Optional[str]) -> Optional[float]:
     a, b = hpc.parse_api_timestamp(start), hpc.parse_api_timestamp(end)
     if a is None or b is None:
@@ -235,6 +262,8 @@ def build_explorer_data(manifest: Dict[str, Any], output_root: str, event_id: Op
         vid = v["video_id"]
         comments = by_video.get(vid, [])
         label, complete = coverage_label(mode, outcomes.get(vid), store_cov.get(vid))
+        pre_comments = [c for c in comments if hpc.published_before_video(c.get("published_at"), v.get("video_published_at"))]
+        pre_count = len(pre_comments)
         pubs = sorted(c["published_at"] for c in comments if c.get("published_at"))
         ages = [hours_between(v.get("video_published_at"), c.get("published_at")) for c in comments]
         videos.append({
@@ -248,6 +277,9 @@ def build_explorer_data(manifest: Dict[str, Any], output_root: str, event_id: Op
             "coverage_complete": complete,
             "collected": vid in outcomes,
             "likely_pinned": sum(1 for c in comments if c.get("likely_pinned")),
+            "pre_publication": pre_count,
+            "pre_publication_earliest": min((c["published_at"] for c in pre_comments), default=None),
+            "pre_publication_status": pre_publication_status(mode, outcomes.get(vid), store_cov.get(vid), pre_count),
             "sample": deterministic_sample(comments, SAMPLE_PER_VIDEO),
         })
 
@@ -395,6 +427,68 @@ def _utc(ts: Optional[datetime.datetime]) -> str:
     return ts.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if ts else ""
 
 
+def render_pre_publication_section(data: Dict[str, Any]) -> str:
+    flagged = data["verification"].get("warnings", {}).get("comment_before_video_published", [])
+    out = ["<h2>Flagged: comments published before the video's publishedAt</h2>"]
+    out.append(f"<p class='muted'>{len(flagged)} comment(s) carry a published_at earlier than their video's "
+               "publishedAt. They are kept and flagged, with timestamps exactly as returned by the API. They lie "
+               "outside the configured window, which stays anchored on each video's publishedAt; changing the anchor "
+               "needs evidence (for example a livestream's actual start time) and explicit approval. They may come "
+               "from a livestream or premiere, but that has not been verified. Their coverage is shown separately "
+               "from completion of the configured window.</p>")
+    rows = [v for v in data["videos"] if v["pre_publication"]]
+    if not rows:
+        out.append("<p class='muted'>None.</p>")
+        return "".join(out)
+    out.append("<div class='scroll'><table><tr><th>Video</th><th>publishedAt (UTC)</th><th class='num'>Flagged comments"
+               "</th><th>Earliest flagged comment</th><th>Pre-publication coverage</th><th>Configured window</th></tr>")
+    for v in sorted(rows, key=lambda x: -x["pre_publication"]):
+        out.append(f"<tr><td class='mono'>{_esc(v['video_id'])}</td><td class='mono ts'>{_esc(v.get('video_published_at'))}"
+                   f"</td><td class='num'>{v['pre_publication']}</td><td class='mono ts'>"
+                   f"{_esc(v['pre_publication_earliest'])}</td><td>"
+                   f"{_esc(PREPUB_LABELS.get(v['pre_publication_status'], v['pre_publication_status']))}</td>"
+                   f"<td>{_esc(v['coverage_label'])}</td></tr>")
+    out.append("</table></div>")
+    return "".join(out)
+
+
+def render_occurrence_section(data: Dict[str, Any]) -> str:
+    ver = data["verification"]
+    rows = ([("identical", r) for r in ver.get("warnings", {}).get("duplicate_occurrences_identical", [])]
+            + [("changed", r) for r in ver.get("warnings", {}).get("duplicate_occurrences_changed", [])])
+    out = ["<h2>Repeated occurrences within runs</h2>",
+           "<p class='muted'>The same comment ID returned more than once in one run (for example on two consecutive "
+           "pages). Every occurrence is preserved with its raw page and position; all counts on this page use unique "
+           "comment IDs. “Identical” means the raw item matches the first occurrence exactly; “changed” means it "
+           "differs, for example a like count updated between page requests.</p>"]
+    summary = ver.get("occurrences_by_run", {})
+    if summary:
+        out.append("<div class='scroll'><table><tr><th>Run</th><th class='num'>Occurrences</th><th class='num'>Unique "
+                   "comments</th><th class='num'>Identical repeats</th><th class='num'>Changed repeats</th></tr>")
+        for run_id, counts in summary.items():
+            total = sum(counts.values())
+            out.append(f"<tr><td class='mono'>{_esc(run_id)}</td><td class='num'>{total}</td>"
+                       f"<td class='num'>{counts[hpc.OCCURRENCE_FIRST]}</td>"
+                       f"<td class='num'>{counts[hpc.OCCURRENCE_DUPLICATE_IDENTICAL]}</td>"
+                       f"<td class='num'>{counts[hpc.OCCURRENCE_DUPLICATE_CHANGED]}</td></tr>")
+        out.append("</table></div>")
+    if not rows:
+        out.append("<p class='muted'>No repeated occurrences.</p>")
+        return "".join(out)
+    out.append("<div class='scroll'><table class='wide'><tr><th>Run</th><th>Comment ID</th><th>Kind</th>"
+               "<th>First occurrence</th><th>Repeat</th></tr>")
+    for kind, r in rows[:200]:
+        first, repeat = r["first"], r["repeat"]
+        out.append(f"<tr><td class='mono'>{_esc(r['run_id'])}</td><td class='mono'>{_esc(r['comment_id'])}</td>"
+                   f"<td>{kind}</td><td class='mono'>{_esc(first['raw_file'])} #{first['position']}</td>"
+                   f"<td class='mono'>{_esc(repeat['raw_file'])} #{repeat['position']}</td></tr>")
+    out.append("</table></div>")
+    if len(rows) > 200:
+        out.append(f"<p class='muted'>Showing 200 of {len(rows)}; all are listed by "
+                   "<span class='mono'>harvest_pilot_comments.py verify</span>.</p>")
+    return "".join(out)
+
+
 def render_phase_section(data: Dict[str, Any]) -> str:
     ev = data["event_phases"]
     out = ["<h2>Event-relative phases</h2>"]
@@ -485,6 +579,9 @@ def render_html(data: Dict[str, Any]) -> str:
         (len(data["channels"]), "channels"),
         (f"{_date(first)} → {_date(last)}", "comment publication range"),
         (len(warnings), "timestamp warnings"),
+        (ver["warning_counts"].get("comment_before_video_published", 0), "published before video (flagged)"),
+        (ver["warning_counts"].get("duplicate_occurrences_identical", 0)
+         + ver["warning_counts"].get("duplicate_occurrences_changed", 0), "repeated occurrences recorded"),
     ]:
         out.append(f"<div class='kpi'><b>{_esc(value)}</b><span>{_esc(label)}</span></div>")
     out.append("</div>")
@@ -515,13 +612,20 @@ def render_html(data: Dict[str, Any]) -> str:
                    f"<td class='num'>{ch['retrieved']}</td></tr>")
     out.append("</table></div>")
 
-    window_head = "<th class='num'>In window</th>" if mode == hpc.SCOPE_EARLY_WINDOW else ""
-    out.append("<h2>Videos</h2><div class='scroll'><table><tr><th>Video</th><th>Channel</th><th>Player</th>"
+    early = mode == hpc.SCOPE_EARLY_WINDOW
+    window_head = "<th class='num'>In window</th>" if early else ""
+    coverage_head = "Configured window coverage (from upload)" if early else "Coverage"
+    out.append("<h2>Videos</h2><p class='muted'>Counts are unique comment IDs. Coverage of the configured window "
+               "and coverage of comments published before the video's publishedAt are reported separately.</p>"
+               "<div class='scroll'><table><tr><th>Video</th><th>Channel</th><th>Player</th>"
                "<th>Uploaded</th><th class='num'>Retrieved</th>" + window_head +
-               "<th class='num'>First 72h after upload (video-relative)</th><th>Comment dates</th><th>Coverage</th></tr>")
+               "<th class='num'>First 72h after upload (video-relative)</th><th>Comment dates</th>"
+               f"<th>{coverage_head}</th><th>Before publishedAt (flagged)</th></tr>")
     for v in sorted(videos, key=lambda x: x.get("video_published_at") or ""):
         pill = "complete" if v["coverage_complete"] else "partial"
-        window_cell = f"<td class='num'>{v['in_window']}</td>" if mode == hpc.SCOPE_EARLY_WINDOW else ""
+        window_cell = f"<td class='num'>{v['in_window']}</td>" if early else ""
+        prepub = (f"{v['pre_publication']} · {PREPUB_LABELS.get(v['pre_publication_status'], v['pre_publication_status'])}"
+                  if v["pre_publication_status"] else "")
         pinned = f" · {v['likely_pinned']} likely pinned" if v["likely_pinned"] else ""
         out.append(
             f"<tr><td><a href='https://www.youtube.com/watch?v={_esc(v['video_id'])}'>{_esc((v.get('title') or '')[:70])}</a>"
@@ -529,8 +633,12 @@ def render_html(data: Dict[str, Any]) -> str:
             f"<td>{_esc(v.get('player_category'))}</td><td>{_esc(_date(v.get('video_published_at')))}</td>"
             f"<td class='num'>{v['retrieved']}</td>{window_cell}<td class='num'>{v['within_72h']}</td>"
             f"<td>{_esc(_date(v['earliest']))} → {_esc(_date(v['latest']))}</td>"
-            f"<td><span class='pill {pill}'>{_esc(v['coverage_label'])}</span>{_esc(pinned)}</td></tr>")
+            f"<td><span class='pill {pill}'>{_esc(v['coverage_label'])}</span>{_esc(pinned)}</td>"
+            f"<td>{_esc(prepub)}</td></tr>")
     out.append("</table></div>")
+
+    out.append(render_pre_publication_section(data))
+    out.append(render_occurrence_section(data))
 
     out.append("<h2>Timestamp warnings</h2>")
     if warnings:
@@ -546,6 +654,7 @@ def render_html(data: Dict[str, Any]) -> str:
     else:
         out.append("<p class='muted'>None.</p>")
 
+    pub_by_vid = {v["video_id"]: v.get("video_published_at") for v in videos}
     out.append(f"<h2>Audit sample</h2><p class='muted'>Up to {SAMPLE_PER_VIDEO} comments per video, chosen by hashed "
                "comment ID so the same sample is shown every time. Author identifiers are never shown.</p>")
     for v in sorted(videos, key=lambda x: x.get("video_published_at") or ""):
@@ -557,6 +666,8 @@ def render_html(data: Dict[str, Any]) -> str:
                 flags.append("in window")
             if c.get("likely_pinned"):
                 flags.append("likely pinned")
+            if hpc.published_before_video(c.get("published_at"), pub_by_vid.get(v["video_id"])):
+                flags.append("published before video (flagged)")
             if len(c.get("text_versions", [])) > 1:
                 flags.append(f"{len(c['text_versions'])} text versions")
             if c["comment_id"] in data["comment_phase"]:

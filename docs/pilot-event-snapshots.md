@@ -128,6 +128,32 @@ video ends `COMPLETED_BUDGET_TRUNCATED` (exit code 0, with a note).
 A first item older than the one after it on page 1 is flagged `likely_pinned` and does not move the
 paging frontier.
 
+### Repeated comments and pre-publication comments
+
+**Repeated comment IDs within a run.** The API can return the same comment on two consecutive pages.
+- Every raw occurrence is kept: the raw page, the parsed line and a lineage record in the store.
+- Each repeat is classified from the raw item: `DUPLICATE_IDENTICAL` if byte-for-byte equal (canonical
+  JSON) to the first occurrence, otherwise `DUPLICATE_CHANGED`.
+- An identical repeat adds no engagement snapshot; a changed one does.
+- All analytical counts (per video, per phase, per month) are unique by comment ID. Run records give
+  `raw_occurrences`, `unique_comments_observed` and `occurrence_counts`.
+- `verify` re-derives occurrence kinds from the raw pages, so runs made before kinds were recorded are
+  covered too. It lists repeats as `[WARN] duplicate_occurrences_*` with both lineages, and fails only
+  if an occurrence's lineage is missing or inconsistent.
+
+**Comments published before the video's `publishedAt`.**
+- These stay flagged (`[WARN] comment_before_video_published`, with the video and the gap in seconds),
+  with timestamps exactly as returned.
+- They lie outside the configured window, which stays anchored on `publishedAt`. They may be
+  livestream- or premiere-era comments; that is not verified. Changing the anchor needs evidence (for
+  example a livestream's actual start time) and explicit approval.
+- Each video reports `pre_publication_coverage` separately from `coverage_status`:
+  - `COMPLETE`: all pages retrieved, pre-publication comments present.
+  - `NONE_RETRIEVABLE`: all pages retrieved, none present.
+  - `PARTIAL_STOPPED_AT_WINDOW_START`: the configured window is complete, but paging stopped once it
+    passed the window start, so older pre-publication comments were not retrieved.
+  - `PARTIAL`, `NOT_REACHED`, `UNAVAILABLE`.
+
 ### Checkpoints and resuming
 
 After every successful page, `runs/<run_id>/checkpoints/<video_id>.json` records the next page token,

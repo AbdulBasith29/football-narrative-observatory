@@ -270,7 +270,8 @@ def test_rerun_adds_new_and_updated_comments_without_duplicate_ids(tmp_path):
     ])})
     rec2 = hpc.run_harvest(m, run2, str(tmp_path), SECRET, "Abdul", run_id="r2")
     assert rec2["store_merge"] == {"new_comments": 1, "existing_comments": 2, "new_text_versions": 2, "text_reverts": 0,
-                                   "updated_at_changes": 1, "duplicate_ids_within_run": 0}
+                                   "updated_at_changes": 1, "duplicate_ids_within_run": 0,
+                                   "duplicate_occurrences_identical": 0, "duplicate_occurrences_changed": 0}
 
     store = json.loads((tmp_path / "comment_store.json").read_text())
     assert sorted(store["comments"]) == ["c1", "c2", "c3"]
@@ -302,7 +303,10 @@ def test_verify_detects_timestamp_and_lineage_problems(tmp_path):
     ])})
     hpc.run_harvest(m, f, str(tmp_path), SECRET, "Abdul", run_id="r1")
     result = hpc.verify_store(str(tmp_path), m)
-    assert result["problems"]["comment_before_video_published"] == ["early"]
+    # Pre-publication comments are flagged (warning with video and gap), never rewritten or failed.
+    flagged = result["warnings"]["comment_before_video_published"]
+    assert [row[:2] for row in flagged] == [["early", "v1"]] and flagged[0][2] > 0
+    assert "comment_before_video_published" not in result["problems"]
     assert result["problems"]["updated_before_published"] == ["backwards"]
     assert not result["passed"]
 

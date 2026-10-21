@@ -106,6 +106,22 @@ COMPLETE_COVERAGE = {COVERAGE_COMPLETE_ALL_PAGES, COVERAGE_COMPLETE_WINDOW_PASSE
 RESUMABLE_COVERAGE = {COVERAGE_TRUNCATED_BEFORE_WINDOW, COVERAGE_TRUNCATED_WITHIN_WINDOW}
 OUTCOME_SKIPPED_COMPLETE = "SKIPPED_COMPLETE_IN_PRIOR_RUN"
 
+# Comments published before the video's own publishedAt (for example during a livestream or premiere;
+# not verified) lie outside the publication-anchored window. Their coverage is reported separately from
+# completion of the configured window. The window anchor stays VIDEO_PUBLISHED_AT.
+PREPUB_COMPLETE = "COMPLETE"                                   # all pages retrieved, pre-publication comments present
+PREPUB_NONE_RETRIEVABLE = "NONE_RETRIEVABLE"                   # all pages retrieved, none present
+PREPUB_PARTIAL_STOPPED = "PARTIAL_STOPPED_AT_WINDOW_START"     # paging stopped once the window was passed
+PREPUB_PARTIAL = "PARTIAL"                                     # some seen, but paging ended early (budget/error)
+PREPUB_NOT_REACHED = "NOT_REACHED"                             # paging ended before any were reached
+PREPUB_UNAVAILABLE = "UNAVAILABLE"
+
+# Repeated comment IDs within one run (for example the same item on two consecutive pages) are recorded as
+# occurrences with full lineage; analytical counts stay unique by comment ID.
+OCCURRENCE_FIRST = "FIRST"
+OCCURRENCE_DUPLICATE_IDENTICAL = "DUPLICATE_IDENTICAL"   # raw item byte-for-byte equal (canonical JSON) to the first
+OCCURRENCE_DUPLICATE_CHANGED = "DUPLICATE_CHANGED"       # same comment ID, raw item differs (e.g. likes changed)
+
 Fetcher = Callable[[Dict[str, Any]], Tuple[Optional[int], bytes]]
 
 
@@ -434,6 +450,7 @@ def parse_comment_thread(item: Dict[str, Any], hmac_secret: str) -> Dict[str, An
     if text is None:
         text = snippet.get("textDisplay", "")
     return {
+        "item_sha256": canonical_json_hash(item),
         "comment_id": top.get("id") or item.get("id"),
         "comment_thread_id": item.get("id"),
         "video_id": snippet.get("videoId") or thread_snippet.get("videoId"),
@@ -600,6 +617,7 @@ def harvest_video(
             parsed = parse_comment_thread(item, hmac_secret)
             parsed.update({
                 "manifest_video_id": video_id,
+                "published_before_video": published_before_video(parsed["published_at"], video.get("video_published_at")),
                 "run_id": run_id,
                 "raw_file": raw_rel,
                 "payload_sha256": page_record["payload_sha256"],
@@ -635,7 +653,9 @@ def harvest_video(
         "pagination_availability": pagination if outcome in (OUTCOME_COLLECTED, OUTCOME_EMPTY) else PAGINATION_UNKNOWN,
         "pages_requested": len(pages),
         "pages_succeeded": pages_succeeded,
-        "comments_collected": collected,
+        "comments_collected": len({o["comment_id"] for o in observations}),
+        "raw_occurrences": collected,
+        "duplicate_occurrences": collected - len({o["comment_id"] for o in observations}),
     }
     return video_outcome, pages, observations
 
@@ -740,6 +760,7 @@ def harvest_video_early_window(
                 "source_item_position": position,
                 "observed_at": page_record["retrieved_at"],
                 "in_early_window": in_early_window(parsed["published_at"], window_start, window_end),
+                "published_before_video": published_before_video(parsed["published_at"], video.get("video_published_at")),
                 "likely_pinned": position == pinned_position,
             })
             observations.append(parsed)
@@ -771,7 +792,11 @@ def harvest_video_early_window(
         outcome = OUTCOME_COLLECTED if observations or resume else OUTCOME_EMPTY
     checkpoint = write_checkpoint(coverage)
 
-    in_window = sum(1 for o in observations if o["in_early_window"])
+    unique = {}
+    for o in observations:
+        unique.setdefault(o["comment_id"], o)
+    in_window = sum(1 for o in unique.values() if o["in_early_window"])
+    pre_publication = sum(1 for o in unique.values() if o["published_before_video"])
     video_outcome = {
         "video_id": video_id,
         "outcome": outcome,
@@ -787,13 +812,52 @@ def harvest_video_early_window(
         "resumed_from_run_id": checkpoint["resumed_from_run_id"],
         "pages_requested": len(pages),
         "pages_succeeded": pages_succeeded,
-        "comments_collected": len(observations),
+        "comments_collected": len(unique),
+        "raw_occurrences": len(observations),
+        "duplicate_occurrences": len(observations) - len(unique),
         "in_window_comments_observed": in_window,
-        "out_of_window_comments_observed": len(observations) - in_window,
+        "out_of_window_comments_observed": len(unique) - in_window,
+        "pre_publication_comments_observed": pre_publication,
+        "pre_publication_coverage": pre_publication_coverage(coverage, pre_publication),
         "pagination_availability": PAGINATION_EXHAUSTED if coverage == COVERAGE_COMPLETE_ALL_PAGES else (
             PAGINATION_REQUEST_CAP if coverage in RESUMABLE_COVERAGE else PAGINATION_UNKNOWN),
     }
     return video_outcome, pages, observations
+
+
+def published_before_video(published_at: Optional[str], video_published_at: Optional[str]) -> bool:
+    comment_ts, video_ts = parse_api_timestamp(published_at), parse_api_timestamp(video_published_at)
+    return comment_ts is not None and video_ts is not None and comment_ts < video_ts
+
+
+def pre_publication_coverage(coverage_status: Optional[str], pre_publication_count: int) -> str:
+    """Coverage of comments published before the video's publishedAt, separate from the configured window."""
+    if coverage_status == COVERAGE_COMPLETE_ALL_PAGES:
+        return PREPUB_COMPLETE if pre_publication_count else PREPUB_NONE_RETRIEVABLE
+    if coverage_status == COVERAGE_COMPLETE_WINDOW_PASSED:
+        return PREPUB_PARTIAL_STOPPED
+    if coverage_status == COVERAGE_UNAVAILABLE:
+        return PREPUB_UNAVAILABLE
+    return PREPUB_PARTIAL if pre_publication_count else PREPUB_NOT_REACHED
+
+
+def annotate_occurrences(observations: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Marks each observation FIRST / DUPLICATE_IDENTICAL / DUPLICATE_CHANGED within one run, in retrieval
+    order, comparing raw item hashes with the first occurrence of the same comment ID."""
+    first_hash: Dict[str, str] = {}
+    counts = {OCCURRENCE_FIRST: 0, OCCURRENCE_DUPLICATE_IDENTICAL: 0, OCCURRENCE_DUPLICATE_CHANGED: 0}
+    for obs in observations:
+        cid = obs["comment_id"]
+        if cid not in first_hash:
+            first_hash[cid] = obs["item_sha256"]
+            kind = OCCURRENCE_FIRST
+        elif obs["item_sha256"] == first_hash[cid]:
+            kind = OCCURRENCE_DUPLICATE_IDENTICAL
+        else:
+            kind = OCCURRENCE_DUPLICATE_CHANGED
+        obs["occurrence_kind"] = kind
+        counts[kind] += 1
+    return counts
 
 
 def merge_into_store(store: Dict[str, Any], observations: List[Dict[str, Any]], run_id: str) -> Dict[str, int]:
@@ -805,7 +869,8 @@ def merge_into_store(store: Dict[str, Any], observations: List[Dict[str, Any]], 
     """
     comments = store.setdefault("comments", {})
     stats = {"new_comments": 0, "existing_comments": 0, "new_text_versions": 0, "text_reverts": 0,
-             "updated_at_changes": 0, "duplicate_ids_within_run": 0}
+             "updated_at_changes": 0, "duplicate_ids_within_run": 0,
+             "duplicate_occurrences_identical": 0, "duplicate_occurrences_changed": 0}
     seen_in_run = set()
 
     for obs in observations:
@@ -814,6 +879,11 @@ def merge_into_store(store: Dict[str, Any], observations: List[Dict[str, Any]], 
         if repeat_in_run:
             stats["duplicate_ids_within_run"] += 1
         seen_in_run.add(cid)
+        kind = obs.get("occurrence_kind", OCCURRENCE_DUPLICATE_CHANGED if repeat_in_run else OCCURRENCE_FIRST)
+        if kind == OCCURRENCE_DUPLICATE_IDENTICAL:
+            stats["duplicate_occurrences_identical"] += 1
+        elif kind == OCCURRENCE_DUPLICATE_CHANGED:
+            stats["duplicate_occurrences_changed"] += 1
 
         entry = comments.get(cid)
         if entry is None:
@@ -828,6 +898,7 @@ def merge_into_store(store: Dict[str, Any], observations: List[Dict[str, Any]], 
                 "is_reply": False,
                 "in_early_window": obs.get("in_early_window"),
                 "likely_pinned": bool(obs.get("likely_pinned")),
+                "published_before_video": obs.get("published_before_video"),
                 "first_observed_at": obs["observed_at"],
                 "first_observed_run_id": run_id,
                 "text_versions": [],
@@ -868,12 +939,14 @@ def merge_into_store(store: Dict[str, Any], observations: List[Dict[str, Any]], 
         entry["last_observed_at"] = obs["observed_at"]
         entry["last_observed_run_id"] = run_id
 
-        entry["engagement_snapshots"].append({
-            "observed_at": obs["observed_at"],
-            "run_id": run_id,
-            "like_count": obs["like_count"],
-            "total_reply_count": obs["total_reply_count"],
-        })
+        # An identical repeat carries no new engagement observation; its occurrence is still recorded below.
+        if kind != OCCURRENCE_DUPLICATE_IDENTICAL:
+            entry["engagement_snapshots"].append({
+                "observed_at": obs["observed_at"],
+                "run_id": run_id,
+                "like_count": obs["like_count"],
+                "total_reply_count": obs["total_reply_count"],
+            })
         entry["sample_observations"].append({
             "run_id": run_id,
             "raw_file": obs["raw_file"],
@@ -882,6 +955,8 @@ def merge_into_store(store: Dict[str, Any], observations: List[Dict[str, Any]], 
             "source_item_position": obs["source_item_position"],
             "observed_at": obs["observed_at"],
             "text_hash": obs["text_hash"],
+            "item_sha256": obs.get("item_sha256"),
+            "occurrence_kind": kind,
         })
 
     return stats
@@ -997,7 +1072,8 @@ def run_harvest(
                                                              window_hours, request_cap, resume)
             store.setdefault("video_coverage", {})[video["video_id"]] = {
                 k: outcome[k] for k in ("coverage_status", "window_count_is_complete", "window_start", "window_end",
-                                        "frontier_published_at", "window_covered_from", "resumed_from_run_id")}
+                                        "frontier_published_at", "window_covered_from", "resumed_from_run_id",
+                                        "pre_publication_comments_observed", "pre_publication_coverage")}
             store["video_coverage"][video["video_id"]]["run_id"] = run_id
         else:
             outcome, pages, obs = harvest_video(video, fetcher, run_dir, run_id, max_comments, hmac_secret, request_cap)
@@ -1007,7 +1083,8 @@ def run_harvest(
         if outcome["outcome"] in (OUTCOME_QUOTA_LIMIT, OUTCOME_PARTIAL_QUOTA_LIMIT):
             quota_stop = True
 
-    # Parsed observations for this run (lineage-bearing, no author IDs/display names).
+    occurrence_counts = annotate_occurrences(all_obs)
+    # Parsed observations for this run: every raw occurrence, lineage-bearing, no author IDs/display names.
     with open(os.path.join(run_dir, "parsed_comments.jsonl"), "w", encoding="utf-8") as f:
         for obs in all_obs:
             f.write(json.dumps(obs, ensure_ascii=False) + "\n")
@@ -1061,8 +1138,12 @@ def run_harvest(
         "outcome_counts": outcome_counts,
         "coverage_counts": coverage_counts,
         "comments_observed": len(all_obs),
-        "in_window_comments_observed": (sum(1 for o in all_obs if o.get("in_early_window"))
+        "raw_occurrences": len(all_obs),
+        "unique_comments_observed": len({o["comment_id"] for o in all_obs}),
+        "occurrence_counts": occurrence_counts,
+        "in_window_comments_observed": (len({o["comment_id"] for o in all_obs if o.get("in_early_window")})
                                         if mode == SCOPE_EARLY_WINDOW else None),
+        "pre_publication_comments_observed": len({o["comment_id"] for o in all_obs if o.get("published_before_video")}),
         "store_merge": merge_stats,
         "video_outcomes": video_outcomes,
         "pages": all_pages,
@@ -1097,7 +1178,6 @@ def verify_store(output_root: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
     problems: Dict[str, List[Any]] = {
         "unparseable_timestamps": [],
         "updated_before_published": [],
-        "comment_before_video_published": [],
         "video_not_in_manifest": [],
         "video_id_mismatch": [],
         "lineage_file_missing": [],
@@ -1117,6 +1197,11 @@ def verify_store(output_root: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
         "coverage_video_not_in_manifest": [],
         "coverage_checkpoint_missing": [],
         "coverage_checkpoint_mismatch": [],
+        "occurrence_raw_unresolvable": [],
+        "occurrence_missing_from_store": [],
+        "store_observation_missing_from_run_file": [],
+        "occurrence_kind_mismatch": [],
+        "occurrence_item_hash_mismatch": [],
     }
     if store.get("manifest_sha256") != manifest.get("manifest_sha256"):
         problems["store_manifest_mismatch"].append(
@@ -1138,7 +1223,14 @@ def verify_store(output_root: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
     runs_dir = os.path.join(output_root, "runs")
     if os.path.isdir(runs_dir):
         problems["run_not_in_store"] = sorted(set(os.listdir(runs_dir)) - set(store_run_ids))
-    warnings: Dict[str, List[Any]] = {"updated_before_published_within_tolerance": []}
+    warnings: Dict[str, List[Any]] = {
+        "updated_before_published_within_tolerance": [],
+        # Flagged, never rewritten: published before the video's publishedAt, outside the configured window.
+        "comment_before_video_published": [],
+        # Recorded occurrences, not failures: analytical counts stay unique by comment ID.
+        "duplicate_occurrences_identical": [],
+        "duplicate_occurrences_changed": [],
+    }
     raw_cache: Dict[str, Tuple[str, Optional[Dict[str, Any]]]] = {}
     observation_count = 0
     sample_keys = set()
@@ -1161,7 +1253,8 @@ def verify_store(output_root: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
         if c.get("manifest_video_id") not in video_pub:
             problems["video_not_in_manifest"].append(cid)
         elif pub is not None and vp is not None and pub < vp:
-            problems["comment_before_video_published"].append(cid)
+            warnings["comment_before_video_published"].append(
+                [cid, c.get("manifest_video_id"), (vp - pub).total_seconds()])
         if c.get("video_id") != c.get("manifest_video_id"):
             problems["video_id_mismatch"].append(cid)
         latest = [v for v in c.get("text_versions", []) if v.get("is_latest_version")]
@@ -1229,6 +1322,8 @@ def verify_store(output_root: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
                     or (status in RESUMABLE_COVERAGE and not cp.get("next_page_token"))):
                 problems["coverage_checkpoint_mismatch"].append(vid)
 
+    occurrence_summary = verify_run_occurrences(output_root, store, store_run_ids, problems, warnings)
+
     total_problems = sum(len(v) for v in problems.values()) + duplicate_sample_observations
     return {
         "comments": len(store.get("comments", {})),
@@ -1239,9 +1334,76 @@ def verify_store(output_root: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
         "problem_counts": {k: len(v) for k, v in problems.items()},
         "warnings": warnings,
         "warning_counts": {k: len(v) for k, v in warnings.items()},
+        "occurrences_by_run": occurrence_summary,
         "timestamp_skew_tolerance_seconds": TIMESTAMP_SKEW_TOLERANCE_SECONDS,
         "passed": total_problems == 0,
     }
+
+
+def verify_run_occurrences(output_root: str, store: Dict[str, Any], run_ids: List[str],
+                           problems: Dict[str, List[Any]], warnings: Dict[str, List[Any]]) -> Dict[str, Dict[str, int]]:
+    """Re-derives every run's occurrence kinds from the raw pages (so runs written before occurrence kinds
+    were recorded are covered too) and checks that each raw occurrence is preserved in the store."""
+    raw_items: Dict[str, Optional[List[Any]]] = {}
+
+    def raw_item(run_id: str, raw_file: str, position: int) -> Optional[Dict[str, Any]]:
+        path = os.path.join(output_root, "runs", run_id, raw_file)
+        if path not in raw_items:
+            try:
+                with open(path, "rb") as f:
+                    raw_items[path] = json.loads(f.read().decode("utf-8")).get("items", []) or []
+            except (OSError, ValueError, UnicodeDecodeError):
+                raw_items[path] = None
+        items = raw_items[path]
+        return items[position] if items is not None and 0 <= position < len(items) else None
+
+    store_obs: Dict[Tuple[str, str, int], Tuple[str, Dict[str, Any]]] = {}
+    for cid, c in store.get("comments", {}).items():
+        for so in c.get("sample_observations", []):
+            store_obs[(so["run_id"], so["raw_file"], so["source_item_position"])] = (cid, so)
+
+    summary: Dict[str, Dict[str, int]] = {}
+    seen_keys = set()
+    for run_id in run_ids:
+        path = os.path.join(output_root, "runs", run_id, "parsed_comments.jsonl")
+        if not os.path.exists(path):
+            continue  # reported as run_parsed_file_missing
+        counts = {OCCURRENCE_FIRST: 0, OCCURRENCE_DUPLICATE_IDENTICAL: 0, OCCURRENCE_DUPLICATE_CHANGED: 0}
+        first: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [json.loads(line) for line in f if line.strip()]
+        for obs in lines:
+            cid, pos = obs["comment_id"], obs["source_item_position"]
+            key = (run_id, obs["raw_file"], pos)
+            seen_keys.add(key)
+            item = raw_item(run_id, obs["raw_file"], pos)
+            if item is None:
+                problems["occurrence_raw_unresolvable"].append([run_id, cid, obs["raw_file"], pos])
+                continue
+            item_hash = canonical_json_hash(item)
+            if obs.get("item_sha256") is not None and obs["item_sha256"] != item_hash:
+                problems["occurrence_item_hash_mismatch"].append([run_id, cid, obs["raw_file"], pos])
+            lineage = {"raw_file": obs["raw_file"], "page_number": obs.get("page_number"), "position": pos}
+            if cid not in first:
+                first[cid] = (item_hash, lineage)
+                kind = OCCURRENCE_FIRST
+            else:
+                kind = OCCURRENCE_DUPLICATE_IDENTICAL if item_hash == first[cid][0] else OCCURRENCE_DUPLICATE_CHANGED
+                bucket = ("duplicate_occurrences_identical" if kind == OCCURRENCE_DUPLICATE_IDENTICAL
+                          else "duplicate_occurrences_changed")
+                warnings[bucket].append({"run_id": run_id, "comment_id": cid, "first": first[cid][1],
+                                         "repeat": lineage})
+            counts[kind] += 1
+            recorded = store_obs.get(key)
+            if recorded is None or recorded[0] != cid:
+                problems["occurrence_missing_from_store"].append([run_id, cid, obs["raw_file"], pos])
+            elif recorded[1].get("occurrence_kind") is not None and recorded[1]["occurrence_kind"] != kind:
+                problems["occurrence_kind_mismatch"].append([run_id, cid, obs["raw_file"], pos])
+        summary[run_id] = counts
+    for key, (cid, _) in store_obs.items():
+        if key[0] in summary and key not in seen_keys:
+            problems["store_observation_missing_from_run_file"].append([key[0], cid, key[1], key[2]])
+    return summary
 
 
 def scan_run_duplicates(output_root: str) -> Dict[str, int]:
@@ -1392,14 +1554,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     result = verify_store(args.output_root, manifest)
     run_dups = scan_run_duplicates(args.output_root)
     print(json.dumps({k: v for k, v in result.items() if k not in ("problems", "warnings")}, indent=2))
-    print("duplicate comment IDs within each run:", json.dumps(run_dups))
+    print("repeated comment IDs within each run (recorded occurrences, not failures):", json.dumps(run_dups))
     for name, items in result["warnings"].items():
         if items:
             print(f"[WARN] {name}: {items[:10]}{' ...' if len(items) > 10 else ''}")
     for name, items in result["problems"].items():
         if items:
             print(f"[FAIL] {name}: {items[:10]}{' ...' if len(items) > 10 else ''}")
-    passed = result["passed"] and not any(run_dups.values())
+    passed = result["passed"]
     print("[OK] All checks passed" if passed else "[FAIL] Verification found problems")
     return 0 if passed else 1
 
